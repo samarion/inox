@@ -35,5 +35,7 @@ fork's `main` and must never end up in a branch meant for upstream.
 - To test several PRs together, run `Inox CI` manually with the `prs` input,
   e.g. `2 3`. It merges those PR heads into `main` before testing.
 - `Stainless downstream CI` builds epfl-lara/stainless against this Inox and
-  runs its tests (Bolts excluded) on `ubuntu-latest`. It takes the same `prs`
-  input to test PRs downstream.
+  runs its tests (Bolts excluded) on `ubuntu-latest`. It takes about 40
+  minutes, so it only runs when triggered manually, with the same `prs` input:
+  `gh workflow run stainless-downstream-CI.yml -R samarion/inox -f prs="1 2"`.
+  Run it before opening an upstream PR that could affect Stainless.

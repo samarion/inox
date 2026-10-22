@@ -7,10 +7,8 @@ on:
         description: 'Space-separated Inox PR numbers to merge into main and test together (empty tests main)'
         required: false
         default: ''
-  pull_request:
-  push:
-    branches:
-      - main
+  # Fork: manual only. The full Stainless suite takes about 40 minutes on a
+  # hosted runner, and upstream epfl-lara runs it on every PR anyway.
 
 permissions:
   contents: read
