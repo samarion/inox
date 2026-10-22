@@ -73,12 +73,23 @@ jobs:
         tar xfz sbt-1.10.1.tgz
         echo "PATH=$STAINLESS_DIR/sbt/bin:$PATH" >> "$GITHUB_ENV"
     - name: Install solvers
-      working-directory: ${{ env.STAINLESS_DIR }}
-      run: ./stainless-ci.sh --install-solvers "$GITHUB_WORKSPACE/.local/bin"
-    - name: Install CVC4 from the GitHub archive
-      # stainless-ci.sh fetches CVC4 from cvc4.cs.stanford.edu, which no
-      # longer serves the builds, and leaves an empty file behind.
-      run: curl -fsSL https://github.com/CVC4/CVC4-archived/releases/download/1.8/cvc4-1.8-x86_64-linux-opt -o "$GITHUB_WORKSPACE/.local/bin/cvc4" && chmod +x "$GITHUB_WORKSPACE/.local/bin/cvc4"
+      # Same solver versions as `stainless-ci.sh --install-solvers`, but that
+      # script fetches CVC4 from cvc4.cs.stanford.edu, which no longer serves
+      # the builds and makes the download hang. CVC4 comes from the GitHub
+      # archive instead.
+      run: |
+        set -e
+        BIN="$GITHUB_WORKSPACE/.local/bin"
+        TMP="$RUNNER_TEMP/solvers"
+        mkdir -p "$BIN" "$TMP"
+        curl -fsSL https://github.com/cvc5/cvc5/releases/download/cvc5-1.3.4/cvc5-Linux-x86_64-static.zip -o "$TMP/cvc5.zip"
+        unzip -q "$TMP/cvc5.zip" -d "$TMP/cvc5"
+        mv "$TMP"/cvc5/*/bin/cvc5 "$BIN/cvc5"
+        curl -fsSL https://github.com/CVC4/CVC4-archived/releases/download/1.8/cvc4-1.8-x86_64-linux-opt -o "$BIN/cvc4"
+        curl -fsSL https://github.com/Z3Prover/z3/releases/download/z3-5.0.0/z3-5.0.0-x64-glibc-2.39.zip -o "$TMP/z3.zip"
+        unzip -q "$TMP/z3.zip" -d "$TMP/z3"
+        mv "$TMP"/z3/*/bin/z3 "$BIN/z3"
+        chmod +x "$BIN/cvc5" "$BIN/cvc4" "$BIN/z3"
     - name: Add solvers to PATH
       run: echo "$GITHUB_WORKSPACE/.local/bin" >> "$GITHUB_PATH"
     - name: Test solvers availability
