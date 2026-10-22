@@ -12,6 +12,8 @@ permissions:
 
 jobs:
   tests:
+    # Needs the EPFL self-hosted runners (12G heap); skip on forks.
+    if: github.repository_owner == 'epfl-lara'
     runs-on:
       labels: [self-hosted, linux]
     env:
