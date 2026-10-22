@@ -17,8 +17,31 @@ jobs:
   tests:
     # Fork: GitHub-hosted runner (4 cores, 16 GB) instead of the EPFL
     # self-hosted one, with a smaller heap to leave room for the solvers.
+    # The integration tests take about 110 CPU-minutes, so they are split
+    # into shards of similar cost that run on separate runners. The last
+    # shard runs every suite the others don't name, so new suites are
+    # still covered.
+    name: ${{ matrix.shard.name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - name: VerificationSuite (z3), unit tests
+            run: |
+              sbt -batch -Dtestcase-parallelism=5 "it:testOnly stainless.verification.VerificationSuite -- -z solver=smt-z3"
+              sbt -batch -Dtestsuite-parallelism=5 test
+          - name: VerificationSuite (cvc5, princess), sbt plugin
+            run: |
+              sbt -batch -Dtestcase-parallelism=5 "it:testOnly stainless.verification.VerificationSuite -- -z solver=smt-cvc5 -z solver=princess"
+              sbt -batch scripted
+          - name: TerminationSuite, LibrarySuite
+            run: |
+              sbt -batch -Dtestsuite-parallelism=2 -Dtestcase-parallelism=5 "it:testOnly stainless.termination.TerminationSuite stainless.LibrarySuite"
+          - name: Other integration tests
+            run: |
+              sbt -batch -Dtestsuite-parallelism=6 -Dtestcase-parallelism=5 "it:testOnly * -stainless.verification.VerificationSuite -stainless.termination.TerminationSuite -stainless.LibrarySuite"
     env:
       JAVA_OPTS: -Dsbt.io.implicit.relative.glob.conversion=allow -Xss512M -Xms1024M -Xmx10G -XX:MaxMetaspaceSize=2G -XX:+UseCodeCacheFlushing -XX:ReservedCodeCacheSize=768M
       JVM_OPTS: -Dsbt.io.implicit.relative.glob.conversion=allow -Xss512M -Xms1024M -Xmx10G -XX:MaxMetaspaceSize=2G -XX:+UseCodeCacheFlushing -XX:ReservedCodeCacheSize=768M
@@ -57,6 +80,7 @@ jobs:
       with:
         distribution: temurin
         java-version: 17
+        cache: sbt
     - name: Setup java options
       run: |
           echo "JAVA_OPTS=$JAVA_OPTS -Djava.io.tmpdir=$JAVA_OPTS_TMP_DIR" >> "$GITHUB_ENV" && \
@@ -95,11 +119,8 @@ jobs:
     - name: Build and Package
       working-directory: ${{ env.STAINLESS_DIR }}
       run: ./stainless-ci.sh --build-only && echo "PATH=$STAINLESS_DIR/frontends/dotty/target/universal/stage/bin:$PATH" >> "$GITHUB_ENV"
-    - name: Run Tests and Integration Tests
+    - name: Run tests
       working-directory: ${{ env.STAINLESS_DIR }}
-      run: ./stainless-ci.sh --skip-build --skip-bolts --skip-sbt-plugin
-    - name: Sbt Plugin Tests
-      working-directory: ${{ env.STAINLESS_DIR }}
-      run: ./stainless-ci.sh --skip-build --skip-tests --skip-bolts
+      run: ${{ matrix.shard.run }}
     - name: Clean up
       run: rm -rf "$JAVA_OPTS_TMP_DIR"
