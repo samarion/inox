@@ -174,8 +174,33 @@ trait LambdaTemplates { self: Templates =>
 
         val toVars = typeOps.variablesOf(to).toSeq.sortBy(_.id)
         val toClosures = toVars.map(subst)
-        val appResult = encodeSymbol(Variable.fresh("result", BooleanType(), true))
-        clauses ++= instantiateType(freshBlocker, Typing(to, app.encoded, Constraint(appResult, toClosures, free)))
+        val toResult = encodeSymbol(Variable.fresh("result", BooleanType(), true))
+        clauses ++= instantiateType(freshBlocker, Typing(to, app.encoded, Constraint(toResult, toClosures, free)))
+
+        // A function of type `Pi(x: A). B` only maps arguments in `A` to results in `B`, so the
+        // codomain must only be assumed (or checked) for arguments that lie in the domain.
+        // Function-typed parameters are skipped as unrolling their types would register the
+        // arguments as free functions.
+        val domainResults = tpe match {
+          case PiType(params, _) => (params zip app.args).collect {
+            case (vd, arg) if ContractUnrolling.unroll(vd.tpe) && !typeOps.exists {
+              case _: FunctionType | _: PiType => true
+              case _ => false
+            } (vd.tpe) =>
+              val domResult = encodeSymbol(Variable.fresh("dom", BooleanType(), true))
+              val domClosures = typeOps.variablesOf(vd.tpe).toSeq.sortBy(_.id).map(subst)
+              clauses ++= instantiateType(freshBlocker,
+                Typing(vd.tpe, arg.encoded, Constraint(domResult, domClosures, false)))
+              domResult
+          }
+          case _ => Seq.empty
+        }
+
+        val appResult = if (domainResults.isEmpty) toResult else {
+          val appResult = encodeSymbol(Variable.fresh("result", BooleanType(), true))
+          clauses += mkImplies(freshBlocker, mkEquals(appResult, mkImplies(mkAnd(domainResults*), toResult)))
+          appResult
+        }
 
         (typeBlocker, appResult)
       }
