@@ -23,9 +23,6 @@ jobs:
           - name: Linux
             os: Linux
             labels: ['ubuntu-latest']
-          - name: macOS ARM64
-            os: macOS
-            labels: ['macos-latest']
         java-version: [17, 21]
     env:
       # solver versions to test against
