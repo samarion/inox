@@ -68,6 +68,9 @@ trait TypeTemplates { self: Templates =>
 
   protected case object FreeGenerator extends TypingGenerator(FreeUnrolling)
   protected case object ContractGenerator extends TypingGenerator(ContractUnrolling)
+  /** Generator for checks that must be proven rather than assumed, such as the membership of an
+    * argument in the domain of a Pi type (@see [[Membership]]). */
+  protected case object MembershipGenerator extends TypingGenerator(ContractUnrolling)
   protected case class CaptureGenerator(container: Encoded, tpe: FunctionType)
     extends TypingGenerator(CaptureUnrolling)
 
@@ -81,6 +84,20 @@ trait TypeTemplates { self: Templates =>
   case class Constraint(result: Encoded, closures: Seq[Arg], free: Boolean) extends TemplateInstantiator {
     override def substitute(substituter: Encoded => Encoded, msubst: Map[Encoded, Matcher]): TemplateInstantiator =
       Constraint(substituter(result), closures map (_.substitute(substituter, msubst)), free)
+  }
+
+  /** Checks whether a value lies in a type, where the result must be exact in models and may only be
+    * false in proofs if the value lies outside of the type.
+    *
+    * [[Constraint]] typings only check the applications of functions that appear in the formula, so
+    * an unapplied function such as `x => -1` would lie in `Pi(x: BigInt). {r | r > 0}`. This is
+    * sound for typings that are assumed, but not for typings that must be proven. Membership
+    * typings instead check functions at fresh arguments: `f` lies in `Pi(x: A). B` iff
+    * `A(x0) ==> B(f(x0))` for all `x0`, and the solver may pick `x0` as a counterexample.
+    * (@see [[TemplateGenerator.mkTypeClauses]]) */
+  case class Membership(result: Encoded, closures: Seq[Arg]) extends TemplateInstantiator {
+    override def substitute(substituter: Encoded => Encoded, msubst: Map[Encoded, Matcher]): TemplateInstantiator =
+      Membership(substituter(result), closures map (_.substitute(substituter, msubst)))
   }
 
   case class Capture(encoded: Encoded, tpe: FunctionType) extends TemplateInstantiator {
@@ -104,6 +121,7 @@ trait TypeTemplates { self: Templates =>
 
     def unroll: Boolean = instantiator match {
       case Constraint(_, _, free) => (if (free) FreeUnrolling else ContractUnrolling) `unroll` tpe
+      case Membership(_, _) => ContractUnrolling `unroll` tpe
       case Capture(_, _) => CaptureUnrolling `unroll` tpe
     }
   }
@@ -114,8 +132,18 @@ trait TypeTemplates { self: Templates =>
   }
 
   private def instantiateTyping(blocker: Encoded, typing: Typing): Clauses = typing match {
+    case Typing(tpe, arg, Membership(result, closures)) =>
+      val key = (tpe, arg, closures, MembershipGenerator)
+      results.get(key) match {
+        case Some(res) =>
+          Seq(mkEquals(result, res))
+        case None =>
+          results += key -> result
+          ConstraintTemplate(tpe, MembershipGenerator).instantiate(blocker, result, arg, closures)
+      }
+
     case Typing(tpe, arg, Constraint(result, closures, free)) =>
-      val key = (tpe, arg, closures, free)
+      val key = (tpe, arg, closures, if (free) FreeGenerator else ContractGenerator)
       results.get(key) match {
         case Some(res) =>
           Seq(mkEquals(result, res))
@@ -125,7 +153,8 @@ trait TypeTemplates { self: Templates =>
             case (_: FunctionType | _: PiType) =>
               registerFunction(blocker, result, tpe, arg, closures, free)
             case _ =>
-              ConstraintTemplate(tpe, free).instantiate(blocker, result, arg, closures)
+              ConstraintTemplate(tpe, if (free) FreeGenerator else ContractGenerator)
+                .instantiate(blocker, result, arg, closures)
           }
       }
 
@@ -138,6 +167,7 @@ trait TypeTemplates { self: Templates =>
     case _ if !typing.unroll =>
       typing.instantiator match {
         case Constraint(res, _, _) => Seq(mkImplies(blocker, mkEquals(res, trueT)))
+        case Membership(res, _) => Seq(mkImplies(blocker, mkEquals(res, trueT)))
         case _ => Seq.empty
       }
 
@@ -173,9 +203,9 @@ trait TypeTemplates { self: Templates =>
 
   /** Generator for [[ConstraintTemplate]] instances. */
   object ConstraintTemplate {
-    private val cache: MutableMap[(Type, Boolean), ConstraintTemplate] = MutableMap.empty
+    private val cache: MutableMap[(Type, TypingGenerator), ConstraintTemplate] = MutableMap.empty
 
-    def apply(tpe: Type, free: Boolean): ConstraintTemplate = cache.getOrElse(tpe -> free, {
+    def apply(tpe: Type, generator: TypingGenerator): ConstraintTemplate = cache.getOrElse(tpe -> generator, {
       val v = Variable.fresh("x", tpe.getType, true)
       val pathVar = Variable.fresh("b", BooleanType(), true)
       val result = Variable.fresh("result", BooleanType(), true)
@@ -185,14 +215,13 @@ trait TypeTemplates { self: Templates =>
 
       val substMap = Map(v -> idT, pathVar -> pathVarT) ++ arguments
 
-      given TypingGenerator = if (free) FreeGenerator else ContractGenerator
-      val (p, tmplClauses) = mkTypeClauses(pathVar, tpe, v, substMap)
+      val (p, tmplClauses) = mkTypeClauses(pathVar, tpe, v, substMap)(using generator)
       val (contents, _) = Template.contents(
         pathVar -> pathVarT, Seq(result -> resultT, v -> idT) ++ arguments,
         tmplClauses + (pathVar -> Equals(result, p)))
 
       val res = new ConstraintTemplate(contents)
-      cache(tpe -> free) = res
+      cache(tpe -> generator) = res
       res
     })
   }
@@ -293,7 +322,7 @@ trait TypeTemplates { self: Templates =>
   private[unrolling] object typesManager extends Manager {
     private[TypeTemplates] val typeInfos = new IncrementalMap[Encoded, (Int, Int, Encoded, Set[Typing])]
     private[TypeTemplates] val lessOrder = new IncrementalMap[Encoded, Set[Encoded]].withDefaultValue(Set.empty)
-    private[TypeTemplates] val results = new IncrementalMap[(Type, Encoded, Seq[Arg], Boolean), Encoded]
+    private[TypeTemplates] val results = new IncrementalMap[(Type, Encoded, Seq[Arg], TypingGenerator), Encoded]
 
     private val tpSyms: MutableMap[TypeParameter, Variable] = MutableMap.empty
     private[unrolling] val tpSubst: MutableMap[Variable, Encoded] = MutableMap.empty
