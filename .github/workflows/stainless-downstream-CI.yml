@@ -18,7 +18,7 @@ jobs:
     # Fork: GitHub-hosted runner (4 cores, 16 GB) instead of the EPFL
     # self-hosted one, with a smaller heap to leave room for the solvers.
     # The integration tests take about 110 CPU-minutes, so they are split
-    # into shards of similar cost that run on separate runners. The last
+    # into five shards of similar cost that run on separate runners. The last
     # shard runs every suite the others don't name, so new suites are
     # still covered.
     name: ${{ matrix.shard.name }}
@@ -36,12 +36,16 @@ jobs:
             run: |
               sbt -batch -Dtestcase-parallelism=5 "it:testOnly stainless.verification.VerificationSuite -- -z solver=smt-cvc5 -z solver=princess"
               sbt -batch scripted
-          - name: TerminationSuite, LibrarySuite
+          - name: TerminationSuite, ImperativeSuite
             run: |
-              sbt -batch -Dtestsuite-parallelism=2 -Dtestcase-parallelism=5 "it:testOnly stainless.termination.TerminationSuite stainless.LibrarySuite"
+              sbt -batch -Dtestsuite-parallelism=2 -Dtestcase-parallelism=5 "it:testOnly stainless.termination.TerminationSuite stainless.verification.ImperativeSuite"
+          # A single test that verifies the whole library, for about 7 minutes.
+          - name: LibrarySuite
+            run: |
+              sbt -batch "it:testOnly stainless.LibrarySuite"
           - name: Other integration tests
             run: |
-              sbt -batch -Dtestsuite-parallelism=6 -Dtestcase-parallelism=5 "it:testOnly * -stainless.verification.VerificationSuite -stainless.termination.TerminationSuite -stainless.LibrarySuite"
+              sbt -batch -Dtestsuite-parallelism=6 -Dtestcase-parallelism=5 "it:testOnly * -stainless.verification.VerificationSuite -stainless.termination.TerminationSuite -stainless.verification.ImperativeSuite -stainless.LibrarySuite"
     env:
       JAVA_OPTS: -Dsbt.io.implicit.relative.glob.conversion=allow -Xss512M -Xms1024M -Xmx10G -XX:MaxMetaspaceSize=2G -XX:+UseCodeCacheFlushing -XX:ReservedCodeCacheSize=768M
       JVM_OPTS: -Dsbt.io.implicit.relative.glob.conversion=allow -Xss512M -Xms1024M -Xmx10G -XX:MaxMetaspaceSize=2G -XX:+UseCodeCacheFlushing -XX:ReservedCodeCacheSize=768M
