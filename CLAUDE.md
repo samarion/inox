@@ -34,5 +34,6 @@ fork's `main` and must never end up in a branch meant for upstream.
   JDK 21.
 - To test several PRs together, run `Inox CI` manually with the `prs` input,
   e.g. `2 3`. It merges those PR heads into `main` before testing.
-- `Stainless downstream CI` needs EPFL's self-hosted runners and is skipped
-  here.
+- `Stainless downstream CI` builds epfl-lara/stainless against this Inox and
+  runs its tests (Bolts excluded) on `ubuntu-latest`. It takes the same `prs`
+  input to test PRs downstream.
