@@ -18,12 +18,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runners:
-          # Fork: GitHub-hosted runner instead of the EPFL self-hosted one.
-          - name: Linux
-            os: Linux
-            labels: ['ubuntu-latest']
-        java-version: [17, 21]
+        # Fork: GitHub-hosted runners instead of the EPFL self-hosted one.
+        # Instead of the full OS x JDK product, each OS runs one JDK, so
+        # both architectures and both JDKs are still covered with 2 jobs.
+        include:
+          - runners:
+              name: Linux
+              os: Linux
+              labels: ['ubuntu-latest']
+            java-version: 17
+          - runners:
+              name: macOS ARM64
+              os: macOS
+              labels: ['macos-latest']
+            java-version: 21
     env:
       # solver versions to test against
       INSTALL_SOLVERS: 1
