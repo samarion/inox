@@ -60,12 +60,9 @@ class DependentTypeUnrollingSuite extends AnyFunSuite {
     assert(res.isSAT, s"expected SAT for ${e.asString(using PrinterOptions())}, got $res")
   }
 
-  // Checks that the model is valid, including the codomains of Pi-typed functions. Function
-  // models extracted from Princess are currently wrong even without dependent types (their
-  // applications all evaluate to 0), so models are only checked for the other solvers.
+  // Checks that the model is valid, including the codomains of Pi-typed functions
   private def assertValidSAT(ctx: Context, e: Expr): Unit = {
-    val princess = ctx.options.findOptionOrDefault(optSelectedSolvers) == Set("princess")
-    val res = solver(ctx.withOpts(optCheckModels(!princess))).solveSAT(e)
+    val res = solver(ctx.withOpts(optCheckModels(true))).solveSAT(e)
     assert(res.isSAT, s"expected SAT with a valid model for ${e.asString(using PrinterOptions())}, got $res")
   }
 
@@ -206,6 +203,13 @@ class DependentTypeUnrollingSuite extends AnyFunSuite {
     // f: Pi(x: BigInt). {r: BigInt | r > x}
     val g = ("g" :: pi("x" :: IntegerType())(x => refinement("r" :: IntegerType())(_ > x))).toVariable
     assertValidSAT(ctx, g(IntegerLiteral(3)) > IntegerLiteral(10))
+
+    // h: Pi(x: {y: BigInt | y > 0}). Pi(z: BigInt). {r: BigInt | x > 0 && r > z}, whose codomain
+    // is empty outside of its domain
+    val h = ("h" :: pi("x" :: pos)(x => pi("z" :: IntegerType())(z =>
+      refinement("r" :: IntegerType())(r => (x > IntegerLiteral(0)) && (r > z))))).toVariable
+    assertValidSAT(ctx, h(IntegerLiteral(1))(IntegerLiteral(2)) > IntegerLiteral(10))
+    assertValidSAT(ctx, h(IntegerLiteral(0))(IntegerLiteral(2)) < IntegerLiteral(0))
   }
 
   test("negated universal quantifier") { ctx =>

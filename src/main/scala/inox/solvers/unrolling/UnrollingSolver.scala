@@ -512,11 +512,36 @@ abstract class AbstractUnrollingSolver private
     def isFirstOrder(tpe: Type): Boolean =
       !typeOps.exists { case _: FunctionType => true case _ => false } (tpe.getType)
 
+    /* The type `tpe` where every refinement only applies under `cond`, i.e. the values `v` of
+     * `tpe.getType` such that `v` lies in `tpe` when `cond` holds. Such a type is inhabited
+     * whenever `tpe` is inhabited under `cond`, so a `choose` of it never fails. */
+    def guardedType(cond: Expr, tpe: Type): Type = {
+      def guardParams(params: Seq[ValDef]): (Seq[ValDef], Map[ValDef, Expr]) =
+        params.foldLeft((Seq.empty[ValDef], Map.empty[ValDef, Expr])) { case ((vds, subst), vd) =>
+          val nvd = vd.copy(tpe = guardedType(cond, typeOps.replaceFromSymbols(subst, vd.tpe)))
+          (vds :+ nvd, subst + (vd -> nvd.toVariable))
+        }
+
+      if (cond == BooleanLiteral(true)) tpe else tpe match {
+        case RefinementType(vd, pred) =>
+          val (Seq(nvd), subst) = guardParams(Seq(vd)): @unchecked
+          RefinementType(nvd, implies(cond, exprOps.replaceFromSymbols(subst, pred)))
+        case PiType(params, to) => PiType(params, guardedType(cond, to))
+        case FunctionType(from, to) => FunctionType(from, guardedType(cond, to))
+        case SigmaType(params, to) =>
+          val (nparams, subst) = guardParams(params)
+          SigmaType(nparams, guardedType(cond, typeOps.replaceFromSymbols(subst, to)))
+        case TupleType(tps) => TupleType(tps.map(guardedType(cond, _)))
+        case MapType(from, to) => MapType(from, guardedType(cond, to))
+        case _ => tpe
+      }
+    }
+
     /* Chooses the default value of the model of a function, i.e. its value on the arguments the
      * formula doesn't apply it to. The default must lie in the codomain `to` (expressed in terms of
      * `params`) for all arguments in the domain. We pick the first of `candidates` (values of the
      * function at known arguments) that lies in `to` if `to` doesn't depend on the arguments, and
-     * otherwise fall back to `choose(r => domain ==> r lies in to)`. */
+     * otherwise fall back to `choose(r: {r: to | domain ==> r lies in to} => true)`. */
     def defaultValue(params: Seq[ValDef], paramTypes: Seq[Type], to: Type, candidates: Seq[Expr]): Expr = {
       if (to == to.getType) {
         candidates.head
@@ -532,17 +557,11 @@ abstract class AbstractUnrollingSolver private
           else candidates.find(c => exprOps.variablesOf(c).isEmpty && isMember(c))
 
         concrete.getOrElse {
+          // function-typed parameters can't be checked by an expression, so they're assumed in the domain
           val domain = andJoin((params zip paramTypes).collect {
             case (vd, tpe) if isFirstOrder(tpe) => refinementsOf(vd.toVariable, tpe)
           })
-          if (isFirstOrder(to)) {
-            val res = ValDef.fresh("res", to.getType, true)
-            Choose(res, implies(domain, refinementsOf(res.toVariable, to)))
-          } else {
-            // the codomain contains functions, so it can't be expressed as a refinement
-            val choose = Choose(ValDef.fresh("res", to, true), BooleanLiteral(true))
-            if (domain == BooleanLiteral(true)) choose else IfExpr(domain, choose, candidates.head)
-          }
+          Choose(ValDef.fresh("res", guardedType(domain, to), true), BooleanLiteral(true))
         }
       }
     }
