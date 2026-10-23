@@ -424,6 +424,8 @@ abstract class AbstractUnrollingSolver private
     // maintain extracted functions to make sure equality is well-defined
     var lambdaExtractions: Seq[(Encoded, Lambda)] = Seq.empty
     var chooseExtractions: Seq[(Encoded, Choose)] = Seq.empty
+    // chooses that carry the identity of extracted nullary functions, with their results
+    var nullaryChooses: Seq[(Choose, Expr)] = Seq.empty
 
     def modelEq(e1: Encoded, e2: Encoded): Boolean =
       wrapped.modelEval(templates.mkEquals(e1, e2), BooleanType()) == Some(BooleanLiteral(true))
@@ -497,20 +499,42 @@ abstract class AbstractUnrollingSolver private
     def extractFunction(f: Encoded, tpe: FunctionType, seen: Map[FunctionType, Set[Encoded]]): Expr = {
       val nextSeen = seen + (tpe -> (seen(tpe) + f))
 
-      def extractLambda(f: Encoded, tpe: FunctionType): Option[Lambda] = {
-        val optEqTemplate = templates.getLambdaTemplates(tpe).find { tmpl =>
-          wrapped.modelEval(tmpl.start, BooleanType()) == Some(BooleanLiteral(true)) &&
-          modelEq(tmpl.ids._2, f)
+      def liveTemplates(tpe: FunctionType) = templates.getLambdaTemplates(tpe).filter { tmpl =>
+        wrapped.modelEval(tmpl.start, BooleanType()) == Some(BooleanLiteral(true))
+      }
+
+      def templateValue(tmpl: templates.LambdaTemplate): Lambda = {
+        val localsSubst = tmpl.structure.locals.map { case (v, ev) =>
+          v -> extractValue(ev, v.getType, nextSeen)
+        }.toMap
+
+        val res = exprOps.replaceFromSymbols(localsSubst, tmpl.structure.body)
+        val (nl, subst) = normalizeStructure(res, onlySimple = true)
+        exprOps.replaceFromSymbols(subst.map { case (v, e, _) => v -> e }.toMap, nl).asInstanceOf[Lambda]
+      }
+
+      def extractLambda(f: Encoded, tpe: FunctionType): Option[Lambda] =
+        liveTemplates(tpe).find(tmpl => modelEq(tmpl.ids._2, f)).map(templateValue)
+
+      // Closures with closed, pure bodies are normalized to their results, so the extracted
+      // `() => result` may coincide with a function that the model distinguishes from `f`.
+      // In that case, `f` is extracted as a closure over a fresh `choose` that the model maps
+      // to the result, which is distinct from all other closures.
+      def uniqueNullary(f: Encoded, tpe: FunctionType, lambda: Lambda): Lambda = {
+        def normalized(l: Lambda): Lambda = {
+          val (nl, subst) = normalizeStructure(l, onlySimple = true)
+          exprOps.replaceFromSymbols(subst.map { case (v, e, _) => v -> e }.toMap, nl).asInstanceOf[Lambda]
         }
 
-        optEqTemplate.map { tmpl =>
-          val localsSubst = tmpl.structure.locals.map { case (v, ev) =>
-            v -> extractValue(ev, v.getType, nextSeen)
-          }.toMap
+        val distinct =
+          lambdaExtractions.collect { case (e, img: Lambda) if img.getType == tpe && !modelEq(e, f) => img } ++
+          liveTemplates(tpe).toSeq.filter(tmpl => !modelEq(tmpl.ids._2, f)).map(templateValue)
 
-          val res = exprOps.replaceFromSymbols(localsSubst, tmpl.structure.body)
-          val (nl, subst) = normalizeStructure(res, onlySimple = true)
-          exprOps.replaceFromSymbols(subst.map { case (v, e, _) => v -> e }.toMap, nl).asInstanceOf[Lambda]
+        val nl = normalized(lambda)
+        if (!distinct.exists(normalized(_) == nl)) lambda else {
+          val c = Choose(ValDef.fresh("x", tpe.to, true), BooleanLiteral(true))
+          nullaryChooses :+= c -> lambda.body
+          Lambda(Seq.empty, c)
         }
       }
 
@@ -533,7 +557,7 @@ abstract class AbstractUnrollingSolver private
         val res = if (arguments.isEmpty) {
           wrapped.modelEval(f, tpe).getOrThrow.asInstanceOf[Lambda]
         } else if (tpe.from.isEmpty) {
-          Lambda(Seq.empty, extractValue(templates.mkApp(f, tpe, Seq.empty), tpe.to, nextSeen))
+          uniqueNullary(f, tpe, Lambda(Seq.empty, extractValue(templates.mkApp(f, tpe, Seq.empty), tpe.to, nextSeen)))
         } else {
           val projections: Map[Type, Encoded] = (arguments.head zip params)
             .groupBy(p => p._2.getType)
@@ -610,7 +634,7 @@ abstract class AbstractUnrollingSolver private
         case (f, lambda) if lambda.getType == c.res.getType && modelEq(f, e) => lambda
       }.get
     }
-    val chooses = exChooses.map(p => (p._1.res.id, Seq.empty[s.Type]) -> decodeOrSimplest(p._2))
+    val chooses = (exChooses ++ nullaryChooses).map(p => (p._1.res.id, Seq.empty[s.Type]) -> decodeOrSimplest(p._2))
     inox.Model(program)(exModel.vars, exModel.chooses ++ chooses)
   }
 
