@@ -174,6 +174,49 @@ class EvaluatorSuite extends AnyFunSuite {
     eval(e, BVAShiftRight(ubvl(8), ubvl(1)))  === ubvl(4)
   }
 
+  test("eval shifts by large or negative counts") {
+    val e = evaluator(ctx)
+
+    // Shift counts are unsigned, and counts at least the bit width shift every bit out
+    eval(e, BVShiftLeft(Int8Literal(1), Int8Literal(8)))      === Int8Literal(0)
+    eval(e, BVShiftLeft(Int8Literal(1), Int8Literal(-1)))     === Int8Literal(0)
+    eval(e, BVLShiftRight(Int8Literal(-1), Int8Literal(7)))   === Int8Literal(1)
+    eval(e, BVLShiftRight(Int8Literal(-1), Int8Literal(8)))   === Int8Literal(0)
+    eval(e, BVLShiftRight(Int8Literal(-1), Int8Literal(-1)))  === Int8Literal(0)
+    eval(e, BVAShiftRight(Int8Literal(-128), Int8Literal(1))) === Int8Literal(-64)
+    eval(e, BVAShiftRight(Int8Literal(-128), Int8Literal(7))) === Int8Literal(-1)
+    eval(e, BVAShiftRight(Int8Literal(-128), Int8Literal(8))) === Int8Literal(-1)
+    eval(e, BVAShiftRight(Int8Literal(-128), Int8Literal(100))) === Int8Literal(-1)
+    eval(e, BVAShiftRight(Int8Literal(-128), Int8Literal(-1))) === Int8Literal(-1)
+    eval(e, BVAShiftRight(Int8Literal(64), Int8Literal(8)))   === Int8Literal(0)
+    eval(e, BVAShiftRight(Int32Literal(Int.MinValue), Int32Literal(40))) === Int32Literal(-1)
+
+    // The arithmetic shift fills with the most significant bit for unsigned bitvectors too
+    def ubv(x: BigInt) = BVLiteral(false, x, 8)
+    eval(e, BVAShiftRight(ubv(128), ubv(1)))   === ubv(192)
+    eval(e, BVAShiftRight(ubv(128), ubv(200))) === ubv(255)
+    eval(e, BVAShiftRight(ubv(64), ubv(200)))  === ubv(0)
+  }
+
+  test("eval substrings out of bounds") {
+    val e = evaluator(ctx)
+
+    def sub(s: String, from: BigInt, to: BigInt) =
+      SubString(StringLiteral(s), IntegerLiteral(from), IntegerLiteral(to))
+
+    eval(e, sub("abc", 1, 2))   === StringLiteral("b")
+    eval(e, sub("abc", 0, 3))   === StringLiteral("abc")
+    eval(e, sub("abc", 1, 10))  === StringLiteral("bc")
+    eval(e, sub("abc", -1, 2))  === StringLiteral("")
+    eval(e, sub("abc", 3, 4))   === StringLiteral("")
+    eval(e, sub("abc", 5, 6))   === StringLiteral("")
+    eval(e, sub("abc", 2, 1))   === StringLiteral("")
+    eval(e, sub("abc", 1, 1))   === StringLiteral("")
+    eval(e, sub("", 0, 1))      === StringLiteral("")
+    eval(e, sub("abc", BigInt(Long.MaxValue) * 4, BigInt(Long.MaxValue) * 5)) === StringLiteral("")
+    eval(e, sub("abc", 1, BigInt(Long.MaxValue) * 4)) === StringLiteral("bc")
+  }
+
   test("BigInt Arithmetic") {
     val e = evaluator(ctx)
 

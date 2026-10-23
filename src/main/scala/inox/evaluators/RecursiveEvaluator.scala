@@ -26,6 +26,13 @@ abstract class RecursiveEvaluator(override val program: Program,
   private def shift(b: BitSet, size: Int, i: Int): BitSet =
     b.filter(bit => bit + i >= 1 && bit + i <= size).map(_ + i)
 
+  // Shift counts are unsigned in SMT-LIB, and any count above the bit width
+  // has the same effect as the bit width.
+  private def shiftCount(b: BVLiteral): Int = {
+    val count = b.value.foldLeft(BigInt(0))((res, i) => res + BigInt(2).pow(i - 1))
+    if (count > b.size) b.size else count.toInt
+  }
+
   protected def finiteSet(els: Iterable[Expr], tpe: Type): FiniteSet = {
     FiniteSet(els.toSeq.distinct.sortBy(_.toString), tpe)
   }
@@ -196,8 +203,10 @@ abstract class RecursiveEvaluator(override val program: Program,
     }
 
     case SubString(a, start, end) => (e(a), e(start), e(end)) match {
+      // Like SMT-LIB's str.substr, out of bounds indices give an empty or truncated string
       case (StringLiteral(a), IntegerLiteral(b), IntegerLiteral(c))  =>
-        StringLiteral(a.substring(b.toInt, c.toInt))
+        if (b < 0 || b >= a.length || c <= b) StringLiteral("")
+        else StringLiteral(a.substring(b.toInt, (c min a.length).toInt))
       case res => throw EvalError(typeErrorMsg(res._1, StringType()))
     }
 
@@ -296,23 +305,24 @@ abstract class RecursiveEvaluator(override val program: Program,
     case BVShiftLeft(l,r) =>
       (e(l), e(r)) match {
         case (BVLiteral(sig1, i1, s1), b2 @ BVLiteral(sig2, _, s2)) if sig1 == sig2 && s1 == s2 =>
-          BVLiteral(sig1, shift(i1, s1, b2.toBigInt.toInt), s1)
+          BVLiteral(sig1, shift(i1, s1, shiftCount(b2)), s1)
         case (le,re) => throw EvalError("Unexpected operation: (" + le.asString + ") << (" + re.asString + ")")
       }
 
     case BVAShiftRight(l,r) =>
       (e(l), e(r)) match {
         case (BVLiteral(sig1, i1, s1), b2 @ BVLiteral(sig2, _, s2)) if sig1 == sig2 && s1 == s2 =>
-          val shiftCount = b2.toBigInt.toInt
-          val shifted = shift(i1, s1, -shiftCount)
-          BVLiteral(sig1, if (i1(s1) && sig1) shifted ++ ((s1 - shiftCount) to s1) else shifted, s1)
+          // Like SMT-LIB's bvashr, fill with the most significant bit, whatever the signedness
+          val count = shiftCount(b2)
+          val shifted = shift(i1, s1, -count)
+          BVLiteral(sig1, if (i1(s1)) shifted ++ ((s1 - count + 1) to s1) else shifted, s1)
         case (le,re) => throw EvalError("Unexpected operation: (" + le.asString + ") >> (" + re.asString + ")")
       }
 
     case BVLShiftRight(l,r) =>
       (e(l), e(r)) match {
         case (BVLiteral(sig1, i1, s1), b2 @ BVLiteral(sig2, _, s2)) if s1 == s2 && sig1 == sig2 =>
-          BVLiteral(sig1, shift(i1, s1, -b2.toBigInt.toInt), s1)
+          BVLiteral(sig1, shift(i1, s1, -shiftCount(b2)), s1)
         case (le,re) => throw EvalError("Unexpected operation: (" + le.asString + ") >>> (" + re.asString + ")")
       }
 
