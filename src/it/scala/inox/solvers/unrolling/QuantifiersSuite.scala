@@ -125,7 +125,9 @@ class QuantifiersSuite extends TestSuite {
   test("Unification is unsatisfiable") {
     val aT = T("A")
     val f = ("f" :: ((aT, aT) =>: aT)).toVariable
-    val clause = forall("x" :: aT, "y" :: aT)((x,y) => !(f(x,y) === f(y,x)))
+    // `A` must be inhabited, as the quantifier holds vacuously otherwise
+    val a = ("a" :: aT).toVariable
+    val clause = forall("x" :: aT, "y" :: aT)((x,y) => !(f(x,y) === f(y,x))) && (f(a, a) === a)
 
     assert(SimpleSolverAPI(program.getSolver).solveSAT(clause).isUNSAT)
   }
