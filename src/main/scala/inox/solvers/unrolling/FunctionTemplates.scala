@@ -52,10 +52,28 @@ trait FunctionTemplates { self: Templates =>
         // Register the function's return as a contract typing to enable
         // induction with refinement types
         if (ContractUnrolling `unroll` tfd.returnType) {
-          val (conds, exprs, tree, guarded, eqs, tps, equals, lambdas, quants) = clauses
+          // The return type only holds for arguments that lie in the parameter types, so
+          // it is assumed only once the arguments' membership in these types is shown.
+          val (domains, domClauses) = tfd.params.foldLeft((Seq.empty[Expr], emptyClauses)) {
+            case ((domains, domClauses), vd) if ContractUnrolling `unroll` vd.tpe =>
+              val (p, pClauses) = mkTypeClauses(start, vd.tpe, vd.toVariable, substMap)(using MembershipGenerator)
+              (domains :+ p, domClauses +++ pClauses)
+            case (acc, _) => acc
+          }
+
+          val (conds, exprs, tree, guarded, eqs, tps, equals, lambdas, quants) = clauses +++ domClauses
           val closures = typeOps.variablesOf(tfd.returnType).toSeq.sortBy(_.id).map(v => Left(substMap(v)))
-          val typing = Typing(tfd.returnType, mkCall(tfd, arguments.map(_._2)), Constraint(trueT, closures, false))
-          (conds, exprs, tree, guarded, eqs, tps `merge` Map(pathVar._2 -> Set(typing)), equals, lambdas, quants)
+          val call = mkCall(tfd, arguments.map(_._2))
+          if (domains.isEmpty) {
+            val typing = Typing(tfd.returnType, call, Constraint(trueT, closures, false))
+            (conds, exprs, tree, guarded, eqs, tps `merge` Map(pathVar._2 -> Set(typing)), equals, lambdas, quants)
+          } else {
+            val result = Variable.fresh("result", BooleanType(), true)
+            val resultT = encodeSymbol(result)
+            val typing = Typing(tfd.returnType, call, Constraint(resultT, closures, false))
+            (conds, exprs + (result -> resultT), tree, guarded `merge` (start -> Implies(andJoin(domains), result)),
+              eqs, tps `merge` Map(pathVar._2 -> Set(typing)), equals, lambdas, quants)
+          }
         } else {
           clauses
         }
