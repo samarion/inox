@@ -524,12 +524,43 @@ trait TemplateGenerator { self: Templates =>
     (p, builder.result)
   }
 
-  /** Generates the clauses and other bookkeeping relevant to a type unfolding template. */
+  /** Whether the clauses of `expr` may falsify the path condition they are guarded by,
+    * i.e. whether `expr` contains an assumption or a `choose`.
+    *
+    * Function calls are only followed when `followCalls` is set, in which case a call to
+    * a function that (transitively) contains an assumption or a `choose` may falsify the path,
+    * as unrolling the call falsifies the blocker it is registered under.
+    * Calls are not followed by default: that would flag almost every Stainless type predicate
+    * (the type encoding's testers call functions with contracts), and the extra blockers then
+    * make verification much slower. */
+  private def mayFalsifyPath(expr: Expr, followCalls: Boolean): Boolean = exprOps.exists {
+    case _: Assume | _: Choose => true
+    case fi: FunctionInvocation => followCalls && callMayFalsifyPath(fi.id)
+    case _ => false
+  }(expr)
+
+  private val callsMayFalsifyPath: MutableMap[Identifier, Boolean] = MutableMap.empty
+
+  private def callMayFalsifyPath(id: Identifier): Boolean = callsMayFalsifyPath.getOrElseUpdate(id,
+    (transitiveCallees(id) + id).exists(fid => mayFalsifyPath(getFunction(fid).fullBody, followCalls = false)))
+
+  /** Whether checking that a value belongs to `tpe` may falsify the path condition. */
+  private def mayFalsifyPath(tpe: Type, followCalls: Boolean): Boolean = typeOps.exists {
+    case RefinementType(_, pred) => mayFalsifyPath(pred, followCalls)
+    case _ => false
+  }(tpe)
+
+  /** Generates the clauses and other bookkeeping relevant to a type unfolding template.
+    *
+    * When `followCalls` is set, refinement predicates that call functions which may falsify
+    * the path are guarded by the base type check (see `mayFalsifyPath`). This is needed when
+    * `expr` ranges over values outside of `tpe`'s base type, e.g. for quantified variables. */
   protected def mkTypeClauses(
     pathVar: Variable,
     tpe: Type,
     expr: Expr,
-    substMap: Map[Variable, Encoded]
+    substMap: Map[Variable, Encoded],
+    followCalls: Boolean = false
   )(using generator: TypingGenerator): (Expr, TemplateClauses) = {
     val builder = new Builder(pathVar, substMap)
     import builder._
@@ -540,6 +571,33 @@ trait TemplateGenerator { self: Templates =>
       recurseSet: Boolean, // unroll set definition
       recurseBag: Boolean  // unroll bag definition
     )
+
+    // Returns a blocker that holds iff both `pathVar` and `cond` hold. The extra blocker is only
+    // introduced when `needed` (see `mayFalsifyPath`), as it slows down unrolling: the clauses
+    // it guards are only constrained once the solver has established `cond`, which may require
+    // unfolding further type templates.
+    def guardedBy(pathVar: Variable, cond: Expr, needed: Boolean, name: String): Variable = cond match {
+      case BooleanLiteral(true) => pathVar
+      case _ if !needed => pathVar
+      case _ =>
+        val guard: Variable = Variable.fresh(name, BooleanType(), true)
+        storeCond(pathVar, guard)
+        iff(and(pathVar, cond), guard)
+        guard
+    }
+
+    // The result of a guarded check is used under `pathVar`, so any call or application it contains
+    // would be registered (and unrolled) under `pathVar` instead of `guard`. We therefore bind it to
+    // a fresh variable under `guard`. Where `guard` doesn't hold, the base check is false, so
+    // the conjunction it is part of doesn't depend on the (unconstrained) variable.
+    def guardedResult(pathVar: Variable, guard: Variable, res: Expr, name: String): Expr =
+      if (guard == pathVar || res.isInstanceOf[BooleanLiteral]) res
+      else {
+        val newExpr: Variable = Variable.fresh(name, BooleanType(), true)
+        storeExpr(newExpr)
+        storeGuarded(guard, Equals(newExpr, res))
+        newExpr
+      }
 
     def rec(pathVar: Variable, tpe: Type, expr: Expr, state: RecursionState): Expr = tpe match {
       case tpe if !(generator `unroll` tpe) => BooleanLiteral(true) // nothing to do here!
@@ -554,11 +612,19 @@ trait TemplateGenerator { self: Templates =>
 
         storeGuarded(pathVar, Equals(newExpr, expr))
 
-        val (p, predClauses) = mkExprClauses(pathVar,
+        val recBase = rec(pathVar, vd.tpe, expr, state)
+
+        // The predicate may only be meaningful (e.g. it may contain assumptions) when `expr`
+        // belongs to the base type, so its clauses are guarded by the base type check.
+        // Otherwise, a predicate failing outside of the base type would falsify `pathVar`
+        // instead of simply making the type check false.
+        val predVar = guardedBy(pathVar, recBase, mayFalsifyPath(pred, followCalls), "rp")
+
+        val (p, predClauses) = mkExprClauses(predVar,
           exprOps.replaceFromSymbols(Map(vd -> newExpr), pred), localSubst)
         builder ++= predClauses
 
-        and(rec(pathVar, vd.tpe, expr, state), p)
+        and(recBase, guardedResult(pathVar, predVar, p, "rr"))
 
       case SigmaType(params, to) =>
         val (newExprs, recParams) = params.zipWithIndex.map { case (vd, i) =>
@@ -569,11 +635,15 @@ trait TemplateGenerator { self: Templates =>
           (newExpr, rec(pathVar, vd.tpe, newExpr, state))
         }.unzip
 
-        val recTo = rec(pathVar,
+        // Similarly to refinements, the (dependent) last component is only checked
+        // when the first components belong to their types.
+        val toVar = guardedBy(pathVar, andJoin(recParams), mayFalsifyPath(to, followCalls), "sp")
+
+        val recTo = rec(toVar,
           typeOps.replaceFromSymbols((params zip newExprs).toMap, to),
           TupleSelect(expr, params.size + 1), state)
 
-        andJoin(recParams :+ recTo)
+        andJoin(recParams :+ guardedResult(pathVar, toVar, recTo, "sr"))
 
       case adt: ADTType =>
         val sort = adt.getSort
