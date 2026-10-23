@@ -59,6 +59,7 @@ jobs:
       with:
         distribution: temurin
         java-version: ${{ matrix.java-version }}
+        cache: sbt
     - name: Set Java and SBT options
       run: |
         # path for sbt to create a local folder and sockets
