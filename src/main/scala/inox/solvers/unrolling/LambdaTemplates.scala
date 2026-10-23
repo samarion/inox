@@ -437,6 +437,7 @@ trait LambdaTemplates { self: Templates =>
   }
 
   def getLambdaTemplates(tpe: FunctionType): Set[LambdaTemplate] = byType(tpe).values.toSet
+  def getLambdaTemplates: Set[LambdaTemplate] = byType.values.flatMap(_.values).toSet
 
   private[unrolling] object lambdasManager extends Manager {
     // Function instantiations have their own defblocker

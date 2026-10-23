@@ -533,6 +533,7 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
   protected[z3] def fromZ3Formula(model: Z3Model, tree: Z3AST, tpe: Type): (Expr, Map[Choose, Expr]) = {
     val z3ToChooses: MutableMap[Z3AST, Choose] = MutableMap.empty
     val z3ToLambdas: MutableMap[Z3AST, Lambda] = MutableMap.empty
+    val nullaryChooses: MutableMap[Choose, Expr] = MutableMap.empty
 
     def rec(t: Z3AST, tpe: Type, seen: Set[Z3AST]): Expr = {
       val kind = z3.getASTKind(t)
@@ -620,8 +621,15 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
                       Lambda(args, Choose(ValDef.fresh("res", tt), BooleanLiteral(true)))
                   }))
 
-                z3ToLambdas(t) = res
-                res
+                // Distinct nullary functions with equal results must remain distinct (@see [[nullaryClosure]])
+                val closure = if (fts.nonEmpty) res else {
+                  val (closure, c) = nullaryClosure(tt, Some(n))
+                  nullaryChooses(c) = res.body
+                  closure
+                }
+
+                z3ToLambdas(t) = closure
+                closure
               })
 
               case MapType(from, to) =>
@@ -713,7 +721,7 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
     }
 
     val res = rec(tree, tpe, Set.empty)
-    val chooses = z3ToChooses.toMap.map { case (ast, c) => c -> z3ToLambdas(ast) }
+    val chooses = z3ToChooses.toMap.map { case (ast, c) => c -> z3ToLambdas(ast) } ++ nullaryChooses
 
     (res, chooses)
   }

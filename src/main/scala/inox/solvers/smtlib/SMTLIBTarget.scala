@@ -598,11 +598,12 @@ trait SMTLIBTarget extends SMTLIBParser with Interruptible with ADTManagers {
     val functions: Map[SSymbol, DefineFun],
     val seen: Set[(BigInt, Type)] = Set.empty,
     private[SMTLIBTarget] val chooses: MutableMap[(BigInt, Type), Choose] = MutableMap.empty,
-    private[SMTLIBTarget] val lambdas: MutableMap[(BigInt, Type), Lambda] = MutableMap.empty
+    private[SMTLIBTarget] val lambdas: MutableMap[(BigInt, Type), Lambda] = MutableMap.empty,
+    private[SMTLIBTarget] val nullaryChooses: MutableMap[Choose, Expr] = MutableMap.empty
   ) extends super.AbstractContext {
-    def withSeen(n: (BigInt, Type)): Context = new Context(vars, smtVars, functions, seen + n, chooses, lambdas)
-    def withVariable(sym: SSymbol, expr: Expr): Context = new Context(vars + (sym -> expr), smtVars, functions, seen, chooses, lambdas)
-    def withSMTVariable(sym: SSymbol, term: Term): Context = new Context(vars, smtVars + (sym -> term), functions, seen, chooses, lambdas)
+    def withSeen(n: (BigInt, Type)): Context = new Context(vars, smtVars, functions, seen + n, chooses, lambdas, nullaryChooses)
+    def withVariable(sym: SSymbol, expr: Expr): Context = new Context(vars + (sym -> expr), smtVars, functions, seen, chooses, lambdas, nullaryChooses)
+    def withSMTVariable(sym: SSymbol, term: Term): Context = new Context(vars, smtVars + (sym -> term), functions, seen, chooses, lambdas, nullaryChooses)
     def withSMTVariables(bindings: Seq[(SSymbol, Term)]): Context = bindings.foldLeft(this)((ctx, p) => ctx.withSMTVariable(p._1, p._2))
 
     def getFunction(sym: SSymbol, ft: FunctionType): Option[Lambda] = functions.get(sym).map {
@@ -615,7 +616,8 @@ trait SMTLIBTarget extends SMTLIBParser with Interruptible with ADTManagers {
     // If a stack overflow occurred during extraction, then we may end up in situations where
     // chooses don't have a corresponding lambda. In such cases, we discard the choose as it is
     // irrelevant to the final model (since it won't contain that lambda).
-    def getChooses = chooses.toMap.flatMap { case (n, c) => lambdas.get(n).map(c -> _) }
+    def getChooses: Map[Choose, Expr] =
+      chooses.toMap.flatMap { case (n, c) => lambdas.get(n).map(c -> _) } ++ nullaryChooses
   }
 
   override protected def fromSMT(sort: Sort)(using Context): Type = sorts.getA(sort) match {
@@ -702,8 +704,15 @@ trait SMTLIBTarget extends SMTLIBParser with Interruptible with ADTManagers {
               Lambda(args, Choose(ValDef.fresh("res", ft), BooleanLiteral(true)))
           }))
 
-        context.lambdas(n -> ft) = res
-        res
+        // Distinct nullary functions with equal results must remain distinct (@see [[nullaryClosure]])
+        val closure = if (ft.from.nonEmpty) res else {
+          val (closure, c) = nullaryClosure(ft.to, Some(n))
+          context.nullaryChooses(c) = res.body
+          closure
+        }
+
+        context.lambdas(n -> ft) = closure
+        closure
       })
 
       case (SimpleSymbol(s), _) if constructors.containsB(s) =>
