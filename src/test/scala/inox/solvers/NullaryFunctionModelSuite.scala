@@ -28,14 +28,7 @@ class NullaryFunctionModelSuite extends SolverTestSuite {
     assert(res.isSAT, s"expected SAT with a valid model, got $res")
   }
 
-  // Other backends decode the model before comparing functions, and the decoded closures of
-  // distinct nullary functions with equal results are equal.
-  private def onlyOnNativeZ3(ctx: Context): Unit =
-    assume(ctx.options.findOptionOrDefault(optSelectedSolvers) == Set("nativez3"),
-      "Other backends decode the model before comparing functions, and the decoded closures of distinct nullary functions with equal results are equal.")
-
   test("distinct nullary functions with the same result", Integers, Functions) { ctx =>
-    onlyOnNativeZ3(ctx)
     val s = solver(ctx)
     val f = Variable.fresh("f", fun)
     val g = Variable.fresh("g", fun)
@@ -45,7 +38,6 @@ class NullaryFunctionModelSuite extends SolverTestSuite {
   }
 
   test("distinct nullary functions with distinct results", Integers, Functions) { ctx =>
-    onlyOnNativeZ3(ctx)
     val s = solver(ctx)
     val f = Variable.fresh("f", fun)
     val g = Variable.fresh("g", fun)
