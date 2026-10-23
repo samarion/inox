@@ -424,7 +424,7 @@ abstract class AbstractUnrollingSolver private
     // maintain extracted functions to make sure equality is well-defined
     var lambdaExtractions: Seq[(Encoded, Lambda)] = Seq.empty
     var chooseExtractions: Seq[(Encoded, Choose)] = Seq.empty
-    // chooses that carry the identity of extracted nullary functions, with their results
+    // the `choose`s that give nullary functions their identity, with their results
     var nullaryChooses: Seq[(Choose, Expr)] = Seq.empty
 
     def modelEq(e1: Encoded, e2: Encoded): Boolean =
@@ -496,47 +496,25 @@ abstract class AbstractUnrollingSolver private
       }
     }
 
+    def isLive(tmpl: templates.LambdaTemplate): Boolean =
+      wrapped.modelEval(tmpl.start, BooleanType()) == Some(BooleanLiteral(true))
+
+    def templateValue(tmpl: templates.LambdaTemplate, seen: Map[FunctionType, Set[Encoded]]): Lambda = {
+      val localsSubst = tmpl.structure.locals.map { case (v, ev) =>
+        v -> extractValue(ev, v.getType, seen)
+      }.toMap
+
+      val res = exprOps.replaceFromSymbols(localsSubst, tmpl.structure.body)
+      val (nl, subst) = normalizeStructure(res, onlySimple = true)
+      exprOps.replaceFromSymbols(subst.map { case (v, e, _) => v -> e }.toMap, nl).asInstanceOf[Lambda]
+    }
+
     def extractFunction(f: Encoded, tpe: FunctionType, seen: Map[FunctionType, Set[Encoded]]): Expr = {
       val nextSeen = seen + (tpe -> (seen(tpe) + f))
 
-      def liveTemplates(tpe: FunctionType) = templates.getLambdaTemplates(tpe).filter { tmpl =>
-        wrapped.modelEval(tmpl.start, BooleanType()) == Some(BooleanLiteral(true))
-      }
-
-      def templateValue(tmpl: templates.LambdaTemplate): Lambda = {
-        val localsSubst = tmpl.structure.locals.map { case (v, ev) =>
-          v -> extractValue(ev, v.getType, nextSeen)
-        }.toMap
-
-        val res = exprOps.replaceFromSymbols(localsSubst, tmpl.structure.body)
-        val (nl, subst) = normalizeStructure(res, onlySimple = true)
-        exprOps.replaceFromSymbols(subst.map { case (v, e, _) => v -> e }.toMap, nl).asInstanceOf[Lambda]
-      }
-
       def extractLambda(f: Encoded, tpe: FunctionType): Option[Lambda] =
-        liveTemplates(tpe).find(tmpl => modelEq(tmpl.ids._2, f)).map(templateValue)
-
-      // Closures with closed, pure bodies are normalized to their results, so the extracted
-      // `() => result` may coincide with a function that the model distinguishes from `f`.
-      // In that case, `f` is extracted as a closure over a fresh `choose` that the model maps
-      // to the result, which is distinct from all other closures.
-      def uniqueNullary(f: Encoded, tpe: FunctionType, lambda: Lambda): Lambda = {
-        def normalized(l: Lambda): Lambda = {
-          val (nl, subst) = normalizeStructure(l, onlySimple = true)
-          exprOps.replaceFromSymbols(subst.map { case (v, e, _) => v -> e }.toMap, nl).asInstanceOf[Lambda]
-        }
-
-        val distinct =
-          lambdaExtractions.collect { case (e, img: Lambda) if img.getType == tpe && !modelEq(e, f) => img } ++
-          liveTemplates(tpe).toSeq.filter(tmpl => !modelEq(tmpl.ids._2, f)).map(templateValue)
-
-        val nl = normalized(lambda)
-        if (!distinct.exists(normalized(_) == nl)) lambda else {
-          val c = Choose(ValDef.fresh("x", tpe.to, true), BooleanLiteral(true))
-          nullaryChooses :+= c -> lambda.body
-          Lambda(Seq.empty, c)
-        }
-      }
+        templates.getLambdaTemplates(tpe).find(tmpl => isLive(tmpl) && modelEq(tmpl.ids._2, f))
+          .map(templateValue(_, nextSeen))
 
       val params: Seq[ValDef] = tpe.from.map(tpe => ValDef.fresh("x", tpe, true))
       val arguments = templates.getGroundInstantiations(f, tpe).flatMap { case (b, eArgs) =>
@@ -557,7 +535,15 @@ abstract class AbstractUnrollingSolver private
         val res = if (arguments.isEmpty) {
           wrapped.modelEval(f, tpe).getOrThrow.asInstanceOf[Lambda]
         } else if (tpe.from.isEmpty) {
-          uniqueNullary(f, tpe, Lambda(Seq.empty, extractValue(templates.mkApp(f, tpe, Seq.empty), tpe.to, nextSeen)))
+          // Nullary functions are extracted as closures over `choose`s (@see [[nullaryClosure]]),
+          // which are inlined once the model is complete when this keeps functions distinct
+          lambdaExtractions.collectFirst {
+            case (e, img) if img.getType == tpe && modelEq(e, f) => img
+          }.getOrElse {
+            val (closure, c) = nullaryClosure(tpe.to)
+            nullaryChooses :+= c -> extractValue(templates.mkApp(f, tpe, Seq.empty), tpe.to, nextSeen)
+            closure
+          }
         } else {
           val projections: Map[Type, Encoded] = (arguments.head zip params)
             .groupBy(p => p._2.getType)
@@ -634,8 +620,86 @@ abstract class AbstractUnrollingSolver private
         case (f, lambda) if lambda.getType == c.res.getType && modelEq(f, e) => lambda
       }.get
     }
-    val chooses = (exChooses ++ nullaryChooses).map(p => (p._1.res.id, Seq.empty[s.Type]) -> decodeOrSimplest(p._2))
-    inox.Model(program)(exModel.vars, exModel.chooses ++ chooses)
+    val chooses = exChooses.map(p => (p._1.res.id, Seq.empty[s.Type]) -> decodeOrSimplest(p._2))
+
+    // The values of nullary functions in the template lambdas, which extracted functions must
+    // remain distinct from
+    val templateValues = templates.getLambdaTemplates.toSeq
+      .filter(tmpl => tmpl.tpe.from.isEmpty && isLive(tmpl))
+      .map(tmpl => decodeOrSimplest(templateValue(tmpl, initSeen)))
+
+    val (vars, allChooses) = inlineNullaryChooses(
+      exModel.vars, exModel.chooses ++ chooses, templateValues,
+      nullaryChooses.map(p => p._1.res.id -> decodeOrSimplest(p._2)).toMap,
+      id => wrapped.getChoose(id).map(decodeOrSimplest))
+    inox.Model(program)(vars, allChooses)
+  }
+
+  /** Nullary functions are extracted as closures over `choose`s, so that distinct functions with
+    * equal results remain distinct (@see [[nullaryClosure]]). This inlines the result of each such
+    * `choose` into its closure, unless the closure would then equal another nullary function value
+    * of the model or of `others`.
+    *
+    * @param bindings the results of the `choose`s that were extracted along with the model
+    * @param getBinding the results of other `choose`s, such as those extracted by the underlying solver
+    */
+  private def inlineNullaryChooses(
+    vars: Map[ValDef, Expr],
+    chooses: Map[(Identifier, Seq[Type]), Expr],
+    others: Seq[Expr],
+    bindings: Map[Identifier, Expr],
+    getBinding: Identifier => Option[Expr]
+  ): (Map[ValDef, Expr], Map[(Identifier, Seq[Type]), Expr]) = {
+    def closures(e: Expr): Set[Choose] = exprOps.collect[Choose] {
+      case Lambda(Seq(), c: Choose) => Set(c)
+      case _ => Set.empty
+    } (e)
+
+    // Find the results of all `choose`s in nullary closures, including those nested in results
+    val roots = vars.values ++ chooses.values ++ others
+    var results: Map[Identifier, Expr] = Map.empty
+    var queue = roots.flatMap(closures).toSeq
+    while (queue.nonEmpty) {
+      val c = queue.head
+      queue = queue.tail
+      if (!results.contains(c.res.id) && !chooses.contains(c.res.id -> Seq.empty)) {
+        bindings.get(c.res.id).orElse(getBinding(c.res.id)).foreach { res =>
+          results += c.res.id -> res
+          queue ++= closures(res)
+        }
+      }
+    }
+
+    def normalized(l: Lambda): Lambda = {
+      val (nl, subst) = normalizeStructure(l, onlySimple = true)
+      exprOps.replaceFromSymbols(subst.map { case (v, e, _) => v -> e }.toMap, nl).asInstanceOf[Lambda]
+    }
+
+    def isClosure(body: Expr): Boolean = body match {
+      case c: Choose => results.contains(c.res.id)
+      case _ => false
+    }
+
+    val existing = (roots ++ results.values).flatMap(exprOps.collect[Lambda] {
+      case l @ Lambda(Seq(), body) if !isClosure(body) => Set(l)
+      case _ => Set.empty
+    }).map(normalized).toSet
+
+    // Among closures that would be equal once inlined, only one is
+    val inlined: Set[Identifier] = results.toSeq.sortBy(_._1)
+      .groupBy { case (_, res) => normalized(Lambda(Seq.empty, res)) }
+      .collect { case (l, ids) if !existing(l) => ids.head._1 }
+      .toSet
+
+    def inlineIn(e: Expr): Expr = exprOps.postMap {
+      case Lambda(Seq(), c: Choose) if inlined(c.res.id) => Some(Lambda(Seq.empty, inlineIn(results(c.res.id))))
+      case _ => None
+    } (e)
+
+    val newChooses = chooses.view.mapValues(inlineIn).toMap ++ results.collect {
+      case (id, res) if !inlined(id) => (id, Seq.empty[Type]) -> inlineIn(res)
+    }
+    (vars.view.mapValues(inlineIn).toMap, newChooses)
   }
 
   protected val emptyModel: Model =

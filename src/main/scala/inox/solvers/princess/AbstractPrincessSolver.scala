@@ -402,9 +402,10 @@ abstract class AbstractPrincessSolver(override val program: Program,
       val model: Model,
       val seen: Set[BigInt] = Set.empty,
       private[AbstractPrincessSolver] val chooses: MutableMap[BigInt, Choose] = MutableMap.empty,
-      private[AbstractPrincessSolver] val lambdas: MutableMap[BigInt, Lambda] = MutableMap.empty
+      private[AbstractPrincessSolver] val lambdas: MutableMap[BigInt, Lambda] = MutableMap.empty,
+      private[AbstractPrincessSolver] val nullaryChooses: MutableMap[Choose, Expr] = MutableMap.empty
     ) {
-      def withSeen(n: BigInt): Context = new Context(model, seen + n, chooses, lambdas)
+      def withSeen(n: BigInt): Context = new Context(model, seen + n, chooses, lambdas, nullaryChooses)
     }
 
     // For some reason, various trees are not evaluated in the resulting Princess model,
@@ -547,8 +548,16 @@ abstract class AbstractPrincessSolver(override val program: Program,
                     case _: NoSimpleValue =>
                       Lambda(params, Choose(ValDef.fresh("res", ft.to), BooleanLiteral(true)))
                   }))
-                  ctx.lambdas(n) = res
-                  res
+
+                  // Distinct nullary functions with equal results must remain distinct (@see [[nullaryClosure]])
+                  val closure = if (ft.from.nonEmpty) res else {
+                    val (closure, c) = nullaryClosure(ft.to, Some(n))
+                    ctx.nullaryChooses(c) = res.body
+                    closure
+                  }
+
+                  ctx.lambdas(n) = closure
+                  closure
               })
             }
           }
@@ -604,7 +613,7 @@ abstract class AbstractPrincessSolver(override val program: Program,
     def apply(iexpr: IExpression, tpe: Type)(using model: Model) = {
       val ctx = new Context(model)
       val res = parseExpr(iexpr, tpe)(using ctx)
-      (res, ctx.chooses.map { case (n, c) => c -> ctx.lambdas(n) })
+      (res, ctx.chooses.map { case (n, c) => c -> ctx.lambdas(n) } ++ ctx.nullaryChooses)
     }
   }
 

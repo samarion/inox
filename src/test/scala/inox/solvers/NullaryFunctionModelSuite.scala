@@ -24,13 +24,12 @@ class NullaryFunctionModelSuite extends AnyFunSuite {
     Seq("princess")
   }
 
-  protected def test(name: String, solvers: Seq[String] = solverNames)
-                    (body: SimpleSolverAPI { val program: InoxProgram } => Unit): Unit = {
+  protected def test(name: String)(body: SimpleSolverAPI { val program: InoxProgram } => Unit): Unit = {
     // Workaround for a compiler crash caused by calling super.test
     def superTest(self: AnyFunSuite, name: String)(body: => Unit): Unit =
       self.test(name)(body)
 
-    for (sname <- solvers) {
+    for (sname <- solverNames) {
       val ctx = TestContext(Options(Seq(optSelectedSolvers(Set(sname)), optCheckModels(true))))
       superTest(this, s"$name solver=$sname")(body(SimpleSolverAPI(program.getSolver(ctx))))
     }
@@ -45,11 +44,7 @@ class NullaryFunctionModelSuite extends AnyFunSuite {
     assert(res.isSAT, s"expected SAT with a valid model, got $res")
   }
 
-  // Other backends decode the model before comparing functions, and the decoded closures of
-  // distinct nullary functions with equal results are equal.
-  private val nativeSolvers = solverNames.filter(_ == "nativez3")
-
-  test("distinct nullary functions with the same result", nativeSolvers) { s =>
+  test("distinct nullary functions with the same result") { s =>
     val f = Variable.fresh("f", fun)
     val g = Variable.fresh("g", fun)
     val res = s.solveSAT(
@@ -57,7 +52,7 @@ class NullaryFunctionModelSuite extends AnyFunSuite {
     assert(res.isSAT, s"expected SAT with a valid model, got $res")
   }
 
-  test("distinct nullary functions with distinct results", nativeSolvers) { s =>
+  test("distinct nullary functions with distinct results") { s =>
     val f = Variable.fresh("f", fun)
     val g = Variable.fresh("g", fun)
     val h = Variable.fresh("h", fun)
