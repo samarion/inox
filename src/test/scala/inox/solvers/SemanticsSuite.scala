@@ -673,6 +673,8 @@ class SemanticsSuite extends AnyFunSuite {
     )
   }
 
+  // Princess struggles with bit-vector keys in bags (as in sets and maps), so it is
+  // excluded from the bag tests over Int32 keys.
   test("Simple Bag Operations", filterSolvers(_, princess = true, bitwuzla = true)) { ctx =>
     val s = solver(ctx)
 
@@ -859,7 +861,7 @@ class SemanticsSuite extends AnyFunSuite {
     )) contains false)
   }
 
-  test("Bag Operations with repeated keys", filterSolvers(_, princess = true, bitwuzla = true)) { ctx =>
+  test("Bag Operations with repeated keys", filterSolvers(_, bitwuzla = true)) { ctx =>
     val s = solver(ctx)
 
     val empty = FiniteBag(Seq.empty, IntegerType())
