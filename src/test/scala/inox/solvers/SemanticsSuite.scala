@@ -256,6 +256,22 @@ class SemanticsSuite extends AnyFunSuite {
     check(s, BVAShiftRight(bvl(8), bvl(1)),  bvl(4))
   }
 
+  test("solve shifts by large or negative counts", filterSolvers(_, princess = true)) { ctx =>
+    val s = solver(ctx)
+
+    check(s, BVShiftLeft(Int8Literal(1), Int8Literal(8)),       Int8Literal(0))
+    check(s, BVShiftLeft(Int8Literal(1), Int8Literal(-1)),      Int8Literal(0))
+    check(s, BVLShiftRight(Int8Literal(-1), Int8Literal(8)),    Int8Literal(0))
+    check(s, BVLShiftRight(Int8Literal(-1), Int8Literal(-1)),   Int8Literal(0))
+    check(s, BVAShiftRight(Int8Literal(-128), Int8Literal(8)),  Int8Literal(-1))
+    check(s, BVAShiftRight(Int8Literal(-128), Int8Literal(-1)), Int8Literal(-1))
+    check(s, BVAShiftRight(Int8Literal(64), Int8Literal(8)),    Int8Literal(0))
+
+    def ubv(x: BigInt) = BVLiteral(false, x, 8)
+    check(s, BVAShiftRight(ubv(128), ubv(1)),   ubv(192))
+    check(s, BVAShiftRight(ubv(128), ubv(200)), ubv(255))
+  }
+
   test("BigInt Arithmetic", filterSolvers(_, bitwuzla = true)) { ctx =>
     val s = solver(ctx)
 
@@ -821,6 +837,18 @@ class SemanticsSuite extends AnyFunSuite {
       val v = Variable.fresh("v", StringType())
       assert(s.solveVALID(Implies(Equals(v, lit), Equals(StringLength(v), IntegerLiteral(str.length)))) contains true)
     }
+  }
+
+  test("Substrings out of bounds", filterSolvers(_, bitwuzla = true)) { ctx =>
+    val s = solver(ctx)
+
+    def sub(str: String, from: BigInt, to: BigInt) =
+      SubString(StringLiteral(str), IntegerLiteral(from), IntegerLiteral(to))
+
+    check(s, sub("abc", 1, 10), StringLiteral("bc"))
+    check(s, sub("abc", -1, 2), StringLiteral(""))
+    check(s, sub("abc", 3, 4),  StringLiteral(""))
+    check(s, sub("abc", 2, 1),  StringLiteral(""))
   }
 
   test("String Models", filterSolvers(_, bitwuzla = true)) { ctx =>
