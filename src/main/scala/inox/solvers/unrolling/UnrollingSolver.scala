@@ -16,6 +16,7 @@ object optUnrollBound       extends IntOptionDef("unroll-bound", default = -1, "
 object optUnrollFactor      extends IntOptionDef("unroll-factor", default = 1, "<PosInt>")
 object optFeelingLucky      extends FlagOptionDef("feeling-lucky", false)
 object optUnrollAssumptions extends FlagOptionDef("unroll-assumptions", false)
+object optFunctionWitnesses extends FlagOptionDef("function-witnesses", true)
 object optModelFinding      extends IntOptionDef("model-finding", 0, "<PosInt> | 0 (off)") {
   override val parser: OptionParsers.OptionParser[Int] = (s => s match {
     case "" => Some(1)
@@ -515,9 +516,11 @@ abstract class AbstractUnrollingSolver private
       }
 
       val params: Seq[ValDef] = tpe.from.map(tpe => ValDef.fresh("x", tpe, true))
+      // Applications to distinguishing inputs come last, so that they don't determine the default
+      // value of the extracted function (which must agree with quantifier instantiations).
       val arguments = templates.getGroundInstantiations(f, tpe).flatMap { case (b, eArgs) =>
         wrapped.modelEval(b, BooleanType()).filter(_ == BooleanLiteral(true)).map(_ => eArgs)
-      }.distinct
+      }.distinct.sortBy(_.exists(templates.isWitnessArgument))
 
       extractLambda(f, tpe).orElse {
         if (seen(tpe).exists(e => modelEq(f, e))) {
@@ -653,8 +656,14 @@ abstract class AbstractUnrollingSolver private
     case object Unroll extends CheckState
 
     object CheckResult {
-      def cast(resp: SolverResponse[underlying.Model, Set[underlying.Trees]]): CheckResult =
-        CheckResult(config.convert(config.cast(resp), extractSimpleModel, decodeAssumptions))
+      def cast(resp: SolverResponse[underlying.Model, Set[underlying.Trees]]): CheckResult = {
+        // unsat assumptions may have been requested internally (eg. for witness assumptions)
+        val res = resp match {
+          case _: Unsatisfiable if !config.withUnsatAssumptions => Unsat
+          case _ => resp
+        }
+        CheckResult(config.convert(config.cast(res), extractSimpleModel, decodeAssumptions))
+      }
 
       def apply[M <: Model, A <: Assumptions](resp: config.Response[M, A]): CheckResult = resp match {
         case SatWithModel(_) if !checkModels && abort => new CheckResult(config `cast` Unknown)
@@ -683,51 +692,172 @@ abstract class AbstractUnrollingSolver private
 
     def canUnroll: Boolean = unrollBound < 0 || unrollCount < unrollBound
 
+    // Distinguishing inputs for first-class functions are only assumed while they don't
+    // make the formula unsatisfiable (see [[LambdaTemplates.witnessAssumptions]])
+    var useWitnesses: Boolean = true
+    // The depth up to which distinguishing inputs are instantiated: 0 until the first model is found,
+    // then one more level with each unrolling (see [[LambdaTemplates.witnessEqualities]])
+    var witnessLevel: Int = 0
+    def witnessEqualities: Map[Encoded, Int] =
+      if (useWitnesses && witnessLevel > 0) templates.witnessEqualities else Map.empty
+    var modelWithWitnesses: Boolean = false
+    def witnessAssumptions: Seq[Encoded] = if (useWitnesses) templates.witnessAssumptions else Seq.empty
+
+    /* The equalities between functions without distinguishing inputs that appear in the unsat core
+     * of `res`, or all of them if the solver gave no core. Cores aren't necessarily reported as
+     * literals, so they are compared modulo negation. */
+    def coreEqualities(
+      res: SolverResponse[underlying.Model, Set[underlying.Trees]],
+      equalities: Map[Encoded, Int]
+    ): Map[Encoded, Int] = res match {
+      case _: Unsatisfiable if equalities.nonEmpty =>
+        def atom(e: Encoded): Encoded = templates.extractNot(e).getOrElse(e)
+        res match {
+          case UnsatWithAssumptions(core) =>
+            val atoms = core.map(atom)
+            equalities.filter(p => atoms(atom(p._1)))
+          case _ => equalities
+        }
+      case _ => Map.empty
+    }
+
+    /* Instantiates the distinguishing inputs of the given equalities up to the current witness level.
+     * If they are all deeper, we move on to the proof check: it either proves the query, or leads to
+     * an unrolling, which raises the level. Going through the proof check ensures that witnesses can't
+     * delay a proof that the unfolding already allows (see `function-witnesses.md`). */
+    def instantiateWitnesses(needed: Map[Encoded, Int]): CheckState = {
+      val current = needed.filter(_._2 <= witnessLevel).keySet
+      if (current.nonEmpty) {
+        reporter.debug(" - Instantiating distinguishing function inputs")
+        for (cl <- templates.instantiateWitnesses(current)) {
+          underlying.assertCnstr(cl)
+        }
+        ModelCheck
+      } else {
+        ProofCheck
+      }
+    }
+
+    /* Decides what to do with the pending equalities when a check that assumed them is UNSAT, given
+     * the core equalities of the check and a way to run it again without the equalities. Returns
+     * the next state, or the result of the check without equalities when they aren't to blame.
+     *
+     * Equalities in the core are instantiated first. Otherwise, the core may still be missing them
+     * (solvers don't reliably report every assumption they used), so we check again without them:
+     * if that is satisfiable, the equalities are needed, and we instantiate the whole current level,
+     * which also keeps instantiation fair. */
+    def blamedEqualities(
+      inCore: Map[Encoded, Int],
+      equalities: Map[Encoded, Int],
+      withoutEqualities: => SolverResponse[underlying.Model, Set[underlying.Trees]]
+    ): Either[CheckState, SolverResponse[underlying.Model, Set[underlying.Trees]]] = {
+      if (inCore.exists(_._2 <= witnessLevel)) {
+        Left(instantiateWitnesses(inCore))
+      } else {
+        reporter.debug(" - Checking again without equalities between functions")
+        val res = withoutEqualities
+        res match {
+          case _: Satisfiable => Left(instantiateWitnesses(equalities))
+          case _ => Right(res)
+        }
+      }
+    }
+
+    /* Runs the proof check, under the witness assumption when witnesses are in use. As unrolling and
+     * instantiation only add clauses, an UNSAT answer under the witness assumption means no model
+     * with distinguishing inputs will ever be found: if the query is satisfiable without them, they
+     * are dropped. Returns the next state in that case, or the result of the check. */
+    def refute(config: Configuration): Either[CheckState, SolverResponse[underlying.Model, Set[underlying.Trees]]] = {
+      def check(witnesses: Seq[Encoded]) = context.timers.solvers.unrolling.check.run {
+        underlying.checkAssumptions(config)(encodedAssumptions.toSet ++ templates.refutationAssumptions ++ witnesses)
+      }
+
+      val witnesses = witnessAssumptions
+      check(witnesses) match {
+        case res @ (_: Unsatisfiable) if witnesses.nonEmpty && !abort && !pause =>
+          reporter.debug(" - Checking again without distinguishing function inputs")
+          check(Seq.empty) match {
+            case _: Satisfiable =>
+              reporter.debug(" - Distinguishing function inputs are infeasible, dropping them")
+              useWitnesses = false
+              Left(ModelCheck)
+            case res => Right(res)
+          }
+        case res => Right(res)
+      }
+    }
+
     var currentState: CheckState = ModelCheck
     while (!currentState.isInstanceOf[CheckResult]) {
       currentState = currentState match {
         case ModelCheck =>
           reporter.debug(" - Running search...")
 
+          val witnesses = witnessAssumptions
+          val equalities = witnessEqualities
+          modelWithWitnesses = witnesses.nonEmpty
           val getModel = !templates.requiresFiniteRangeCheck || checkModels || templates.hasAxioms || config.withModel
-          val getAssumptions = (unrollAssumptions && templates.canUnroll) || config.withUnsatAssumptions 
+          val getAssumptions = (unrollAssumptions && templates.canUnroll) || config.withUnsatAssumptions ||
+            witnesses.nonEmpty || equalities.nonEmpty
           val checkConfig = Configuration(model = getModel && !ignoreModels, unsatAssumptions = getAssumptions)
 
-          val res: SolverResponse[underlying.Model, Set[underlying.Trees]] = context.timers.solvers.unrolling.check.run {
-            underlying.checkAssumptions(checkConfig)(
-              encodedAssumptions.toSet ++ templates.satisfactionAssumptions
-            )
-          }
+          def check(equalities: Iterable[Encoded]): SolverResponse[underlying.Model, Set[underlying.Trees]] =
+            context.timers.solvers.unrolling.check.run {
+              underlying.checkAssumptions(checkConfig)(
+                encodedAssumptions.toSet ++ templates.satisfactionAssumptions ++ witnesses ++ equalities
+              )
+            }
+
+          val resWithEqualities = check(equalities.keys)
 
           reporter.debug(" - Finished search with blocked literals")
 
-          res match {
-            case Abort() =>
-              CheckResult.cast(Unknown)
+          // the equalities are only assumed in `resWithEqualities`, so that every UNSAT answer below
+          // comes from a check without them
+          val next: Either[CheckState, SolverResponse[underlying.Model, Set[underlying.Trees]]] = resWithEqualities match {
+            case Abort() => Right(resWithEqualities)
+            case _: Unsatisfiable if equalities.nonEmpty =>
+              blamedEqualities(coreEqualities(resWithEqualities, equalities), equalities, check(Seq.empty))
+            case _ => Right(resWithEqualities)
+          }
 
-            case _: Satisfiable if templates.requiresFiniteRangeCheck =>
-              FiniteRangeCheck
+          next match {
+            case Left(state) => state
+            case Right(res) => res match {
+              case Abort() =>
+                CheckResult.cast(Unknown)
 
-            case Sat =>
-              if (config.withModel && ignoreModels) then
-                // did we discard the model check manually?
-                // if yes, recast to the right response, with an empty model
-                CheckResult(config.cast(SatWithModel(emptyModel)))
-              else
-                CheckResult.cast(Sat)
+              // distinguishing inputs only matter once we have a model, in which distinct functions
+              // may still agree on every input: check again with these assumed equal
+              case _: Satisfiable if useWitnesses && witnessLevel == 0 && templates.witnessEqualities.nonEmpty =>
+                witnessLevel = 1
+                ModelCheck
 
-            case SatWithModel(model) =>
-              Validate(model)
+              case _: Satisfiable if templates.requiresFiniteRangeCheck =>
+                FiniteRangeCheck
 
-            case _: Unsatisfiable if !templates.canUnroll =>
-              CheckResult.cast(res)
+              case Sat =>
+                if (config.withModel && ignoreModels) then
+                  // did we discard the model check manually?
+                  // if yes, recast to the right response, with an empty model
+                  CheckResult(config.cast(SatWithModel(emptyModel)))
+                else
+                  CheckResult.cast(Sat)
 
-            case UnsatWithAssumptions(assumptions) if unrollAssumptions =>
-              for (b <- assumptions) templates.promoteBlocker(b)
-              ProofCheck
+              case SatWithModel(model) =>
+                Validate(model)
 
-            case _ =>
-              ProofCheck
+              // with witnesses, the proof check decides (see [[refute]])
+              case _: Unsatisfiable if !templates.canUnroll && witnesses.isEmpty =>
+                CheckResult.cast(res)
+
+              case UnsatWithAssumptions(assumptions) if unrollAssumptions =>
+                for (b <- assumptions) templates.promoteBlocker(b)
+                ProofCheck
+
+              case _ =>
+                ProofCheck
+            }
           }
 
         case FiniteRangeCheck =>
@@ -735,31 +865,58 @@ abstract class AbstractUnrollingSolver private
 
           val clauses = templates.getFiniteRangeClauses
 
-          val res: SolverResponse[underlying.Model, Set[underlying.Trees]] = context.timers.solvers.unrolling.check.run {
-            underlying.push()
-            for (cl <- encodedAssumptions.toSeq ++ templates.satisfactionAssumptions ++ clauses) {
-              underlying.assertCnstr(cl)
+          // the model must have distinguishing inputs as well (see [[ModelCheck]])
+          val witnesses = witnessAssumptions
+          val equalities = witnessEqualities
+          modelWithWitnesses = witnesses.nonEmpty
+
+          val next: Either[CheckState, SolverResponse[underlying.Model, Set[underlying.Trees]]] =
+            context.timers.solvers.unrolling.check.run {
+              underlying.push()
+              for (cl <- encodedAssumptions.toSeq ++ templates.satisfactionAssumptions ++ clauses) {
+                underlying.assertCnstr(cl)
+              }
+              def check(equalities: Iterable[Encoded]) =
+                underlying.checkAssumptions(Configuration(model = true, unsatAssumptions = equalities.nonEmpty))(
+                  witnesses.toSet ++ equalities
+                )
+              val res = check(equalities.keys)
+              // Only equalities are instantiated here, the witnesses are never dropped: the finite range
+              // clauses change as quantifiers are instantiated, so their infeasibility is temporary.
+              val next = res match {
+                case _: Unsatisfiable if equalities.nonEmpty && !abort && !pause =>
+                  val inCore = coreEqualities(res, equalities).filter(_._2 <= witnessLevel)
+                  if (inCore.nonEmpty) Left(inCore)
+                  else check(Seq.empty) match {
+                    case _: Satisfiable => Left(equalities.filter(_._2 <= witnessLevel))
+                    case _ => Right(res)
+                  }
+                case _ => Right(res)
+              }
+              underlying.pop()
+              next.left.map { needed =>
+                if (needed.nonEmpty) instantiateWitnesses(needed) else InstantiateQuantifiers
+              }
             }
-            val res = underlying.check(Model)
-            underlying.pop()
-            res
-          }
 
           reporter.debug(" - Finished checking finite ranges")
 
-          res match {
-            case Abort() =>
-              CheckResult.cast(Unknown)
+          next match {
+            case Left(state) => state
+            case Right(res) => res match {
+              case Abort() =>
+                CheckResult.cast(Unknown)
 
-            case SatWithModel(model) =>
-              Validate(model)
+              case SatWithModel(model) =>
+                Validate(model)
 
-            case _ =>
-              InstantiateQuantifiers
+              case _ =>
+                InstantiateQuantifiers
+            }
           }
 
         case Validate(umodel) =>
-          (try { Some(extractTotalModel(umodel)) } catch {
+          val validated = (try { Some(extractTotalModel(umodel)) } catch {
             case NoSimpleValue(tpe) =>
               if (!silentErrors) {
                 reporter.error("No simple value found for type " + tpe.asString)
@@ -812,6 +969,16 @@ abstract class AbstractUnrollingSolver private
             }
           }.getOrElse(CheckResult `cast` Unknown)
 
+          validated match {
+            // the witnesses may have led to a model we can't extract (or validate),
+            // so we try again without them
+            case CheckResult(Unknown) if modelWithWitnesses && useWitnesses && !abort && !pause =>
+              reporter.debug(" - Model with distinguishing function inputs is unusable, dropping them")
+              useWitnesses = false
+              ModelCheck
+            case res => res
+          }
+
         case InstantiateQuantifiers =>
           if (templates.quantificationsManager.unrollGeneration.isEmpty) {
             if (!silentErrors) {
@@ -827,25 +994,24 @@ abstract class AbstractUnrollingSolver private
           // check without additional model-guidance for unrolling
           reporter.debug(" - Running search without blocked literals (w/o lucky test)")
 
-          val res = context.timers.solvers.unrolling.check.run {
-              underlying.checkAssumptions(Configuration(model = false, unsatAssumptions = config.withUnsatAssumptions))(
-                encodedAssumptions.toSet ++ templates.refutationAssumptions
-              )
-            }
+          val next = refute(Configuration(model = false, unsatAssumptions = config.withUnsatAssumptions))
 
           reporter.debug(" - Finished search without blocked literals")
 
-          res match {
-            case Abort() =>
-              CheckResult.cast(Unknown)
+          next match {
+            case Left(state) => state
+            case Right(res) => res match {
+              case Abort() =>
+                CheckResult.cast(Unknown)
 
-            case _: Unsatisfiable =>
-              CheckResult.cast(res)
+              case _: Unsatisfiable =>
+                CheckResult.cast(res)
 
-            case _: Satisfiable =>
-              Unroll
+              case _: Satisfiable =>
+                Unroll
 
-            case otherwise => sys.error(s"Unexpected case: $otherwise")
+              case otherwise => sys.error(s"Unexpected case: $otherwise")
+            }
           }
 
         case ProofCheck =>
@@ -857,50 +1023,48 @@ abstract class AbstractUnrollingSolver private
 
           // we always ask for a model here in order to give priority to blockers that
           // are keeping quantified clause instantiations from being considered
-          val res: SolverResponse[underlying.Model, Set[underlying.Trees]] =
-            context.timers.solvers.unrolling.check.run {
-              underlying.checkAssumptions(config `max` Configuration(model = true))(
-                encodedAssumptions.toSet ++ templates.refutationAssumptions
-              )
-            }
+          val next = refute(config `max` Configuration(model = true))
 
           reporter.debug(" - Finished search without blocked literals")
 
-          res match {
-            case Abort() =>
-              CheckResult.cast(Unknown)
+          next match {
+            case Left(state) => state
+            case Right(res) => res match {
+              case Abort() =>
+                CheckResult.cast(Unknown)
 
-            case _: Unsatisfiable =>
-              CheckResult.cast(res)
+              case _: Unsatisfiable =>
+                CheckResult.cast(res)
 
-            case SatWithModel(model) =>
-              lazy val luckyModel = if (!feelingLucky) None else {
-                (try { Some(extractSimpleModel(model)) } catch { case _: NoSimpleValue => None })
-                  .filter(exModel => validateModel(exModel, assumptionsSeq, silenceErrors = true))
-              }
-
-              if (luckyModel.isDefined) {
-                CheckResult(config `cast` (if (config.withModel) SatWithModel(luckyModel.get) else Sat))
-              } else {
-                val wrapped = wrapModel(model)
-
-                if (modelFinding) {
-                  for {
-                    b <- templates.satisfactionAssumptions
-                    v = templates.extractNot(b).getOrElse(b)
-                    if wrapped.eval(v, BooleanType()) == Some(BooleanLiteral(true))
-                  } templates.promoteBlocker(v)
+              case SatWithModel(model) =>
+                lazy val luckyModel = if (!feelingLucky) None else {
+                  (try { Some(extractSimpleModel(model)) } catch { case _: NoSimpleValue => None })
+                    .filter(exModel => validateModel(exModel, assumptionsSeq, silenceErrors = true))
                 }
 
-                for {
-                  (inst, bs) <- templates.getInstantiationsWithBlockers
-                  if wrapped.eval(inst, BooleanType()) == Some(BooleanLiteral(false))
-                  b <- bs
-                } templates.promoteBlocker(b, force = true)
+                if (luckyModel.isDefined) {
+                  CheckResult(config `cast` (if (config.withModel) SatWithModel(luckyModel.get) else Sat))
+                } else {
+                  val wrapped = wrapModel(model)
 
-                Unroll
-              }
-            case otherwise => sys.error(s"Unexpected case: $otherwise")
+                  if (modelFinding) {
+                    for {
+                      b <- templates.satisfactionAssumptions
+                      v = templates.extractNot(b).getOrElse(b)
+                      if wrapped.eval(v, BooleanType()) == Some(BooleanLiteral(true))
+                    } templates.promoteBlocker(v)
+                  }
+
+                  for {
+                    (inst, bs) <- templates.getInstantiationsWithBlockers
+                    if wrapped.eval(inst, BooleanType()) == Some(BooleanLiteral(false))
+                    b <- bs
+                  } templates.promoteBlocker(b, force = true)
+
+                  Unroll
+                }
+              case otherwise => sys.error(s"Unexpected case: $otherwise")
+            }
           }
 
         case Unroll if !canUnroll =>
@@ -919,6 +1083,7 @@ abstract class AbstractUnrollingSolver private
           }
 
           unrollCount += 1
+          if (witnessLevel > 0) witnessLevel += 1
 
           reporter.debug(" - Finished unrolling")
           ModelCheck

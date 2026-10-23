@@ -153,6 +153,9 @@ trait TypeTemplates { self: Templates =>
       val gen = nextGeneration(currentGeneration)
       val notBlocker = mkNot(blocker)
 
+      // keep track of the witness depth until the typing is unrolled (see [[LambdaTemplates]])
+      if (witnessDepth > 0) typeDepths += blocker -> (witnessDepth max typeDepths.getOrElse(blocker, 0))
+
       typeInfos.get(blocker) match {
         case Some((exGen, origGen, _, exTps)) =>
           val minGen = gen min exGen
@@ -294,6 +297,7 @@ trait TypeTemplates { self: Templates =>
     private[TypeTemplates] val typeInfos = new IncrementalMap[Encoded, (Int, Int, Encoded, Set[Typing])]
     private[TypeTemplates] val lessOrder = new IncrementalMap[Encoded, Set[Encoded]].withDefaultValue(Set.empty)
     private[TypeTemplates] val results = new IncrementalMap[(Type, Encoded, Seq[Arg], Boolean), Encoded]
+    private[TypeTemplates] val typeDepths = new IncrementalMap[Encoded, Int]
 
     private val tpSyms: MutableMap[TypeParameter, Variable] = MutableMap.empty
     private[unrolling] val tpSubst: MutableMap[Variable, Encoded] = MutableMap.empty
@@ -314,7 +318,7 @@ trait TypeTemplates { self: Templates =>
       !transitiveLess(f1, f2) && !transitiveLess(f2, f1)
     }
 
-    val incrementals: Seq[IncrementalState] = Seq(typeInfos, lessOrder, results)
+    val incrementals: Seq[IncrementalState] = Seq(typeInfos, lessOrder, results, typeDepths)
 
     def unrollGeneration: Option[Int] =
       if (typeInfos.isEmpty) None
@@ -343,7 +347,7 @@ trait TypeTemplates { self: Templates =>
       typeInfos --= typeBlockers
 
       for ((blocker, (gen, _, _, tps)) <- newTypeInfos; tp <- tps) {
-        newClauses ++= instantiateTyping(blocker, tp)
+        newClauses ++= withWitnessDepth(typeDepths.getOrElse(blocker, 0))(instantiateTyping(blocker, tp))
       }
 
       reporter.debug("Unrolling types (" + newClauses.size + ")")

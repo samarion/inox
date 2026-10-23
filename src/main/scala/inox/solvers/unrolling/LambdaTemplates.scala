@@ -175,7 +175,11 @@ trait LambdaTemplates { self: Templates =>
         val toVars = typeOps.variablesOf(to).toSeq.sortBy(_.id)
         val toClosures = toVars.map(subst)
         val appResult = encodeSymbol(Variable.fresh("result", BooleanType(), true))
-        clauses ++= instantiateType(freshBlocker, Typing(to, app.encoded, Constraint(appResult, toClosures, free)))
+        // the application result descends from both `f` and the arguments of `app`
+        val depth = currentWitnessDepth max witnessDepths.getOrElse(f, 0) max appDepths.getOrElse(app, 0)
+        clauses ++= withWitnessDepth(depth) {
+          instantiateType(freshBlocker, Typing(to, app.encoded, Constraint(appResult, toClosures, free)))
+        }
 
         (typeBlocker, appResult)
       }
@@ -193,13 +197,17 @@ trait LambdaTemplates { self: Templates =>
 
     val clauses = new scala.collection.mutable.ListBuffer[Encoded]
 
+    // The blocker of a function-typed application result only bounds whether its typing holds,
+    // so the result is also considered active whenever the application is (see [[resultGuards]])
+    val active = resultGuards.get(f).map(a => mkOr(b, a)).getOrElse(b)
+
     // Add non-free blocker clause
     val isFree = encodeSymbol(Variable.fresh("b_free", BooleanType(), true))
     locally {
       val nextB = encodeSymbol(Variable.fresh("b_next", BooleanType(), true))
       nonFreeBlockers += f -> ((isFree, nextB))
 
-      clauses += mkImplies(b, mkEquals(isFree, mkNot(mkOr((for {
+      clauses += mkImplies(active, mkEquals(isFree, mkNot(mkOr((for {
         template <- byType(ft).values
         if canBeEqual(template.ids._2, f)
       } yield {
@@ -243,6 +251,22 @@ trait LambdaTemplates { self: Templates =>
         val cond = mkAnd(b, isFree, mkEquals(f, caller))
         registerAppInfo(gen, app, Right(f), cond, args)
       }
+    }
+
+    // Make sure `f` has a distinguishing input with every other function it differs from
+    if (free && functionWitnesses) {
+      val guard = mkAnd(active, isFree)
+      if (currentWitnessDepth > 0) witnessDepths += f -> currentWitnessDepth
+
+      for ((otherGuard, other) <- witnessFunctions(ft).toSeq if other != f) {
+        clauses ++= registerWitness(mkAnd(guard, otherGuard), ft, f, other)
+      }
+
+      for (template <- byType(ft).values.toSeq) {
+        clauses ++= registerWitness(mkAnd(guard, template.start), ft, f, template.ids._2)
+      }
+
+      witnessFunctions += ft -> (witnessFunctions(ft) + (guard -> f))
     }
 
     clauses.toSeq
@@ -333,6 +357,7 @@ trait LambdaTemplates { self: Templates =>
         nonFreeClauses
 
       byID += idT -> newTemplate
+      if (currentWitnessDepth > 0) witnessDepths += idT -> currentWitnessDepth
       byType += newTemplate.tpe -> (byType(newTemplate.tpe) + (newTemplate.structure -> newTemplate))
 
       val gen = nextGeneration(currentGeneration)
@@ -341,7 +366,12 @@ trait LambdaTemplates { self: Templates =>
         registerAppInfo(gen, app, Left(newTemplate), cond, args)
       }
 
-      (idT, clauses)
+      // make sure free functions have a distinguishing input with the new lambda (if they differ)
+      val witnessClauses = for ((guard, f) <- witnessFunctions(newTemplate.tpe).toSeq) yield {
+        registerWitness(mkAnd(guard, newTemplate.start), newTemplate.tpe, f, idT)
+      }
+
+      (idT, clauses ++ witnessClauses.flatten)
     }
   }
 
@@ -352,6 +382,11 @@ trait LambdaTemplates { self: Templates =>
     var clauses: Clauses = Seq.empty
     if (!instantiated(key)) {
       instantiated += key
+
+      if (functionWitnesses && ft.to.isInstanceOf[FunctionType]) {
+        val active = resultGuards.cached(app.encoded)(encodeSymbol(Variable.fresh("b_active", BooleanType(), true)))
+        clauses :+= mkImplies(blocker, active)
+      }
 
       if (!appBlockers.isDefinedAt(key)) {
         val firstB = encodeSymbol(Variable.fresh("b_lambda", BooleanType(), true))
@@ -402,6 +437,7 @@ trait LambdaTemplates { self: Templates =>
         }
 
         applications += ft -> (applications(ft) + key)
+        if (currentWitnessDepth > 0) appDepths += app -> (currentWitnessDepth max appDepths.getOrElse(app, 0))
       }
     }
 
@@ -437,6 +473,85 @@ trait LambdaTemplates { self: Templates =>
   }
 
   def getLambdaTemplates(tpe: FunctionType): Set[LambdaTemplate] = byType(tpe).values.toSet
+
+  /** The witness nesting depth of the symbols currently being instantiated (0 for regular inputs).
+    *
+    * Everything that descends from a distinguishing input inherits its depth: the free functions in
+    * its type unfolding (including ADT fields that are unfolded at later generations, see
+    * [[TypeTemplates]]) and the results of the applications it takes part in. Otherwise, the free
+    * functions that appear in these could get fresh distinguishing inputs of their own without bound
+    * (eg. lambdas that are created anew in each distinguishing input). */
+  private var currentWitnessDepth = 0
+
+  protected def witnessDepth: Int = currentWitnessDepth
+
+  protected def withWitnessDepth[T](depth: Int)(body: => T): T = {
+    val previous = currentWitnessDepth
+    currentWitnessDepth = depth
+    try body finally currentWitnessDepth = previous
+  }
+
+  /** Registers a distinguishing input for `f1` and `f2` (needed when `cond` holds), to be
+    * instantiated by [[instantiateWitnesses]]. Until then, the returned clause lets the solver
+    * assume that `f1 == f2` through the [[PendingWitness.equality]] literal. */
+  private def registerWitness(cond: Encoded, tpe: FunctionType, f1: Encoded, f2: Encoded): Clauses = {
+    val depth = (witnessDepths.getOrElse(f1, 0) max witnessDepths.getOrElse(f2, 0)) + 1
+    val equality = encodeSymbol(Variable.fresh("b_eq", BooleanType(), true))
+    pendingWitnesses += PendingWitness(cond, tpe, f1, f2, depth, equality)
+    Seq(mkImplies(mkAnd(equality, cond), mkEquals(f1, f2)))
+  }
+
+  /** The equality literals of the pending distinguishing inputs, along with their depth.
+    *
+    * Distinguishing inputs are unfolded progressively, much like function calls: once it has found
+    * a model, the solver assumes that the pairs of functions that don't have a distinguishing input
+    * yet are equal. A model under these assumptions needs no more distinguishing inputs, and if they
+    * make the formula unsatisfiable, the solver instantiates the ones whose equalities are in the
+    * unsat core (see [[instantiateWitnesses]]). This keeps distinguishing inputs away from unsatisfiable
+    * queries and from the pairs of functions that a model can keep equal.
+    *
+    * To stay fair with the rest of the unfolding, the solver only instantiates distinguishing inputs
+    * up to a depth that grows by one with each unrolling. Each round stays finite: the free functions
+    * and lambdas a distinguishing input creates on the spot inherit its depth, and the others are only
+    * created by later unrollings. */
+  def witnessEqualities: Map[Encoded, Int] =
+    pendingWitnesses.toSeq.map(w => w.equality -> w.depth).toMap
+
+  /** Instantiates the pending distinguishing inputs with the given equality literals. */
+  def instantiateWitnesses(equalities: Set[Encoded]): Clauses = {
+    pendingWitnesses.toSeq.filter(w => equalities(w.equality)).sortBy(_.depth).flatMap { w =>
+      pendingWitnesses -= w
+      witnessPairs += (w.f1 -> w.f2)
+      withWitnessDepth(w.depth)(instantiateWitness(mkAnd(witnessEnabler, w.cond), w.tpe, w.f1, w.f2))
+    }
+  }
+
+  /** Whether the solver should search for models in which distinct first-class functions
+    * have a distinguishing input (see [[witnessAssumptions]]). */
+  protected lazy val functionWitnesses: Boolean = options.findOptionOrDefault(optFunctionWitnesses)
+
+  /** Assumptions that enable distinguishing inputs between first-class functions.
+    *
+    * Function equality in Inox is intensional, so two functions that agree on all inputs
+    * may still be distinct. When reporting models, we would however like each pair of distinct
+    * function values to have an input on which they differ, as this ensures the extracted
+    * function values are meaningfully distinct. For each pair of free functions `f` and `g`
+    * (and each pair of free function `f` and lambda `g`), we therefore introduce fresh witness
+    * arguments `ws` such that `f != g ==> f(ws) != g(ws)`. Witnesses of function type are
+    * themselves free functions, so the construction recurses on higher-order argument types.
+    *
+    * These witness constraints are an extensionality assumption that doesn't hold in general,
+    * so they are guarded by a literal that is only assumed during model finding (and never
+    * during refutation). The solver is responsible for dropping these assumptions when they
+    * are the reason for unsatisfiability.
+    */
+  /** Whether `e` is the argument of a distinguishing input (see [[Templates.instantiateWitness]]). */
+  def isWitnessArgument(e: Encoded): Boolean = witnessArguments(e)
+
+  def witnessAssumptions: Seq[Encoded] =
+    if (witnessPairs.isEmpty) Seq.empty else Seq(witnessEnabler)
+
+  protected case class PendingWitness(cond: Encoded, tpe: FunctionType, f1: Encoded, f2: Encoded, depth: Int, equality: Encoded)
 
   private[unrolling] object lambdasManager extends Manager {
     // Function instantiations have their own defblocker
@@ -499,10 +614,39 @@ trait LambdaTemplates { self: Templates =>
 
     val instantiated = new IncrementalSet[(Encoded, App)]
 
+    /** This mapping maintains the set of free functions (along with the condition under which
+      * they are free) which require distinguishing inputs with other functions of the same type.
+      * @see [[witnessAssumptions]]
+      */
+    val witnessFunctions = new IncrementalMap[FunctionType, Set[(Encoded, Encoded)]].withDefaultValue(Set.empty)
+
+    /** Witness nesting depth of the free functions that were introduced as distinguishing inputs. */
+    val witnessDepths = new IncrementalMap[Encoded, Int]
+
+    /** Witness nesting depth of the applications that were registered while instantiating distinguishing inputs. */
+    val appDepths = new IncrementalMap[App, Int]
+
+    /** For function-typed applications, a literal that holds whenever the application is reached.
+      * Results of applications are registered as free functions under a blocker that is only an
+      * upper bound, which would let a model keep two distinct results without distinguishing them. */
+    val resultGuards = new IncrementalMap[Encoded, Encoded]
+
+    /** The witness arguments of the instantiated distinguishing inputs. */
+    val witnessArguments = new IncrementalSet[Encoded]
+
+    /** The pairs of functions that received a distinguishing input. */
+    val witnessPairs = new IncrementalSet[(Encoded, Encoded)]
+
+    /** The distinguishing inputs that haven't been instantiated yet. */
+    val pendingWitnesses = new IncrementalSet[PendingWitness]
+
+    /** The literal that guards all distinguishing input constraints. */
+    lazy val witnessEnabler: Encoded = encodeSymbol(Variable.fresh("b_witness", BooleanType(), true))
+
     val incrementals: Seq[IncrementalState] = Seq(
       lambdaBlockers, appInfos, appBlockers, blockerToApps,
       byID, byType, applications, freeBlockers, nonFreeBlockers, freeFunctions,
-      instantiated, typeBlockers)
+      instantiated, typeBlockers, witnessFunctions, witnessDepths, appDepths, resultGuards, witnessArguments, witnessPairs, pendingWitnesses)
 
     def unrollGeneration: Option[Int] =
       if (appInfos.isEmpty) None
@@ -574,7 +718,9 @@ trait LambdaTemplates { self: Templates =>
                 val lambdaBlocker = encodeSymbol(Variable.fresh("d", BooleanType(), true))
                 lambdaBlockers += info -> lambdaBlocker
 
-                val instClauses: Clauses = template.instantiate(lambdaBlocker, args)
+                // the lambda body is instantiated on the arguments of `app`, so it inherits their witness depth
+                val depth = appDepths.getOrElse(app._2, 0) max witnessDepths.getOrElse(template.ids._2, 0)
+                val instClauses: Clauses = withWitnessDepth(depth)(template.instantiate(lambdaBlocker, args))
 
                 newCls ++= instClauses
                 lambdaBlocker
