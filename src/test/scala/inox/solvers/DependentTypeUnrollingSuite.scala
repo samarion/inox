@@ -47,8 +47,8 @@ class DependentTypeUnrollingSuite extends AnyFunSuite {
 
     for {
       sname <- solverNames
-      // Models are not checked: the default value of a function model is not constrained by
-      // the codomain of its Pi type, so such models may fail validation (and yield Unknown).
+      // Models are only checked by `assertValidSAT`: validating the model of a function with a
+      // function-typed domain quantifies over functions, which the evaluator can't decide.
       ctx = TestContext(Options(Seq(optSelectedSolvers(Set(sname)))))
     } superTest(this, s"$name solver=$sname")(body(ctx))
   }
@@ -58,6 +58,15 @@ class DependentTypeUnrollingSuite extends AnyFunSuite {
   private def assertSAT(ctx: Context, e: Expr): Unit = {
     val res = solver(ctx).solveSAT(e)
     assert(res.isSAT, s"expected SAT for ${e.asString(using PrinterOptions())}, got $res")
+  }
+
+  // Checks that the model is valid, including the codomains of Pi-typed functions. Function
+  // models extracted from Princess are currently wrong even without dependent types (their
+  // applications all evaluate to 0), so models are only checked for the other solvers.
+  private def assertValidSAT(ctx: Context, e: Expr): Unit = {
+    val princess = ctx.options.findOptionOrDefault(optSelectedSolvers) == Set("princess")
+    val res = solver(ctx.withOpts(optCheckModels(!princess))).solveSAT(e)
+    assert(res.isSAT, s"expected SAT with a valid model for ${e.asString(using PrinterOptions())}, got $res")
   }
 
   private def assertUNSAT(ctx: Context, e: Expr): Unit = {
@@ -186,6 +195,17 @@ class DependentTypeUnrollingSuite extends AnyFunSuite {
     assertUNSAT(ctx, f(cons(const(1), nil)) <= IntegerLiteral(0))
     assertUNSAT(ctx, f(cons(const(1), cons(const(2), nil))) <= IntegerLiteral(0))
     assertSAT(ctx, f(cons(const(1), cons(const(-1), nil))) <= IntegerLiteral(0))
+  }
+
+  test("models of Pi-typed functions respect their codomains") { ctx =>
+    val f = ("f" :: posToPos).toVariable
+    val x = ("x" :: IntegerType()).toVariable
+    assertValidSAT(ctx, f(IntegerLiteral(0)) <= IntegerLiteral(0))
+    assertValidSAT(ctx, (x > IntegerLiteral(5)) && (f(x) > IntegerLiteral(7)) && (f(IntegerLiteral(-1)) < IntegerLiteral(0)))
+
+    // f: Pi(x: BigInt). {r: BigInt | r > x}
+    val g = ("g" :: pi("x" :: IntegerType())(x => refinement("r" :: IntegerType())(_ > x))).toVariable
+    assertValidSAT(ctx, g(IntegerLiteral(3)) > IntegerLiteral(10))
   }
 
   test("negated universal quantifier") { ctx =>
