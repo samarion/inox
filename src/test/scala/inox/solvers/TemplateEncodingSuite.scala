@@ -98,11 +98,11 @@ class TemplateEncodingSuite extends SolverTestSuite with DatastructureUtils {
   }
 
   test("Function equality", Integers, Functions) { ctx =>
-    val s = solver(ctx)
     val f = Variable.fresh("f", FunctionType(Seq(IntegerType()), IntegerType()))
     val succ = \("x" :: IntegerType())(x => x + int(1))
-    assert(s.solveVALID(Equals(f, succ) ==> Equals(f(int(1)), int(2))) contains true)
-    assert(s.solveVALID(Equals(f, succ) ==> Equals(f(int(1)), int(1))) contains false)
+
+    // Functions don't admit equality, so comparing them is rejected
+    intercept[ast.TypeOps#TypeErrorException](solver(ctx).solveVALID(Equals(f, succ) ==> Equals(f(int(1)), int(2))))
   }
 
   test("Choose in function", Integers) { ctx =>
