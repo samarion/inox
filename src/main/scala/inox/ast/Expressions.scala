@@ -366,6 +366,17 @@ trait Expressions { self: Trees =>
     }
   }
 
+  /** $encodingof extensional equality: functions are equal when they agree on every input.
+    *
+    * Unlike [[Equals]], it applies to every type, including the ones that don't admit equality (see
+    * [[EqualityTypes]]). On those it involves a quantifier, so it belongs in specifications. */
+  sealed case class ExtEquals(lhs: Expr, rhs: Expr) extends Expr with CachingTyped {
+    override protected def computeTpe(stripRefinements: Boolean)(using s: Symbols): Type = {
+      if (s.leastUpperBound(lhs.getType, rhs.getType) != Untyped) BooleanType()
+      else Untyped
+    }
+  }
+
 
   /* Propositional logic */
 

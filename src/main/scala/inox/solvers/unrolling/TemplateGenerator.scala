@@ -60,6 +60,7 @@ trait TemplateGenerator { self: Templates =>
   private def isSimple(expr: Expr): Boolean = {
     exprOps.isSimple(expr) && !exprOps.exists {
       case Equals(e1, e2) => unrollEquality(e1.getType)
+      case _: ExtEquals => true
       case _ => false
     } (expr)
   }
@@ -291,11 +292,11 @@ trait TemplateGenerator { self: Templates =>
       quantifications :+= quantification
 
     var equalities = Map[Encoded, Set[Equality]]()
-    @inline def storeEquality(guardVar: Variable, e1: Expr, e2: Expr): Unit = {
+    @inline def storeEquality(guardVar: Variable, e1: Expr, e2: Expr, extensional: Boolean = false, pol: Option[Boolean] = None): Unit = {
       val b = encodedCond(guardVar)
       val prev: Set[Equality] = equalities.getOrElse(b, Set.empty)
       val encoder: Expr => Encoded = mkEncoder(localSubst)
-      equalities += b -> (prev + Equality(e1.getType, encoder(e1), encoder(e2)))
+      equalities += b -> (prev + Equality(e1.getType, encoder(e1), encoder(e2), extensional, pol))
     }
 
     @inline def localSubst: Map[Variable, Encoded] =
@@ -515,6 +516,23 @@ trait TemplateGenerator { self: Templates =>
         val re1 = rec(pathVar, e1, pol)
         val re2 = rec(pathVar, e2, pol)
         storeEquality(pathVar, re1, re2)
+        Application(v, Seq(re1, re2))
+
+      // Extensional equality coincides with equality on types that admit it
+      case ExtEquals(e1, e2) if admitsEquality(e1.getType) =>
+        rec(pathVar, Equals(e1, e2).copiedFrom(expr), pol)
+
+      // Unfolding one level keeps the polarity of the quantifiers it introduces, so that a negated
+      // equality between functions only introduces a distinguishing input. Only sorts, which can
+      // be recursive, are unfolded lazily.
+      case ExtEquals(e1, e2) if !e1.getType.isInstanceOf[ADTType] =>
+        rec(pathVar, extensionalEquality(e1.getType, e1, e2), pol)
+
+      case ExtEquals(e1, e2) =>
+        val (v, _) = equalitySymbol(e1.getType, extensional = true)
+        val re1 = rec(pathVar, e1, pol)
+        val re2 = rec(pathVar, e2, pol)
+        storeEquality(pathVar, re1, re2, extensional = true, pol = pol)
         Application(v, Seq(re1, re2))
 
       case Operator(as, r) => r(as.map(a => rec(pathVar, a, None)))

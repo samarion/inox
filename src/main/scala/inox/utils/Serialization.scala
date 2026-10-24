@@ -503,6 +503,7 @@ class InoxSerializer(val trees: ast.Trees, serializeProducts: Boolean = false) e
     classSerializer[IsConstructor]     (28),
     classSerializer[ADTSelector]       (29),
     classSerializer[Equals]            (30),
+    classSerializer[ExtEquals]         (144),
     classSerializer[And]               (31),
     classSerializer[Or]                (32),
     classSerializer[Implies]           (99),
