@@ -161,6 +161,9 @@ trait Printer {
     case Equals(l, r) => optP {
       p"$l == $r"
     }
+    case ExtEquals(l, r) => optP {
+      p"$l =~= $r"
+    }
 
     case StringConcat(lhs, rhs) => optP {
       p"$lhs + $rhs"
@@ -534,7 +537,7 @@ trait Printer {
       _: BVAShiftRight | _: BVLShiftRight | _: BVShiftLeft
       ) => 4
     // 5: = !
-    case (_: Equals | _: Not | _: Implies) => 5
+    case (_: Equals | _: ExtEquals | _: Not | _: Implies) => 5
     // 6: :
     // 7: + -
     case (_: Plus | _: Minus | _: SetUnion | _: SetDifference | _: StringConcat) => 7

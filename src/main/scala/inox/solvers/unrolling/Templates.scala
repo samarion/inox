@@ -284,17 +284,25 @@ trait Templates
     )
   }
 
-  /** Represents an equality relation between two instances of a given type */
-  case class Equality(tpe: Type, e1: Encoded, e2: Encoded) {
+  /** Identifies how equalities are unfolded: their type, whether they are extensional (see
+    * [[Expressions.ExtEquals ExtEquals]]), and for extensional equalities, the polarity in which
+    * they occur, if known. */
+  case class EqualityKey(tpe: Type, extensional: Boolean, polarity: Option[Boolean])
+
+  /** Represents an equality relation between two instances of a given type, which is extensional
+    * equality (see [[Expressions.ExtEquals ExtEquals]]) if `extensional` holds. */
+  case class Equality(tpe: Type, e1: Encoded, e2: Encoded, extensional: Boolean = false, polarity: Option[Boolean] = None) {
     override def toString: String =
-      s"${asString(e1)} == ${asString(e2)} (of type ${tpe.asString})"
+      s"${asString(e1)} ${if (extensional) "=~=" else "=="} ${asString(e2)} (of type ${tpe.asString})"
 
     def substitute(substituter: Encoded => Encoded): Equality = copy(
       e1 = substituter(e1),
       e2 = substituter(e2)
     )
 
-    lazy val symbols: (Variable, Encoded) = equalitySymbol(tpe)
+    lazy val symbols: (Variable, Encoded) = equalitySymbol(tpe, extensional)
+
+    def key: EqualityKey = EqualityKey(tpe, extensional, if (extensional) polarity else None)
   }
 
   /** Template instantiations
@@ -573,7 +581,7 @@ trait Templates
         val result = res.flatten.toMap
 
         result ++ (expr match {
-          case QuantificationMatcher(c, Seq(e1, _)) if c == equalitySymbol(e1.getType)._1 => None
+          case QuantificationMatcher(c: Variable, Seq(e1, _)) if isEqualitySymbol(c, e1.getType) => None
           case QuantificationMatcher(c, args) =>
             // Note that we rely here on the fact that foldRight visits the matcher's arguments first,
             // so any Matcher in arguments will belong to the `result` map
@@ -614,7 +622,7 @@ trait Templates
         case app: Application => Set(app)
         case _ => Set.empty
       } (expr).filter {
-        case Application(c, Seq(e1, e2)) => c != equalitySymbol(e1.getType)._1
+        case Application(c: Variable, Seq(e1, e2)) => !isEqualitySymbol(c, e1.getType)
         case _ => true
       }.map { case app @ Application(c, args) =>
         val tpe = c.getType.asInstanceOf[FunctionType]
@@ -835,8 +843,11 @@ trait Templates
         allClauses ++= instantiateMatcher(bp, m.substitute(substituter, msubst))
       }
 
+      // Extensional equalities can introduce distinguishing inputs on which other extensional
+      // equalities depend, so they are unfolded lazily, like the ones in equality templates
       for ((b, eqs) <- equalities if !abort; bp = substituter(b); e <- eqs if !abort) {
-        allClauses ++= instantiateEquality(bp, e.substitute(substituter))
+        if (e.extensional) registerEquality(bp, e.substitute(substituter))
+        else allClauses ++= instantiateEquality(bp, e.substitute(substituter))
       }
 
       allClauses.toSeq

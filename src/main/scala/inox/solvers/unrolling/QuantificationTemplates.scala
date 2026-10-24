@@ -137,7 +137,7 @@ trait QuantificationTemplates { self: Templates =>
       val trQuantifiers: Seq[Encoded] = forall.params.map(v => encodeSymbol(v.toVariable))
 
       val clauseSubst: Map[Variable, Encoded] = depSubst ++ (idQuantifiers zip trQuantifiers)
-      val (p, tmplClauses) = mkExprClauses(pathVar._1, body, clauseSubst)
+      val (p, tmplClauses) = mkExprClauses(pathVar._1, body, clauseSubst, Some(pol))
 
       given TypingGenerator = if (pol) ContractGenerator else FreeGenerator
       val (tpeCond, tpeClauses) = idQuantifiers.foldLeft((BooleanLiteral(true): Expr, emptyClauses)) {

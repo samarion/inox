@@ -157,6 +157,11 @@ trait TreeDeconstructor {
       (NoIdentifiers, NoVariables, Seq(t1, t2), NoTypes, NoFlags,
         (_, _, es, _, _) => t.Equals(es(0), es(1)))
     },
+    classOf[s.ExtEquals] -> { expr =>
+      val s.ExtEquals(t1, t2) = expr: @unchecked
+      (NoIdentifiers, NoVariables, Seq(t1, t2), NoTypes, NoFlags,
+        (_, _, es, _, _) => t.ExtEquals(es(0), es(1)))
+    },
     classOf[s.And] -> { expr =>
       val s.And(args) = expr: @unchecked
       (NoIdentifiers, NoVariables, args, NoTypes, NoFlags,
