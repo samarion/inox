@@ -121,7 +121,8 @@ trait Definitions { self: Trees =>
       with TypeOps
       with SymbolOps
       with CallGraph
-      with DependencyGraph { self0: Symbols =>
+      with DependencyGraph
+      with EqualityTypes { self0: Symbols =>
 
     // The only value that can be assigned to `trees`, but that has to be
     // done in a concrete class explicitly overriding `trees`
@@ -234,6 +235,14 @@ trait Definitions { self: Trees =>
       if (unbound.nonEmpty) {
         throw NotWellFormedException(fd, Some("Unknown variables: " + (unbound map { _.id.uniqueName } mkString ", ")))
       }
+
+      checkEqualityViolations(fd, equalityViolations(fd))
+    }
+
+    private def checkEqualityViolations(d: Definition, violations: Seq[String]): Unit = {
+      if (violations.nonEmpty) {
+        throw NotWellFormedException(d, Some(violations.mkString(", ")))
+      }
     }
 
     protected def ensureWellFormedSort(sort: ADTSort) = {
@@ -241,6 +250,7 @@ trait Definitions { self: Trees =>
       if (!(sort.constructors forall (cons => cons.sort == sort.id))) throw NotWellFormedException(sort)
       if (!(sort.constructors forall (_.fields forall (_.isTyped)))) throw NotWellFormedException(sort)
       if (sort.constructors.flatMap(_.fields).groupBy(_.id).exists(_._2.size > 1)) throw NotWellFormedException(sort)
+      checkEqualityViolations(sort, equalityViolations(sort))
     }
 
     override def equals(that: Any): Boolean = that match {

@@ -130,6 +130,7 @@ abstract class AbstractUnrollingSolver private
   lazy val feelingLucky = options.findOptionOrDefault(optFeelingLucky)
   lazy val unrollAssumptions = options.findOptionOrDefault(optUnrollAssumptions)
   lazy val modelFinding = options.findOptionOrDefault(optModelFinding) > 0
+  lazy val checkEqualities = options.findOptionOrDefault(optCheckEqualities)
 
   def check(config: CheckConfiguration): config.Response[Model, Assumptions] =
     checkAssumptions(config)(Set.empty)
@@ -213,6 +214,10 @@ abstract class AbstractUnrollingSolver private
     context.timers.solvers.assert.sanity.run {
       symbols.ensureWellFormed // make sure that the current program is well-formed
       typeCheck(expression, BooleanType()) // make sure we've asserted a boolean-typed expression
+      val violations = if (checkEqualities) equalityViolations(expression) else Seq.empty
+      if (violations.nonEmpty) {
+        throw new TypeErrorException(violations.mkString(", "), expression, expression.getPos)
+      }
     }
 
     // Multiple calls to registerForInterrupts are (almost) idempotent and acceptable

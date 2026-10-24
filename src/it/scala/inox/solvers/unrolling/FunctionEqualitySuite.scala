@@ -39,34 +39,17 @@ class FunctionEqualitySuite extends SolvingTestSuite with DatastructureUtils {
     assert(SimpleSolverAPI(program.getSolver).solveSAT(Not(clause)).isSAT)
   }
 
-  test("possible equality 1") {
+  test("equality between functions is rejected") {
     val f = ("f" :: (IntegerType() =>: IntegerType())).toVariable
     val g = ("g" :: (IntegerType() =>: IntegerType())).toVariable
-    val clause = f === (\("x" :: IntegerType())(x => g(x)))
+    val clauses = Seq(
+      f === (\("x" :: IntegerType())(x => g(x))),
+      f === (\("x" :: IntegerType())(x => f(x))),
+      f === (\("x" :: IntegerType())(x => g(x))) && g === (\("x" :: IntegerType())(x => f(x)))
+    )
 
-    assert(SimpleSolverAPI(program.getSolver).solveSAT(clause).isSAT)
-  }
-
-  test("possible equality 2") {
-    val f = ("f" :: (IntegerType() =>: IntegerType())).toVariable
-    val g = ("g" :: (IntegerType() =>: IntegerType())).toVariable
-    val clause = g === (\("x" :: IntegerType())(x => f(x)))
-
-    assert(SimpleSolverAPI(program.getSolver).solveSAT(clause).isSAT)
-  }
-
-  test("impossible equality 1") {
-    val f = ("f" :: (IntegerType() =>: IntegerType())).toVariable
-    val clause = f === (\("x" :: IntegerType())(x => f(x)))
-
-    assert(SimpleSolverAPI(program.getSolver).solveSAT(clause).isUNSAT)
-  }
-
-  test("impossible equality 2") {
-    val f = ("f" :: (IntegerType() =>: IntegerType())).toVariable
-    val g = ("g" :: (IntegerType() =>: IntegerType())).toVariable
-    val clause = f === (\("x" :: IntegerType())(x => g(x))) && g === (\("x" :: IntegerType())(x => f(x)))
-
-    assert(SimpleSolverAPI(program.getSolver).solveSAT(clause).isUNSAT)
+    for (clause <- clauses) {
+      intercept[ast.TypeOps#TypeErrorException](SimpleSolverAPI(program.getSolver).solveSAT(clause))
+    }
   }
 }
