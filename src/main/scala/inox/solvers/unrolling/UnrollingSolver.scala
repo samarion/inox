@@ -213,6 +213,10 @@ abstract class AbstractUnrollingSolver private
     context.timers.solvers.assert.sanity.run {
       symbols.ensureWellFormed // make sure that the current program is well-formed
       typeCheck(expression, BooleanType()) // make sure we've asserted a boolean-typed expression
+      val violations = equalityViolations(expression)
+      if (violations.nonEmpty) {
+        throw new TypeErrorException(violations.mkString(", "), expression, expression.getPos)
+      }
     }
 
     // Multiple calls to registerForInterrupts are (almost) idempotent and acceptable

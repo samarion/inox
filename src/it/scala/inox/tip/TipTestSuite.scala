@@ -27,8 +27,6 @@ class TipTestSuite extends TestSuite with ResourceUtils {
       case Some(solver) => (solver, file.getName) match {
         // Z3 and CVC4 binaries are exceedingly slow on these benchmarks
         case ("no-inc:smt-z3" | "smt-z3" | "smt-cvc4", "ForallAssoc.scala-0.tip") => Ignore
-        // this test only holds when assumeChecked=false
-        case (_, "LambdaEquality2.scala-1.tip") if ctx.options.findOptionOrDefault(optAssumeChecked) => Skip
         case _ => Test
       }
 
@@ -90,6 +88,15 @@ class TipTestSuite extends TestSuite with ResourceUtils {
         val res = api.solveSAT(expr)
         assert(!res.isSAT && !res.isUNSAT)
         assert(ctx.reporter.errorCount > 0)
+      }
+    }
+  }
+
+  // These compare functions, which no type admits equality on
+  for (file <- resourceFiles("regression/tip/REJECTED", _.endsWith(".tip"))) {
+    test(s"REJECTED - ${file.getName}") {
+      for ((program, expr) <- Parser(file).parseScript) {
+        intercept[ast.TypeOps#TypeErrorException](SimpleSolverAPI(program.getSolver).solveSAT(expr))
       }
     }
   }
