@@ -467,6 +467,17 @@ trait TemplateGenerator { self: Templates =>
         }
       }
 
+      // Quantifiers and lambdas are identified by their structure, so extensional equalities on
+      // types that admit equality, as in instantiated generic code, are made structural first
+      case e @ (_: Lambda | _: Forall) if exprOps.exists {
+        case ExtEquals(e1, _) => admitsEquality(e1.getType)
+        case _ => false
+      } (e) =>
+        rec(pathVar, exprOps.postMap {
+          case ExtEquals(e1, e2) if admitsEquality(e1.getType) => Some(Equals(e1, e2))
+          case _ => None
+        } (e), pol)
+
       case l: Lambda =>
         val template = LambdaTemplate(pathVar -> encodedCond(pathVar), l, localSubst)
         builder.registerLambda(template)
