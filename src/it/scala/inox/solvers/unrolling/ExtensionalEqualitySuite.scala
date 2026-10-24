@@ -360,6 +360,11 @@ class ExtensionalEqualitySuite extends SolvingTestSuite {
     val l = ("l" :: intList).toVariable
     assert(result(neq(x, x)).isUNSAT)
     assert(result((l =~= C(nilID)(IntegerType())()) && (l `is` consID)).isUNSAT)
+
+    val f = ("f" :: (IntegerType() =>: IntegerType())).toVariable
+    val extensional = forall("y" :: IntegerType())(y => f(y) =~= y)
+    val structural = forall("y" :: IntegerType())(y => f(y) === y)
+    assert(result(Not(Equals(extensional, structural))).isUNSAT)
   }
 
   test("unsatisfiable query with distinct functions") {
