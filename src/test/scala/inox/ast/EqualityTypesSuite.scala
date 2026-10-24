@@ -48,7 +48,7 @@ class EqualityTypesSuite extends AnyFunSuite {
   val containsID = FreshIdentifier("contains")
   val contains = mkFunDef(containsID)("T") { case Seq(tp) => (
     Seq("l" :: T(listID)(tp), "x" :: tp), BooleanType(), { case Seq(l, x) =>
-      if_ (l is consID) {
+      if_ (l `is` consID) {
         l.getField(head) === x || E(containsID)(tp)(l.getField(tail), x)
       } else_ {
         E(false)
@@ -64,7 +64,7 @@ class EqualityTypesSuite extends AnyFunSuite {
   val sizeID = FreshIdentifier("size")
   val size = mkFunDef(sizeID)("T") { case Seq(tp) => (
     Seq("l" :: T(listID)(tp)), IntegerType(), { case Seq(l) =>
-      if_ (l is consID) {
+      if_ (l `is` consID) {
         E(BigInt(1)) + E(sizeID)(tp)(l.getField(tail))
       } else_ {
         E(BigInt(0))

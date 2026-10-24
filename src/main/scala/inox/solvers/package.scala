@@ -10,6 +10,10 @@ package object solvers {
 
   object optAssumeChecked extends FlagOptionDef("assume-checked", false)
 
+  /** Whether solvers reject equality on types that don't admit it (see `ast.EqualityTypes`).
+    * Models compare functions, so solvers that evaluate quantifiers over them turn this off. */
+  object optCheckEqualities extends FlagOptionDef("check-equalities", true)
+
   case class PurityOptions(assumeChecked: Boolean)
 
   object PurityOptions {
