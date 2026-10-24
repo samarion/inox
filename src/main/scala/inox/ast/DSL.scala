@@ -40,6 +40,7 @@ trait DSL {
     def >=  = GreaterEquals(e, _: Expr)
     def === = Equals(e, _: Expr)
     def !== = (e2: Expr) => Not(Equals(e, e2))
+    def =~= = ExtEquals(e, _: Expr)
 
     // Boolean
     def &&  = And(e, _: Expr)

@@ -128,6 +128,38 @@ abstract class RecursiveEvaluator(override val program: Program,
     case Equals(le,re) =>
       BooleanLiteral(e(le) == e(re))
 
+    case ExtEquals(le, re) =>
+      // Functions and maps are compared on every input, which involves a quantifier
+      def rec(v1: Expr, v2: Expr, tpe: Type): Boolean = (v1, v2, tpe) match {
+        case _ if admitsEquality(tpe) => v1 == v2
+        case (ADT(id1, tps, args1), ADT(id2, _, args2), _) =>
+          id1 == id2 && (args1 zip args2 zip getConstructor(id1, tps).fields).forall {
+            case ((a1, a2), vd) => rec(a1, a2, vd.getType)
+          }
+        case (Tuple(es1), Tuple(es2), TupleType(tps)) =>
+          (es1 zip es2 zip tps).forall { case ((a1, a2), tp) => rec(a1, a2, tp) }
+        case (Tuple(es1), Tuple(es2), SigmaType(params, to)) =>
+          val tps = params.map(_.getType) :+ to
+          (es1 zip es2 zip tps).forall { case ((a1, a2), tp) => rec(a1, a2, tp) }
+        case (_, _, FunctionType(from, _)) =>
+          val xs = from.map(tp => Variable.fresh("x", tp, true))
+          e(Forall(xs.map(_.toVal), ExtEquals(Application(v1, xs), Application(v2, xs)))) == BooleanLiteral(true)
+        case (_, _, PiType(params, _)) =>
+          val xs = params.map(_.freshen)
+          val subst = (params zip xs.map(_.toVariable)).toMap
+          val nxs = xs.map(vd => vd.copy(tpe = typeOps.replaceFromSymbols(subst, vd.tpe)))
+          e(Forall(nxs, ExtEquals(Application(v1, nxs.map(_.toVariable)), Application(v2, nxs.map(_.toVariable))))) ==
+            BooleanLiteral(true)
+        case (_, _, MapType(from, _)) =>
+          val k = Variable.fresh("k", from, true)
+          e(Forall(Seq(k.toVal), ExtEquals(MapApply(v1, k), MapApply(v2, k)))) == BooleanLiteral(true)
+        case _ =>
+          throw EvalError(s"Unexpected values for extensional equality: ${v1.asString}, ${v2.asString}")
+      }
+
+      val (v1, v2) = (e(le), e(re))
+      BooleanLiteral(rec(v1, v2, leastUpperBound(le.getType, re.getType)))
+
     case ADT(id, tps, args) =>
       val cc = ADT(id, tps.map(_.getType), args.map(e))
       if (!ignoreContractsOn(expr)) {
