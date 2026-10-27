@@ -7,6 +7,14 @@ on:
         description: 'Space-separated Inox PR numbers to merge into main and test together (empty tests main)'
         required: false
         default: ''
+      stainless_repo:
+        description: 'Stainless repository to test against'
+        required: false
+        default: 'epfl-lara/stainless'
+      stainless_ref:
+        description: 'Stainless branch, tag or commit to test against (empty tests the default branch)'
+        required: false
+        default: ''
   # Fork: manual only. The full Stainless suite takes about 40 minutes on a
   # hosted runner, and upstream epfl-lara runs it on every PR anyway.
 
@@ -71,7 +79,8 @@ jobs:
     - name: Checkout Stainless
       uses: actions/checkout@v4
       with:
-        repository: epfl-lara/stainless
+        repository: ${{ inputs.stainless_repo || 'epfl-lara/stainless' }}
+        ref: ${{ inputs.stainless_ref }}
         path: stainless
         submodules: recursive
     - name: Update Stainless Inox checkout
