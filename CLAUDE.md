@@ -40,3 +40,6 @@ fork's `main` and must never end up in a branch meant for upstream.
   triggered manually, with the same `prs` input:
   `gh workflow run stainless-downstream-CI.yml -R samarion/inox -f prs="1 2"`.
   Run it before opening an upstream PR that could affect Stainless.
+- The downstream CI skips Stainless's `verification/false-valid` and
+  `termination/false-invalid` benchmarks, which encode known Stainless bugs
+  and would block Inox fixes. Pass `-f false_benchmarks=true` to run them.
