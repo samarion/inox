@@ -29,7 +29,12 @@ trait Z3Target extends SMTLIBTarget with SMTLIBDebugger {
 
   protected def interpreterOpts = Seq(
     "-in",
-    "-smt2"
+    "-smt2",
+    // Always try `false` first when picking a phase for a case split. With z3's
+    // default (cached phase), some queries are very sensitive to the random seed:
+    // the RedBlackTree2 counterexample in Stainless takes 20 s to 300+ s
+    // depending on the seed, and 6-15 s on every seed with this setting.
+    "smt.phase_selection=1"
   )
 
   protected class Z3Parser(lexer: Lexer) extends Parser(lexer) {
