@@ -54,8 +54,11 @@ trait FunctionTemplates { self: Templates =>
         if (ContractUnrolling `unroll` tfd.returnType) {
           // The return type only holds for arguments that lie in the parameter types, so
           // it is assumed only once the arguments' membership in these types is shown.
-          val (domains, domClauses) = tfd.params.foldLeft((Seq.empty[Expr], emptyClauses)) {
-            case ((domains, domClauses), vd) if ContractUnrolling `unroll` vd.tpe =>
+          // Only the refinements written in the function's signature are conditions: those that
+          // come from sort definitions or from the instantiation of type parameters are not
+          // checked, so the return type is assumed directly when the signature has none.
+          val (domains, domClauses) = (tfd.params zip tfd.fd.params).foldLeft((Seq.empty[Expr], emptyClauses)) {
+            case ((domains, domClauses), (vd, gvd)) if hasArgumentConditions(gvd.tpe) =>
               val (p, pClauses) = mkTypeClauses(start, vd.tpe, vd.toVariable, substMap, inDomain = true)(using MembershipGenerator)
               (domains :+ p, domClauses +++ pClauses)
             case (acc, _) => acc

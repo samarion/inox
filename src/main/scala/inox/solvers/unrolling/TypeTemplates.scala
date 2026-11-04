@@ -57,6 +57,20 @@ trait TypeTemplates { self: Templates =>
     }
   }
 
+  /** Determines whether membership in a parameter type places conditions on the arguments.
+    *
+    * The field types of sorts are not considered: Inox does not check them when values are
+    * constructed, so a front-end that wants them to hold checks constructor arguments itself
+    * (as Stainless does). Refinements anywhere else in the type are conditions. */
+  protected def hasArgumentConditions(tpe: Type): Boolean = tpe match {
+    case _: RefinementType => true
+    case ADTType(_, tps) => tps.exists(hasArgumentConditions)
+    case FunctionType(_, to) => hasArgumentConditions(to)
+    case PiType(_, to) => hasArgumentConditions(to)
+    case SigmaType(params, to) => params.exists(vd => hasArgumentConditions(vd.tpe)) || hasArgumentConditions(to)
+    case NAryType(tpes, _) => tpes.exists(hasArgumentConditions)
+  }
+
   protected case object FreeUnrolling extends TypeUnrolling
   protected case object ContractUnrolling extends TypeUnrolling
   protected case object CaptureUnrolling extends TypeUnrolling
