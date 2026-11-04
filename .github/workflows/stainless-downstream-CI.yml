@@ -16,7 +16,7 @@ on:
   # hosted runner, and upstream epfl-lara runs it on every PR anyway.
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   tests:
@@ -122,24 +122,12 @@ jobs:
       run: |
         set -x
         B=$PWD/frontends/benchmarks/verification/invalid/RedBlackTree2.scala
-        for cfg in models:true nomodels:false; do
-          name=${cfg%%:*}; cm=${cfg##*:}
-          mkdir -p /tmp/$name && cd /tmp/$name
-          /usr/bin/time -f "WALL $name %e s" stainless-dotty --solvers=smt-z3 --vc-cache=false --strict-arithmetic=false --batched=true --infer-measures=false --check-measures=no --functions=buggyAdd --check-models=$cm --timeout=150 --debug=smt $B > out.txt 2>&1 || true
-          grep -E "WALL|buggyAdd|total:" out.txt | cut -c1-200
-          ls -laS smt-sessions | head -8
-        done
-        for name in models nomodels; do
-          f=$(ls -S /tmp/$name/smt-sessions/*.smt2 | head -1)
-          echo "FILE $name $f $(wc -c < $f) bytes, $(grep -c check-sat $f) check-sat, $(grep -c '^(push' $f) push"
-          for seed in 0 1 2 3 4 5; do
-            /usr/bin/time -f "REPLAY $name seed=$seed %e s" timeout 200 z3 -T:180 smt.random_seed=$seed sat.random_seed=$seed $f > /tmp/r.txt 2>&1 || echo "REPLAY $name seed=$seed exit=$?"
-            grep "REPLAY" /tmp/r.txt; tail -2 /tmp/r.txt | cut -c1-200
-            grep -c "^sat" /tmp/r.txt | sed "s/^/  sat-count /"; grep -c "^unsat" /tmp/r.txt | sed "s/^/  unsat-count /"; grep -c "^unknown\|timeout" /tmp/r.txt | sed "s/^/  unknown-count /"
-          done
-        done
-        f=$(ls -S /tmp/models/smt-sessions/*.smt2 | head -1)
-        head -c 3000 $f
-        echo; echo ----- last check-sat context; grep -n "check-sat" $f | tail -3
+        mkdir -p /tmp/dump && cd /tmp/dump
+        stainless-dotty --solvers=smt-z3 --vc-cache=false --strict-arithmetic=false --batched=true --infer-measures=false --check-measures=no --functions=buggyAdd --check-models=true --timeout=150 --debug=smt $B > out.txt 2>&1 || true
+        ls -laS smt-sessions
+        cd "$INOX_DIR"
+        git config user.name "Nicolas Voirol" && git config user.email voirol.nicolas@gmail.com
+        mkdir -p .github/probe/smt && cp /tmp/dump/smt-sessions/*.smt2 .github/probe/smt/
+        git add .github/probe/smt && git commit -qm "Probe: RedBlackTree2 buggyAdd SMT sessions" && git push origin HEAD:rbt-timeout-probe
     - name: Clean up
       run: rm -rf "$JAVA_OPTS_TMP_DIR"
