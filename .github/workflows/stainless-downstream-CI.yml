@@ -23,9 +23,10 @@ jobs:
     # Fork: GitHub-hosted runner (4 cores, 16 GB) instead of the EPFL
     # self-hosted one, with a smaller heap to leave room for the solvers.
     # The integration tests take about 110 CPU-minutes, so they are split
-    # into five shards of similar cost that run on separate runners. The last
+    # into seven shards of similar cost that run on separate runners. The last
     # shard runs every suite the others don't name, so new suites are
-    # still covered.
+    # still covered. Each shard makes a single sbt call: every sbt launch
+    # recompiles part of Stainless, because BuildInfo stamps the build time.
     name: ${{ matrix.shard.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -33,24 +34,31 @@ jobs:
       fail-fast: false
       matrix:
         shard:
-          - name: VerificationSuite (z3), unit tests
+          # VerificationSuite runs every benchmark twice on z3: once plain
+          # (lucky=false) and once with codegen and lucky models (lucky=true).
+          - name: VerificationSuite (z3)
             run: |
-              sbt -batch -Dtestcase-parallelism=5 "it:testOnly stainless.verification.VerificationSuite -- -z solver=smt-z3"
-              sbt -batch -Dtestsuite-parallelism=5 test
+              sbt -batch -Dtestcase-parallelism=5 "it:testOnly stainless.verification.VerificationSuite -- -z \"solver=smt-z3 lucky=false\""
+          - name: VerificationSuite (z3 lucky), unit tests
+            run: |
+              sbt -batch -Dtestcase-parallelism=5 -Dtestsuite-parallelism=5 "it:testOnly stainless.verification.VerificationSuite -- -z \"solver=smt-z3 lucky=true\"" test
           - name: VerificationSuite (cvc5, princess), sbt plugin
             run: |
-              sbt -batch -Dtestcase-parallelism=5 "it:testOnly stainless.verification.VerificationSuite -- -z solver=smt-cvc5 -z solver=princess"
-              sbt -batch scripted
+              sbt -batch -Dtestcase-parallelism=5 "it:testOnly stainless.verification.VerificationSuite -- -z solver=smt-cvc5 -z solver=princess" scripted
           - name: TerminationSuite, ImperativeSuite
             run: |
               sbt -batch -Dtestsuite-parallelism=2 -Dtestcase-parallelism=5 "it:testOnly stainless.termination.TerminationSuite stainless.verification.ImperativeSuite"
-          # A single test that verifies the whole library, for about 7 minutes.
+          # A single test that verifies the whole library. Stainless checks
+          # VCs one at a time unless -Dparallel is set.
           - name: LibrarySuite
             run: |
-              sbt -batch "it:testOnly stainless.LibrarySuite"
+              sbt -batch -Dparallel=4 "it:testOnly stainless.LibrarySuite"
+          - name: EquivChkSuite, FullImperativeSuite
+            run: |
+              sbt -batch -Dtestsuite-parallelism=2 -Dtestcase-parallelism=5 "it:testOnly stainless.equivchk.EquivChkSuite stainless.verification.FullImperativeSuite"
           - name: Other integration tests
             run: |
-              sbt -batch -Dtestsuite-parallelism=6 -Dtestcase-parallelism=5 "it:testOnly * -stainless.verification.VerificationSuite -stainless.termination.TerminationSuite -stainless.verification.ImperativeSuite -stainless.LibrarySuite"
+              sbt -batch -Dtestsuite-parallelism=6 -Dtestcase-parallelism=5 "it:testOnly * -stainless.verification.VerificationSuite -stainless.termination.TerminationSuite -stainless.verification.ImperativeSuite -stainless.LibrarySuite -stainless.equivchk.EquivChkSuite -stainless.verification.FullImperativeSuite"
     env:
       JAVA_OPTS: -Dsbt.io.implicit.relative.glob.conversion=allow -Xss512M -Xms1024M -Xmx10G -XX:MaxMetaspaceSize=2G -XX:+UseCodeCacheFlushing -XX:ReservedCodeCacheSize=768M
       JVM_OPTS: -Dsbt.io.implicit.relative.glob.conversion=allow -Xss512M -Xms1024M -Xmx10G -XX:MaxMetaspaceSize=2G -XX:+UseCodeCacheFlushing -XX:ReservedCodeCacheSize=768M
