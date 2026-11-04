@@ -18,7 +18,7 @@ object SimpStats {
   private val counts = new ConcurrentHashMap[String, AtomicLong]()
 
   /** Default for CI variant branches, overridden by the `inox.simp` property. */
-  val defaultMode: String = ""
+  val defaultMode: String = "ground,assumptions"
 
   lazy val disabled: Set[String] =
     Option(System.getProperty("inox.simp")).getOrElse(defaultMode).split(",").map(_.trim).filter(_.nonEmpty).toSet
