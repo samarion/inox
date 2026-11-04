@@ -121,9 +121,10 @@ jobs:
       working-directory: ${{ env.STAINLESS_DIR }}
       run: |
         set -x
-        grep -n "optTimeout" frontends/dotty/src/it/scala/stainless/ComponentTestSuite.scala
-        sed -i 's/inox.optTimeout(300.seconds)/inox.optTimeout(120.seconds)/' frontends/dotty/src/it/scala/stainless/ComponentTestSuite.scala
-        grep -n "optTimeout" frontends/dotty/src/it/scala/stainless/ComponentTestSuite.scala
-        sbt -batch -Dtestcase-parallelism=1 "it:testOnly stainless.verification.VerificationSuite -- -z RedBlackTree2"
+        cp "$INOX_DIR/.github/probe/RBTProbe.scala" frontends/dotty/src/it/scala/stainless/verification/
+        sbt -batch "it:testOnly stainless.verification.RBTProbeIsolated stainless.verification.RBTProbeFull stainless.verification.RBTProbeFullNoModels" 2>&1 | tee probe.log
+        grep "PROBE\[" probe.log || true
+        grep "PROBE-VC" probe.log | cut -c1-400 || true
+        grep "PROBE-VC" probe.log | awk '{print $1, length($0)}' || true
     - name: Clean up
       run: rm -rf "$JAVA_OPTS_TMP_DIR"
