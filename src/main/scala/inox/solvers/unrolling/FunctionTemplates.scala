@@ -34,7 +34,8 @@ trait FunctionTemplates { self: Templates =>
     private val cache: MutableMap[TypedFunDef, FunctionTemplate] = MutableMap.empty
 
     def apply(tfd: TypedFunDef): FunctionTemplate = cache.getOrElse(tfd, {
-      val body: Expr = timers.solvers.simplify.run { simplifyFormula(tfd.fullBody) }
+      utils.SimpStats.count("tmpl.function")
+      val body: Expr = utils.SimpStats.time("simplify.function")(timers.solvers.simplify.run { simplifyFormula(tfd.fullBody) })
 
       val tpVars = tfd.tps.flatMap(variableSeq).distinct
       val fdArgs: Seq[Variable] = tfd.params.map(_.toVariable)

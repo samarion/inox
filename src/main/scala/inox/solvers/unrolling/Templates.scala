@@ -882,7 +882,7 @@ trait Templates
 
   def instantiateExpr(expr: Expr, bindings: Map[Variable, Encoded]): Clauses = {
     instantiate(bindings, { (start, encodedStart) =>
-      val instExpr = timers.solvers.simplify.run { simplifyFormula(expr) }
+      val instExpr = utils.SimpStats.time("simplify.inst")(timers.solvers.simplify.run { simplifyFormula(expr) })
 
       val tmplClauses = mkClauses0(start, instExpr, bindings + (start -> encodedStart), polarity = Some(true))
       val tpeClauses = bindings.filterNot(declared `contains` _).map { case (v, s) =>

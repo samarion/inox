@@ -693,7 +693,7 @@ abstract class AbstractUnrollingSolver private
           val getAssumptions = (unrollAssumptions && templates.canUnroll) || config.withUnsatAssumptions 
           val checkConfig = Configuration(model = getModel && !ignoreModels, unsatAssumptions = getAssumptions)
 
-          val res: SolverResponse[underlying.Model, Set[underlying.Trees]] = context.timers.solvers.unrolling.check.run {
+          val res: SolverResponse[underlying.Model, Set[underlying.Trees]] = utils.SimpStats.time("solver.check") apply context.timers.solvers.unrolling.check.run {
             underlying.checkAssumptions(checkConfig)(
               encodedAssumptions.toSet ++ templates.satisfactionAssumptions
             )
@@ -735,7 +735,7 @@ abstract class AbstractUnrollingSolver private
 
           val clauses = templates.getFiniteRangeClauses
 
-          val res: SolverResponse[underlying.Model, Set[underlying.Trees]] = context.timers.solvers.unrolling.check.run {
+          val res: SolverResponse[underlying.Model, Set[underlying.Trees]] = utils.SimpStats.time("solver.check") apply context.timers.solvers.unrolling.check.run {
             underlying.push()
             for (cl <- encodedAssumptions.toSeq ++ templates.satisfactionAssumptions ++ clauses) {
               underlying.assertCnstr(cl)
@@ -827,7 +827,7 @@ abstract class AbstractUnrollingSolver private
           // check without additional model-guidance for unrolling
           reporter.debug(" - Running search without blocked literals (w/o lucky test)")
 
-          val res = context.timers.solvers.unrolling.check.run {
+          val res = utils.SimpStats.time("solver.check") apply context.timers.solvers.unrolling.check.run {
               underlying.checkAssumptions(Configuration(model = false, unsatAssumptions = config.withUnsatAssumptions))(
                 encodedAssumptions.toSet ++ templates.refutationAssumptions
               )
@@ -858,7 +858,7 @@ abstract class AbstractUnrollingSolver private
           // we always ask for a model here in order to give priority to blockers that
           // are keeping quantified clause instantiations from being considered
           val res: SolverResponse[underlying.Model, Set[underlying.Trees]] =
-            context.timers.solvers.unrolling.check.run {
+            utils.SimpStats.time("solver.check") apply context.timers.solvers.unrolling.check.run {
               underlying.checkAssumptions(config `max` Configuration(model = true))(
                 encodedAssumptions.toSet ++ templates.refutationAssumptions
               )
@@ -907,7 +907,7 @@ abstract class AbstractUnrollingSolver private
           reporter.debug(s"- We need to keep going, but reached unroll bound ($unrollBound)")
           CheckResult.cast(Unknown)
 
-        case Unroll => context.timers.solvers.unrolling.unroll.run {
+        case Unroll => utils.SimpStats.time("solver.unroll") apply context.timers.solvers.unrolling.unroll.run {
           reporter.debug("- We need to keep going")
 
           // Unrolling `unrollFactor` times

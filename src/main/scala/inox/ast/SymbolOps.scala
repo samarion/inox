@@ -842,14 +842,15 @@ trait SymbolOps extends TypeOps { self =>
       case _ => None
     } (e)
 
+    import utils.SimpStats.time
     val simp: Expr => Expr =
-      ((e: Expr) => normalizeClauses(e))    compose
-      ((e: Expr) => simplifyMatchers(e))    compose
-      ((e: Expr) => simplifyAssumptions(e)) compose
-      ((e: Expr) => inlineLambdas(e))       compose
-      ((e: Expr) => inlinePosts(e))         compose
-      ((e: Expr) => inlineForalls(e))       compose
-      ((e: Expr) => inlineFunctions(e))
+      ((e: Expr) => time("foralls.normalizeClauses")(normalizeClauses(e)))    compose
+      ((e: Expr) => time("foralls.simplifyMatchers")(simplifyMatchers(e)))    compose
+      ((e: Expr) => time("foralls.simplifyAssumptions")(simplifyAssumptions(e))) compose
+      ((e: Expr) => time("foralls.inlineLambdas")(inlineLambdas(e)))       compose
+      ((e: Expr) => time("foralls.inlinePosts")(inlinePosts(e)))         compose
+      ((e: Expr) => time("foralls.inlineForalls")(inlineForalls(e)))       compose
+      ((e: Expr) => time("foralls.inlineFunctions")(inlineFunctions(e)))
     simp(e)
   }
 
@@ -1071,12 +1072,15 @@ trait SymbolOps extends TypeOps { self =>
     val simpOpts = SimplificationOptions(ctx)
 
     if (simpOpts.simplify) {
-      val simp: Expr => Expr =
-        ((e: Expr) => simplifyGround(e))      compose
-        ((e: Expr) => simplifyExpr(e))        compose
-        ((e: Expr) => simplifyForalls(e))     compose
-        ((e: Expr) => simplifyAssumptions(e))
-      simp(e)
+      import utils.SimpStats
+      SimpStats.count("size.in", exprOps.formulaSize(e))
+      var r = e
+      if (SimpStats.enabled("assumptions")) r = SimpStats.time("simp.assumptions")(simplifyAssumptions(r))
+      if (SimpStats.enabled("foralls")) r = SimpStats.time("simp.foralls")(simplifyForalls(r))
+      if (SimpStats.enabled("expr")) r = SimpStats.time("simp.expr")(simplifyExpr(r))
+      if (SimpStats.enabled("ground")) r = SimpStats.time("simp.ground")(simplifyGround(r))
+      SimpStats.count("size.out", exprOps.formulaSize(r))
+      r
     } else {
       e
     }
