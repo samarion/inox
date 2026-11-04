@@ -774,11 +774,25 @@ trait SymbolOps extends TypeOps { self =>
   def simplifyForalls(e: Expr)(using opts: PurityOptions): Expr = {
 
     def inlineFunctions(e: Expr): Expr = {
+      // Only functions reachable through calls from `e` are candidates (an ADT
+      // equality appearing directly in `e` is not, unless some callee uses it).
+      val reachable = {
+        val seen = scala.collection.mutable.Set.empty[Identifier]
+        var todo = functionCallsOf(e).map(_.id).toList
+        while (todo.nonEmpty) {
+          val next = todo.head
+          todo = todo.tail
+          if (seen.add(next)) todo = forallCalleesOf(next).toList ++ todo
+        }
+        seen
+      }
+      def toInline(id: Identifier): Boolean = reachable(id) && isForallInlinable(id)
+
       def inlineExpr(e: Expr): Expr = postMap {
-        case fi: FunctionInvocation if isForallInlinable(fi.id) =>
+        case fi: FunctionInvocation if toInline(fi.id) =>
           Some(fi.inlined)
         case Equals(IsTyped(e1, adt: ADTType), e2)
-        if adt.getSort.hasEquality && isForallInlinable(adt.getSort.equality.get.id) =>
+        if adt.getSort.hasEquality && toInline(adt.getSort.equality.get.id) =>
           Some(adt.getSort.equality.get.applied(Seq(e1, e2)).inlined)
         case _ => None
       } (e)
