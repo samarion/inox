@@ -20,16 +20,18 @@ abstract class RBTProbeBase(checkModels: Boolean) extends VerificationComponentT
     inox.solvers.optCheckModels(checkModels),
     evaluators.optCodeGen(false),
     inox.solvers.unrolling.optFeelingLucky(false),
+    inox.solvers.optSilentErrors(false),
   ))
 
   override def filter(ctx: inox.Context, name: String): FilterStatus =
     if (name.endsWith("/RedBlackTree2")) Test else Skip
 
-  testAll("verification/invalid", lp) { (analysis, _, _, _) =>
+  testAll("verification/invalid", lp) { (analysis, reporter, _, _) =>
+    val errs = reporter.asInstanceOf[inox.TestSilentReporter].lastErrors
+    println(s"PROBE-ERRS[$label] count=${errs.size}")
+    for (e <- errs) println(s"PROBE-ERR[$label] len=${e.length} " + e.take(1500).replace("\n", " | "))
     for ((vc, res) <- analysis.vrs) {
       println(s"PROBE[$label] ${vc.fid} ${vc.kind} ${res.status} ${res.time.getOrElse(-1L)}ms")
-      if (vc.kind == VCKind.Postcondition && vc.fid.name == "buggyAdd")
-        println(s"PROBE-VC[$label] ${vc.condition}")
     }
   }
 }
@@ -52,4 +54,9 @@ class RBTProbeFull extends RBTProbeBase(true) {
 class RBTProbeFullNoModels extends RBTProbeBase(false) {
   def lp = RBTProbe.full
   def label = "full-nomodels"
+}
+
+class RBTProbeIsolatedNoModels extends RBTProbeBase(false) {
+  def lp = RBTProbe.isolated
+  def label = "isolated-nomodels"
 }

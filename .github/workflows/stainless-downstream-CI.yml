@@ -122,9 +122,8 @@ jobs:
       run: |
         set -x
         cp "$INOX_DIR/.github/probe/RBTProbe.scala" frontends/dotty/src/it/scala/stainless/verification/
-        sbt -batch "it:testOnly stainless.verification.RBTProbeIsolated stainless.verification.RBTProbeFull stainless.verification.RBTProbeFullNoModels" 2>&1 | tee probe.log
-        grep "PROBE\[" probe.log || true
-        grep "PROBE-VC" probe.log | cut -c1-400 || true
-        grep "PROBE-VC" probe.log | awk '{print $1, length($0)}' || true
+        sbt -batch "it:testOnly stainless.verification.RBTProbeIsolated stainless.verification.RBTProbeFull stainless.verification.RBTProbeFullNoModels stainless.verification.RBTProbeIsolatedNoModels" 2>&1 | tee probe.log
+        grep "PROBE\[.*buggyAdd" probe.log || true
+        grep "PROBE-ERR" probe.log | cut -c1-1700 || true
     - name: Clean up
       run: rm -rf "$JAVA_OPTS_TMP_DIR"
