@@ -11,7 +11,9 @@ import scala.collection.mutable.{Set => MutableSet, Map => MutableMap}
 /** Incrementally unfolds equality relations between types for which the
   * SMT notion of equality is not relevant.
   *
-  * @see [[ast.Definitions.ADTSort.equality]] for such a case of equality
+  * This covers custom equalities on sorts (see [[ast.Definitions.ADTSort.equality]]), and
+  * extensional equality (see [[ast.Expressions.ExtEquals]]) on types that don't admit equality.
+  * Extensional equality on functions and maps quantifies over their inputs.
   */
 trait EqualityTemplates { self: Templates =>
   import context.{given, _}
@@ -43,10 +45,67 @@ trait EqualityTemplates { self: Templates =>
     res
   })
 
-  def equalitySymbol(tpe: Type): (Variable, Encoded) = {
-    typeSymbols.cached(tpe) {
-      val v = Variable.fresh("eq" + tpe, FunctionType(Seq(tpe, tpe), BooleanType()))
+  def equalitySymbol(tpe: Type, extensional: Boolean = false): (Variable, Encoded) = {
+    typeSymbols.cached(tpe -> extensional) {
+      val v = Variable.fresh((if (extensional) "exteq" else "eq") + tpe, FunctionType(Seq(tpe, tpe), BooleanType()))
       v -> encodeSymbol(v)
+    }
+  }
+
+  /** Whether `v` is the symbol of an equality (extensional or not) on type `tpe`. */
+  def isEqualitySymbol(v: Variable, tpe: Type): Boolean =
+    v == equalitySymbol(tpe)._1 || typeSymbols.get(tpe -> true).exists(_._1 == v)
+
+  /** The extensional equality of `e1` and `e2` of type `tpe`, unfolded one level. */
+  private[unrolling] def extensionalEquality(tpe: Type, e1: Expr, e2: Expr): Expr = {
+    // Sorts are unfolded lazily since they can be recursive, and other types right away, so that
+    // quantifiers over the inputs of curried functions or maps of functions form a single Forall
+    def ext(e1: Expr, e2: Expr): Expr = e1.getType match {
+      case tpe if admitsEquality(tpe) => Equals(e1, e2)
+      case _: ADTType => ExtEquals(e1, e2)
+      case tpe => extensionalEquality(tpe, e1, e2)
+    }
+
+    def forall(params: Seq[ValDef], body: Expr): Expr = body match {
+      case Forall(inner, body) => Forall(params ++ inner, body)
+      case _ => Forall(params, body)
+    }
+
+    tpe match {
+      case adt: ADTType =>
+        val sort = adt.getSort
+        if (sort.hasEquality) {
+          sort.equality.get.applied(Seq(e1, e2))
+        } else {
+          orJoin(sort.constructors.map { tcons =>
+            val instCond = and(isCons(e1, tcons.id), isCons(e2, tcons.id))
+            val fieldConds = tcons.fields.map(vd => ext(ADTSelector(e1, vd.id), ADTSelector(e2, vd.id)))
+            andJoin(instCond +: fieldConds)
+          })
+        }
+
+      case TupleType(tps) =>
+        andJoin(tps.indices.map(i => ext(TupleSelect(e1, i + 1), TupleSelect(e2, i + 1))))
+
+      case SigmaType(params, _) =>
+        andJoin((1 to params.size + 1).map(i => ext(TupleSelect(e1, i), TupleSelect(e2, i))))
+
+      case FunctionType(from, _) =>
+        val xs = from.map(tp => Variable.fresh("x", tp, true))
+        forall(xs.map(_.toVal), ext(Application(e1, xs), Application(e2, xs)))
+
+      case PiType(params, _) =>
+        val xs = params.map(_.freshen)
+        val subst = (params zip xs.map(_.toVariable)).toMap
+        val vds = xs.map(vd => vd.copy(tpe = typeOps.replaceFromSymbols(subst, vd.tpe)))
+        val args = vds.map(_.toVariable)
+        forall(vds, ext(Application(e1, args), Application(e2, args)))
+
+      case MapType(from, _) =>
+        val k = Variable.fresh("k", from, true)
+        forall(Seq(k.toVal), ext(MapApply(e1, k), MapApply(e2, k)))
+
+      case _ => throw new InternalSolverError(s"Why does $tpe require extensional equality unrolling!?")
     }
   }
 
@@ -65,7 +124,7 @@ trait EqualityTemplates { self: Templates =>
     }
   }
 
-  class EqualityTemplate private(val tpe: Type, val contents: TemplateContents) extends Template {
+  class EqualityTemplate private(val key: EqualityKey, val contents: TemplateContents) extends Template {
     def instantiate(aVar: Encoded, e1: Encoded, e2: Encoded): Clauses = {
       instantiate(aVar, Seq(Left(e1), Left(e2)))
     }
@@ -89,17 +148,30 @@ trait EqualityTemplates { self: Templates =>
   }
 
   object EqualityTemplate {
-    private val cache: MutableMap[Type, EqualityTemplate] = MutableMap.empty
+    private val cache: MutableMap[EqualityKey, EqualityTemplate] = MutableMap.empty
 
-    def apply(tpe: Type): EqualityTemplate = cache.getOrElse(tpe, {
-      val (f, fT) = equalitySymbol(tpe)
+    /** Extensional equalities are only unfolded in the polarity in which they occur, so that the
+      * quantifiers they introduce keep it: the template for a positive (resp. negative) occurrence
+      * only says that the equality implies (resp. is implied by) its unfolding. */
+    def apply(key: EqualityKey): EqualityTemplate = cache.getOrElse(key, {
+      val EqualityKey(tpe, extensional, polarity) = key
+      val (f, fT) = equalitySymbol(tpe, extensional)
       val args @ Seq(e1, e2) = Seq("e1", "e2").map(s => Variable.fresh(s, tpe))
       val argsT = args.map(encodeSymbol)
 
       val pathVar = Variable.fresh("b", BooleanType(), true)
       val pathVarT = encodeSymbol(pathVar)
 
-      val tmplClauses = mkClauses0(pathVar, Equals(Application(f, args), tpe match {
+      val app = Application(f, args)
+      val tmplClauses = if (extensional) {
+        val body = extensionalEquality(tpe, e1, e2)
+        val expr = polarity match {
+          case Some(true) => Implies(app, body)
+          case Some(false) => Implies(body, app)
+          case None => Equals(app, body)
+        }
+        mkClauses0(pathVar, expr, (args zip argsT).toMap + (f -> fT) + (pathVar -> pathVarT), Some(true))
+      } else mkClauses0(pathVar, Equals(app, tpe match {
         case adt: ADTType =>
           val sort = adt.getSort
 
@@ -124,17 +196,18 @@ trait EqualityTemplates { self: Templates =>
         substMap = Map(f -> fT), optApp = Some(fT -> FunctionType(Seq(tpe, tpe), BooleanType()))
       )
 
-      val res = new EqualityTemplate(tpe, contents)
-      cache(tpe) = res
+      val res = new EqualityTemplate(key, contents)
+      cache(key) = res
       res
     })
   }
 
   def instantiateEquality(blocker: Encoded, equality: Equality): Clauses = {
-    val Equality(tpe, e1, e2) = equality
+    val Equality(tpe, e1, e2, extensional, _) = equality
+    val key = equality.key
     val clauses = new scala.collection.mutable.ListBuffer[Encoded]
 
-    if (!instantiated(tpe)((blocker, e1, e2))) {
+    if (!instantiated(key)((blocker, e1, e2))) {
       val eqBlocker = eqBlockers.get(equality) match {
         case Some(eqBlocker) =>
           eqBlocker
@@ -143,20 +216,20 @@ trait EqualityTemplates { self: Templates =>
           val eqBlocker = encodeSymbol(Variable.fresh("q", BooleanType(), true))
           eqBlockers += equality -> eqBlocker
 
-          clauses ++= EqualityTemplate(tpe).instantiate(eqBlocker, e1, e2)
+          clauses ++= EqualityTemplate(key).instantiate(eqBlocker, e1, e2)
 
-          val (_, f) = equalitySymbol(tpe)
+          val (_, f) = equalitySymbol(tpe, extensional)
           val ft = FunctionType(Seq(tpe, tpe), BooleanType())
 
           // congruence is transitive
-          for ((tb, te1, te2) <- instantiated(tpe); cond = mkAnd(eqBlocker, tb)) {
+          for ((tb, te1, te2) <- instantiated(key); cond = mkAnd(eqBlocker, tb)) {
             if (e2 == te1) {
               clauses += mkImplies(
                 mkAnd(cond, mkApp(f, ft, Seq(e1, e2)), mkApp(f, ft, Seq(e2, te2))),
                 mkApp(f, ft, Seq(e1, te2))
               )
 
-              instantiated += tpe -> (instantiated(tpe) + ((cond, e1, te2)))
+              instantiated += key -> (instantiated(key) + ((cond, e1, te2)))
             }
 
             if (te2 == e1) {
@@ -165,13 +238,13 @@ trait EqualityTemplates { self: Templates =>
                 mkApp(f, ft, Seq(te1, e2))
               )
 
-              instantiated += tpe -> (instantiated(tpe) + ((cond, te1, e2)))
+              instantiated += key -> (instantiated(key) + ((cond, te1, e2)))
             }
           }
 
           // congruence is commutative
           clauses += mkImplies(eqBlocker, mkEquals(mkApp(f, ft, Seq(e1, e2)), mkApp(f, ft, Seq(e2, e1))))
-          instantiated += tpe -> (instantiated(tpe) + ((eqBlocker, e1, e2)) + ((eqBlocker, e2, e1)))
+          instantiated += key -> (instantiated(key) + ((eqBlocker, e1, e2)) + ((eqBlocker, e2, e1)))
 
           clauses += mkImplies(mkEquals(e1, e2), mkApp(f, ft, Seq(e1, e2)))
           eqBlocker
@@ -208,14 +281,14 @@ trait EqualityTemplates { self: Templates =>
         equalityInfos += blocker -> (gen, gen, notBlocker, Set(equality))
     }
 
-    mkApp(equalitySymbol(tpe)._2, FunctionType(Seq(tpe, tpe), BooleanType()), Seq(equality.e1, equality.e2))
+    mkApp(equality.symbols._2, FunctionType(Seq(tpe, tpe), BooleanType()), Seq(equality.e1, equality.e2))
   }
 
   private[unrolling] object equalityManager extends Manager {
     private[EqualityTemplates] val eqBlockers = new IncrementalMap[Equality, Encoded]()
-    private[EqualityTemplates] val typeSymbols = new IncrementalMap[Type, (Variable, Encoded)]
+    private[EqualityTemplates] val typeSymbols = new IncrementalMap[(Type, Boolean), (Variable, Encoded)]
     private[EqualityTemplates] val equalityInfos = new IncrementalMap[Encoded, (Int, Int, Encoded, Set[Equality])]
-    private[EqualityTemplates] val instantiated = new IncrementalMap[Type, Set[(Encoded, Encoded, Encoded)]].withDefaultValue(Set.empty)
+    private[EqualityTemplates] val instantiated = new IncrementalMap[EqualityKey, Set[(Encoded, Encoded, Encoded)]].withDefaultValue(Set.empty)
 
     val incrementals: Seq[IncrementalState] = Seq(eqBlockers, typeSymbols, equalityInfos, instantiated)
 

@@ -80,6 +80,7 @@ trait SolvingEvaluator extends Evaluator { self =>
           optSilentErrors(true),
           optCheckModels(false), // model is checked manually!! (see below)
           unrolling.optFeelingLucky(false),
+          optCheckEqualities(false), // models of higher-order functions compare their arguments
           optForallCache(forallCache) // this makes sure we have an `optForallCache` set!
         ))
       }
