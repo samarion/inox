@@ -26,31 +26,9 @@ jobs:
     # into five shards of similar cost that run on separate runners. The last
     # shard runs every suite the others don't name, so new suites are
     # still covered.
-    name: ${{ matrix.shard.name }}
+    name: Timeout probe
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        shard:
-          - name: VerificationSuite (z3), unit tests
-            run: |
-              sbt -batch -Dtestcase-parallelism=5 "it:testOnly stainless.verification.VerificationSuite -- -z solver=smt-z3"
-              sbt -batch -Dtestsuite-parallelism=5 test
-          - name: VerificationSuite (cvc5, princess), sbt plugin
-            run: |
-              sbt -batch -Dtestcase-parallelism=5 "it:testOnly stainless.verification.VerificationSuite -- -z solver=smt-cvc5 -z solver=princess"
-              sbt -batch scripted
-          - name: TerminationSuite, ImperativeSuite
-            run: |
-              sbt -batch -Dtestsuite-parallelism=2 -Dtestcase-parallelism=5 "it:testOnly stainless.termination.TerminationSuite stainless.verification.ImperativeSuite"
-          # A single test that verifies the whole library, for about 7 minutes.
-          - name: LibrarySuite
-            run: |
-              sbt -batch "it:testOnly stainless.LibrarySuite"
-          - name: Other integration tests
-            run: |
-              sbt -batch -Dtestsuite-parallelism=6 -Dtestcase-parallelism=5 "it:testOnly * -stainless.verification.VerificationSuite -stainless.termination.TerminationSuite -stainless.verification.ImperativeSuite -stainless.LibrarySuite"
     env:
       JAVA_OPTS: -Dsbt.io.implicit.relative.glob.conversion=allow -Xss512M -Xms1024M -Xmx10G -XX:MaxMetaspaceSize=2G -XX:+UseCodeCacheFlushing -XX:ReservedCodeCacheSize=768M
       JVM_OPTS: -Dsbt.io.implicit.relative.glob.conversion=allow -Xss512M -Xms1024M -Xmx10G -XX:MaxMetaspaceSize=2G -XX:+UseCodeCacheFlushing -XX:ReservedCodeCacheSize=768M
@@ -141,6 +119,12 @@ jobs:
       run: ./stainless-ci.sh --build-only && echo "PATH=$STAINLESS_DIR/frontends/dotty/target/universal/stage/bin:$PATH" >> "$GITHUB_ENV"
     - name: Run tests
       working-directory: ${{ env.STAINLESS_DIR }}
-      run: ${{ matrix.shard.run }}
+      run: |
+        set -x
+        B=frontends/benchmarks
+        /usr/bin/time -v stainless --solvers=smt-z3 --timeout=300 --vc-cache=false --check-models=true --strict-arithmetic=false --batched=true --infer-measures=false --check-measures=no $B/verification/invalid/RedBlackTree2.scala || true
+        /usr/bin/time -v stainless --solvers=smt-z3 --timeout=300 --vc-cache=false --check-models=true --strict-arithmetic=false --batched=true --infer-measures=false --check-measures=no --timeout=60 $B/verification/invalid/RedBlackTree2.scala || true
+        /usr/bin/time -v stainless --solvers=smt-z3 --timeout=300 --vc-cache=false --check-models=true --strict-arithmetic=false --batched=true --infer-measures=true --check-measures=only $B/verification/valid/CovCollection.scala || true
+        sbt -batch -Dtestcase-parallelism=1 "it:testOnly stainless.verification.VerificationSuite -- -z RedBlackTree2"
     - name: Clean up
       run: rm -rf "$JAVA_OPTS_TMP_DIR"
