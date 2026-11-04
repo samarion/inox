@@ -721,6 +721,52 @@ trait SymbolOps extends TypeOps { self =>
     rec(e, Map.empty, false)
   }
 
+  private val forallCallees = new java.util.concurrent.ConcurrentHashMap[Identifier, Set[Identifier]]
+  private val forallInlinable = new java.util.concurrent.ConcurrentHashMap[Identifier, java.lang.Boolean]
+
+  /** Functions called by `id`'s full body, counting ADT equalities as calls. */
+  private def forallCalleesOf(id: Identifier): Set[Identifier] = {
+    val cached = forallCallees.get(id)
+    if (cached != null) cached else {
+      var res = Set.empty[Identifier]
+      exprOps.preTraversal {
+        case fi: FunctionInvocation => res += fi.id
+        case Equals(IsTyped(_, adt: ADTType), _) if adt.getSort.hasEquality => res += adt.getSort.equality.get.id
+        case _ =>
+      } (getFunction(id).fullBody)
+      forallCallees.put(id, res)
+      res
+    }
+  }
+
+  /** Whether [[simplifyForalls]] inlines calls to `id`: the function is not
+    * (mutually) recursive and its body contains a quantifier outside assumptions.
+    * Only depends on the symbols, so it is computed once per function. */
+  private[inox] def isForallInlinable(id: Identifier): Boolean = {
+    val cached = forallInlinable.get(id)
+    if (cached != null) cached.booleanValue else {
+      def hasForall(e: Expr): Boolean = e match {
+        case _: Forall => true
+        case Assume(pred, body) => hasForall(body)
+        case Operator(es, _) => es.exists(hasForall)
+      }
+      val res = hasForall(getFunction(id).fullBody) && {
+        val seen = scala.collection.mutable.Set.empty[Identifier]
+        var todo = forallCalleesOf(id).toList
+        var recursive = false
+        while (todo.nonEmpty && !recursive) {
+          val next = todo.head
+          todo = todo.tail
+          if (next == id) recursive = true
+          else if (seen.add(next)) todo = forallCalleesOf(next).toList ++ todo
+        }
+        !recursive
+      }
+      forallInlinable.put(id, res)
+      res
+    }
+  }
+
   /** Pre-processing for solvers that handle universal quantification
     * in order to increase the precision of polarity analysis for
     * quantification instantiations.
@@ -728,38 +774,11 @@ trait SymbolOps extends TypeOps { self =>
   def simplifyForalls(e: Expr)(using opts: PurityOptions): Expr = {
 
     def inlineFunctions(e: Expr): Expr = {
-      import utils.Graphs._
-      val initGraph = DiGraph[Identifier, SimpleEdge[Identifier]](functionCallsOf(e).map(_.id))
-
-      val graph = fixpoint { (graph: DiGraph[Identifier, SimpleEdge[Identifier]]) =>
-        var newGraph = graph
-        for (id <- graph.N) {
-          preTraversal {
-            case fi: FunctionInvocation =>
-              newGraph += SimpleEdge(id, fi.id)
-            case Equals(IsTyped(e1, adt: ADTType), e2) if adt.getSort.hasEquality =>
-              newGraph += SimpleEdge(id, adt.getSort.equality.get.id)
-            case _ =>
-          } (getFunction(id).fullBody)
-        }
-        newGraph
-      } (initGraph)
-
-      val toInline = graph.N.filter { id =>
-        def rec(e: Expr): Boolean = e match {
-          case _: Forall => true
-          case Assume(pred, body) => rec(body)
-          case Operator(es, _) => es.exists(rec)
-        }
-
-        !graph.transitiveSucc(id)(id) && rec(getFunction(id).fullBody)
-      }
-
       def inlineExpr(e: Expr): Expr = postMap {
-        case fi: FunctionInvocation if toInline(fi.id) =>
+        case fi: FunctionInvocation if isForallInlinable(fi.id) =>
           Some(fi.inlined)
         case Equals(IsTyped(e1, adt: ADTType), e2)
-        if adt.getSort.hasEquality && toInline(adt.getSort.equality.get.id) =>
+        if adt.getSort.hasEquality && isForallInlinable(adt.getSort.equality.get.id) =>
           Some(adt.getSort.equality.get.applied(Seq(e1, e2)).inlined)
         case _ => None
       } (e)
