@@ -121,10 +121,9 @@ jobs:
       working-directory: ${{ env.STAINLESS_DIR }}
       run: |
         set -x
-        B=frontends/benchmarks
-        /usr/bin/time -v stainless-dotty --solvers=smt-z3 --timeout=300 --vc-cache=false --check-models=true --strict-arithmetic=false --batched=true --infer-measures=false --check-measures=no $B/verification/invalid/RedBlackTree2.scala || true
-        /usr/bin/time -v stainless-dotty --solvers=smt-z3 --timeout=300 --vc-cache=false --check-models=true --strict-arithmetic=false --batched=true --infer-measures=false --check-measures=no --timeout=60 $B/verification/invalid/RedBlackTree2.scala || true
-        /usr/bin/time -v stainless-dotty --solvers=smt-z3 --timeout=300 --vc-cache=false --check-models=true --strict-arithmetic=false --batched=true --infer-measures=true --check-measures=only $B/verification/valid/CovCollection.scala || true
-        /usr/bin/time -v stainless-dotty --solvers=smt-z3 --timeout=60 --vc-cache=false --check-models=true --strict-arithmetic=false --batched=true --infer-measures=true --check-measures=only $B/verification/valid/CovCollection.scala || true
+        grep -n "optTimeout" frontends/dotty/src/it/scala/stainless/ComponentTestSuite.scala
+        sed -i 's/inox.optTimeout(300.seconds)/inox.optTimeout(120.seconds)/' frontends/dotty/src/it/scala/stainless/ComponentTestSuite.scala
+        grep -n "optTimeout" frontends/dotty/src/it/scala/stainless/ComponentTestSuite.scala
+        sbt -batch -Dtestcase-parallelism=1 "it:testOnly stainless.verification.VerificationSuite -- -z RedBlackTree2"
     - name: Clean up
       run: rm -rf "$JAVA_OPTS_TMP_DIR"
