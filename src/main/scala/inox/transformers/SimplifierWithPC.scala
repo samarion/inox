@@ -165,50 +165,9 @@ trait SimplifierWithPC extends Transformer { self =>
         case None => (IsConstructor(re, id).copiedFrom(ic), pe)
       }
 
-    case s @ ADTSelector(e, sel) =>
-      val (re, pe) = simplify(path `expand` e, path)
+    case s: ADTSelector => simplifyADTSelector(s, path)
 
-      if (isConstructor(re, s.constructor.id, path) == Some(true)) {
-        val cons = s.constructor
-        val index = cons.definition.selectorID2Index(sel)
-        re match {
-          case ADT(_, _, es) if pe =>
-            (es(index), true)
-
-          // Note: no need to check invariant as if the ADT constructor is in
-          //       the path, then its invariant has already been checked.
-          case adt @ ADT(_, _, es) =>
-            val value = es(index)
-            val freshFields = cons.fields.map(_.freshen)
-            val bindings = (freshFields zip es).filter(_._2 != value)
-            simplify(bindings.foldRight(value) { case ((vd, e), b) => Let(vd, e, b).copiedFrom(s) }, path)
-
-          case _ =>
-            (ADTSelector(re, sel).copiedFrom(s), pe)
-        }
-      } else {
-        (ADTSelector(re, sel).copiedFrom(s), opts.assumeChecked)
-      }
-
-    case adt @ ADT(id, tps, args) =>
-      val (rargs, pargs) = args.map(simplify(_, path)).unzip
-      val ls = (adt.getConstructor.fields zip rargs).collect {
-        case (vd, ADTSelector(e, id)) if vd.id == id => e
-      }
-
-      val newAdt = ls match {
-        case ls @ (e +: es) if (
-          ls.size == rargs.size &&
-          es.forall(_ == e) &&
-          e.getType == adt.getType &&
-          (isConstructor(e, id, path) contains true)) => e
-        case _ => ADT(id, tps, rargs).copiedFrom(adt)
-      }
-
-      // Note that if `isConstructor(e, id, path)` holds for each ADTSelector argument
-      // in rargs, then these selectors will be marked as pure by the simplifier so we
-      // don't need to do any special recomputation of pargs
-      (newAdt, pargs.foldLeft(opts.assumeChecked || !isImpureExpr(newAdt))(_ && _))
+    case adt: ADT => simplifyADT(adt, path)
 
     case ts @ TupleSelect(e, i) => simplify(path `expand` e, path) match {
       case (Tuple(es), true) => (es(i - 1), true)
@@ -224,42 +183,7 @@ trait SimplifierWithPC extends Transformer { self =>
 
     case Let(vd, v: Variable, b) => simplify(replaceFromSymbols(Map(vd -> v), b), path)
 
-    case let @ Let(vd, e, b) =>
-      val (re, pe) = simplify(e, path)
-      val (rb, pb) = simplify(b, path `withBinding` (vd -> re))
-
-      val v = vd.toVariable
-      lazy val insts = count { case `v` => 1 case _ => 0 }(rb)
-      lazy val inLambda = exists { case l: Lambda => variablesOf(l) contains v case _ => false }(rb)
-      lazy val immediateCall = existsWithPC(rb) { case (`v`, path) => path.isEmpty case _ => false }
-      lazy val containsLambda = exists { case l: Lambda => true case _ => false }(re)
-      lazy val realPE = if (opts.assumeChecked) {
-        val simp = simplifier(using solvers.PurityOptions.unchecked)
-        simp.isPure(e, path `in` simp)
-      } else {
-        pe
-      }
-      lazy val isSimpleBdg = isSimpleBinding(re)
-
-      if (
-        (((!inLambda && pe) || (inLambda && realPE && !containsLambda)) && insts <= 1) ||
-        (!inLambda && immediateCall && insts == 1) ||
-        (((!inLambda && pe) || (inLambda && realPE)) && isSimpleBdg)
-      ) {
-        // We can assume here that all `important` simplifications have already taken place
-        // as if the bound expression was an ADT or variable, then `path.expand` has already
-        // made sure that all possible simplifications have taken place in `rb`.
-        (replaceFromSymbols(Map(vd -> re), rb), pe && pb)
-      } else {
-        val newLet = Let(vd, re, rb).copiedFrom(let)
-        re match {
-          case l: Lambda =>
-            val inlined = inlineLambdas(newLet)
-            if (inlined != newLet) simplify(inlined, path)
-            else (newLet, pe && pb)
-          case _ => (newLet, pe && pb)
-        }
-      }
+    case let: Let => simplifyLet(let, path)
 
     case fi @ FunctionInvocation(id, tps, args) =>
       val (rargs, pargs) = args.map(simplify(_, path)).unzip
@@ -308,6 +232,96 @@ trait SimplifierWithPC extends Transformer { self =>
       dynStack.set(dynStack.get.tail)
       dynPurity.set(rest)
       (re, pe)
+  }
+
+  // The cases below live in their own methods to keep `simplify` under the JVM's
+  // huge method limit (8000 bytes of bytecode): HotSpot never JIT-compiles larger methods.
+  private def simplifyADTSelector(s: ADTSelector, path: Env): (Expr, Boolean) = {
+    val ADTSelector(e, sel) = s
+    val (re, pe) = simplify(path `expand` e, path)
+
+    if (isConstructor(re, s.constructor.id, path) == Some(true)) {
+      val cons = s.constructor
+      val index = cons.definition.selectorID2Index(sel)
+      re match {
+        case ADT(_, _, es) if pe =>
+          (es(index), true)
+
+        // Note: no need to check invariant as if the ADT constructor is in
+        //       the path, then its invariant has already been checked.
+        case adt @ ADT(_, _, es) =>
+          val value = es(index)
+          val freshFields = cons.fields.map(_.freshen)
+          val bindings = (freshFields zip es).filter(_._2 != value)
+          simplify(bindings.foldRight(value) { case ((vd, e), b) => Let(vd, e, b).copiedFrom(s) }, path)
+
+        case _ =>
+          (ADTSelector(re, sel).copiedFrom(s), pe)
+      }
+    } else {
+      (ADTSelector(re, sel).copiedFrom(s), opts.assumeChecked)
+    }
+  }
+
+  private def simplifyADT(adt: ADT, path: Env): (Expr, Boolean) = {
+    val ADT(id, tps, args) = adt
+    val (rargs, pargs) = args.map(simplify(_, path)).unzip
+    val ls = (adt.getConstructor.fields zip rargs).collect {
+      case (vd, ADTSelector(e, id)) if vd.id == id => e
+    }
+
+    val newAdt = ls match {
+      case ls @ (e +: es) if (
+        ls.size == rargs.size &&
+        es.forall(_ == e) &&
+        e.getType == adt.getType &&
+        (isConstructor(e, id, path) contains true)) => e
+      case _ => ADT(id, tps, rargs).copiedFrom(adt)
+    }
+
+    // Note that if `isConstructor(e, id, path)` holds for each ADTSelector argument
+    // in rargs, then these selectors will be marked as pure by the simplifier so we
+    // don't need to do any special recomputation of pargs
+    (newAdt, pargs.foldLeft(opts.assumeChecked || !isImpureExpr(newAdt))(_ && _))
+  }
+
+  private def simplifyLet(let: Let, path: Env): (Expr, Boolean) = {
+    val Let(vd, e, b) = let
+    val (re, pe) = simplify(e, path)
+    val (rb, pb) = simplify(b, path `withBinding` (vd -> re))
+
+    val v = vd.toVariable
+    lazy val insts = count { case `v` => 1 case _ => 0 }(rb)
+    lazy val inLambda = exists { case l: Lambda => variablesOf(l) contains v case _ => false }(rb)
+    lazy val immediateCall = existsWithPC(rb) { case (`v`, path) => path.isEmpty case _ => false }
+    lazy val containsLambda = exists { case l: Lambda => true case _ => false }(re)
+    lazy val realPE = if (opts.assumeChecked) {
+      val simp = simplifier(using solvers.PurityOptions.unchecked)
+      simp.isPure(e, path `in` simp)
+    } else {
+      pe
+    }
+    lazy val isSimpleBdg = isSimpleBinding(re)
+
+    if (
+      (((!inLambda && pe) || (inLambda && realPE && !containsLambda)) && insts <= 1) ||
+      (!inLambda && immediateCall && insts == 1) ||
+      (((!inLambda && pe) || (inLambda && realPE)) && isSimpleBdg)
+    ) {
+      // We can assume here that all `important` simplifications have already taken place
+      // as if the bound expression was an ADT or variable, then `path.expand` has already
+      // made sure that all possible simplifications have taken place in `rb`.
+      (replaceFromSymbols(Map(vd -> re), rb), pe && pb)
+    } else {
+      val newLet = Let(vd, re, rb).copiedFrom(let)
+      re match {
+        case l: Lambda =>
+          val inlined = inlineLambdas(newLet)
+          if (inlined != newLet) simplify(inlined, path)
+          else (newLet, pe && pb)
+        case _ => (newLet, pe && pb)
+      }
+    }
   }
 
   private def simplifyAndCons(es: Seq[Expr], path: Env, cons: Seq[Expr] => Expr): (Expr, Boolean) = {
