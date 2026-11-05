@@ -31,7 +31,9 @@ fork's `main` and must never end up in a branch meant for upstream.
 ## CI on the fork
 
 - `Inox CI` runs on GitHub-hosted runners: Linux on JDK 17 and macOS ARM64 on
-  JDK 21.
+  JDK 21. Pull requests run the Linux job only, since hosted macOS runners
+  can take 10+ minutes to start. macOS runs on pushes to `main`, manual runs
+  and nightly.
 - To test several PRs together, run `Inox CI` manually with the `prs` input,
   e.g. `2 3`. It merges those PR heads into `main` before testing.
 - `Stainless downstream CI` builds epfl-lara/stainless against this Inox and

@@ -10,6 +10,9 @@ on:
   push:
     branches:
       - main
+  # Nightly, so macOS is still tested while pull requests skip it.
+  schedule:
+    - cron: '0 3 * * *'
 
 # Cancel a pull request's superseded runs when new commits are pushed.
 # Runs on main are never cancelled, so every merge still gets a result.
@@ -28,17 +31,16 @@ jobs:
         # Fork: GitHub-hosted runners instead of the EPFL self-hosted one.
         # Instead of the full OS x JDK product, each OS runs one JDK, so
         # both architectures and both JDKs are still covered with 2 jobs.
-        include:
-          - runners:
-              name: Linux
-              os: Linux
-              labels: ['ubuntu-latest']
-            java-version: 17
-          - runners:
-              name: macOS ARM64
-              os: macOS
-              labels: ['macos-latest']
-            java-version: 21
+        # Pull requests run Linux only: hosted macOS runners can take 10+
+        # minutes to start, or never start. macOS runs on pushes to main,
+        # manual runs and the nightly schedule.
+        include: >-
+          ${{ fromJSON(github.event_name == 'pull_request' && '[
+            {"runners": {"name": "Linux", "os": "Linux", "labels": ["ubuntu-latest"]}, "java-version": 17}
+          ]' || '[
+            {"runners": {"name": "Linux", "os": "Linux", "labels": ["ubuntu-latest"]}, "java-version": 17},
+            {"runners": {"name": "macOS ARM64", "os": "macOS", "labels": ["macos-latest"]}, "java-version": 21}
+          ]') }}
     env:
       # solver versions to test against
       INSTALL_SOLVERS: 1
