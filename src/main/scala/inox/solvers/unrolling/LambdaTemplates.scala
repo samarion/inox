@@ -174,8 +174,28 @@ trait LambdaTemplates { self: Templates =>
 
         val toVars = typeOps.variablesOf(to).toSeq.sortBy(_.id)
         val toClosures = toVars.map(subst)
-        val appResult = encodeSymbol(Variable.fresh("result", BooleanType(), true))
-        clauses ++= instantiateType(freshBlocker, Typing(to, app.encoded, Constraint(appResult, toClosures, free)))
+        val toResult = encodeSymbol(Variable.fresh("result", BooleanType(), true))
+        clauses ++= instantiateType(freshBlocker, Typing(to, app.encoded, Constraint(toResult, toClosures, free)))
+
+        // A function of type `Pi(x: A). B` only maps arguments in `A` to results in `B`, so the
+        // codomain must only be assumed (or checked) for arguments that lie in the domain.
+        val domainResults = tpe match {
+          case PiType(params, _) => (params zip app.args).collect {
+            case (vd, arg) if ContractUnrolling.unroll(vd.tpe) =>
+              val domResult = encodeSymbol(Variable.fresh("dom", BooleanType(), true))
+              val domClosures = typeOps.variablesOf(vd.tpe).toSeq.sortBy(_.id).map(subst)
+              clauses ++= instantiateType(freshBlocker,
+                Typing(vd.tpe, arg.encoded, Membership(domResult, domClosures)))
+              domResult
+          }
+          case _ => Seq.empty
+        }
+
+        val appResult = if (domainResults.isEmpty) toResult else {
+          val appResult = encodeSymbol(Variable.fresh("result", BooleanType(), true))
+          clauses += mkImplies(freshBlocker, mkEquals(appResult, mkImplies(mkAnd(domainResults*), toResult)))
+          appResult
+        }
 
         (typeBlocker, appResult)
       }
@@ -401,11 +421,43 @@ trait LambdaTemplates { self: Templates =>
           clauses :+= mkEquals(oldB, ext)
         }
 
+        clauses ++= congruenceClauses(blocker, app)
         applications += ft -> (applications(ft) + key)
       }
     }
 
     clauses
+  }
+
+  /** Function applications are congruent with respect to custom equalities: applying a
+    * function to equal arguments must give equal results. SMT solvers only ensure this for
+    * structurally equal arguments, so we relate `app` to the previous applications of the
+    * same type whose arguments require equality unrolling.
+    *
+    * The equalities are registered, so that they are unrolled before a model is accepted.
+    * Otherwise, the solver could pick unrelated results for the applications of a free
+    * function to equal arguments, which is not a valid model.
+    */
+  private def congruenceClauses(blocker: Encoded, app: App): Clauses = {
+    val App(caller, FunctionType(from, to), args, encoded) = app
+    if (!from.exists(unrollEquality)) Seq.empty else {
+      val clauses = new scala.collection.mutable.ListBuffer[Encoded]
+      for ((b, that) <- applications(app.tpe) if that != app && canBeEqual(caller, that.caller)) {
+        val bc = encodeSymbol(Variable.fresh("b_cong", BooleanType(), true))
+        clauses += mkEquals(bc, mkAnd(blocker, b, mkEquals(caller, that.caller)))
+
+        val argEqs = (from zip (args zip that.args)).map { case (tpe, (a1, a2)) =>
+          val (equality, equalityClauses) = mkEqualities(bc, tpe, a1.encoded, a2.encoded)
+          clauses ++= equalityClauses
+          equality
+        }
+
+        val (resEq, resClauses) = mkEqualities(bc, to, encoded, that.encoded)
+        clauses ++= resClauses
+        clauses += mkImplies(mkAnd(bc +: argEqs*), resEq)
+      }
+      clauses.toSeq
+    }
   }
 
   private def equalityClauses(template: LambdaTemplate): Clauses = {
@@ -423,7 +475,9 @@ trait LambdaTemplates { self: Templates =>
             equals
           } else {
             val equalities = filtered.map { case ((v, e1), (_, e2)) =>
-              val (equality, equalityClauses) = mkEqualities(blocker, v.getType, e1, e2, register = false)
+              // The equality is registered so that it is unrolled before a model is accepted:
+              // the identifiers of lambdas with equal closures must be equal in the model.
+              val (equality, equalityClauses) = mkEqualities(blocker, v.getType, e1, e2, register = true)
               clauses ++= equalityClauses
               equality
             }

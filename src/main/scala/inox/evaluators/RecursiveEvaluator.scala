@@ -28,6 +28,16 @@ abstract class RecursiveEvaluator(override val program: Program,
   private def shift(b: BitSet, size: Int, i: Int): BitSet =
     b.filter(bit => bit + i >= 1 && bit + i <= size).map(_ + i)
 
+  /** The number of positions a bitvector of `size` bits is shifted by `amount`.
+    *
+    * As in SMT-LIB, the amount is read as an unsigned value, whatever the signedness of its type, and
+    * shifting by `size` or more vacates all the bits: the result is capped at `size`.
+    */
+  private def shiftAmount(amount: BVLiteral, size: Int): Int = {
+    val unsigned = BVLiteral(false, amount.value, amount.size).toBigInt
+    if (unsigned >= size) size else unsigned.toInt
+  }
+
   protected def finiteSet(els: Iterable[Expr], tpe: Type): FiniteSet = {
     FiniteSet(els.toSeq.distinct.sortBy(_.toString), tpe)
   }
@@ -35,6 +45,13 @@ abstract class RecursiveEvaluator(override val program: Program,
   protected def finiteBag(els: Iterable[(Expr, Expr)], tpe: Type): FiniteBag = {
     FiniteBag(els.toMap.toSeq.filter { case (_, IntegerLiteral(i)) => i > 0 case _ => false }.sortBy(_._1.toString), tpe)
   }
+
+  // `max` and `min` follow SMT-LIB's fp.max and fp.min: a NaN operand is ignored unless both are
+  // NaN. SMT-LIB leaves the result open for +0.0 and -0.0, which we order as the JVM does.
+  private def fpMax(a: Double, b: Double): Double = if (a.isNaN) b else if (b.isNaN) a else a.max(b)
+  private def fpMin(a: Double, b: Double): Double = if (a.isNaN) b else if (b.isNaN) a else a.min(b)
+  private def fpMax(a: Float, b: Float): Float = if (a.isNaN) b else if (b.isNaN) a else a.max(b)
+  private def fpMin(a: Float, b: Float): Float = if (a.isNaN) b else if (b.isNaN) a else a.min(b)
 
   protected def finiteMap(els: Iterable[(Expr, Expr)], default: Expr, from: Type, to: Type): FiniteMap = {
     FiniteMap(els.toMap.toSeq.filter { case (_, value) => value != default }.sortBy(_._1.toString), default, from, to)
@@ -413,23 +430,24 @@ abstract class RecursiveEvaluator(override val program: Program,
     case BVShiftLeft(l,r) =>
       (e(l), e(r)) match {
         case (BVLiteral(sig1, i1, s1), b2 @ BVLiteral(sig2, _, s2)) if sig1 == sig2 && s1 == s2 =>
-          BVLiteral(sig1, shift(i1, s1, b2.toBigInt.toInt), s1)
+          BVLiteral(sig1, shift(i1, s1, shiftAmount(b2, s1)), s1)
         case (le,re) => throw EvalError("Unexpected operation: (" + le.asString + ") << (" + re.asString + ")")
       }
 
     case BVAShiftRight(l,r) =>
       (e(l), e(r)) match {
         case (BVLiteral(sig1, i1, s1), b2 @ BVLiteral(sig2, _, s2)) if sig1 == sig2 && s1 == s2 =>
-          val shiftCount = b2.toBigInt.toInt
-          val shifted = shift(i1, s1, -shiftCount)
-          BVLiteral(sig1, if (i1(s1) && sig1) shifted ++ ((s1 - shiftCount) to s1) else shifted, s1)
+          val amount = shiftAmount(b2, s1)
+          val shifted = shift(i1, s1, -amount)
+          // the vacated bits are copies of the most significant bit, as for SMT-LIB `bvashr`
+          BVLiteral(sig1, if (i1(s1)) shifted ++ ((s1 - amount + 1) to s1) else shifted, s1)
         case (le,re) => throw EvalError("Unexpected operation: (" + le.asString + ") >> (" + re.asString + ")")
       }
 
     case BVLShiftRight(l,r) =>
       (e(l), e(r)) match {
         case (BVLiteral(sig1, i1, s1), b2 @ BVLiteral(sig2, _, s2)) if s1 == s2 && sig1 == sig2 =>
-          BVLiteral(sig1, shift(i1, s1, -b2.toBigInt.toInt), s1)
+          BVLiteral(sig1, shift(i1, s1, -shiftAmount(b2, s1)), s1)
         case (le,re) => throw EvalError("Unexpected operation: (" + le.asString + ") >>> (" + re.asString + ")")
       }
 
@@ -531,16 +549,16 @@ abstract class RecursiveEvaluator(override val program: Program,
 
     case FPMin(lhs, rhs) =>
       (e(lhs), e(rhs)) match {
-        case (Float32Literal(l1), Float32Literal(l2)) => Float32Literal(l1.min(l2))
-        case (Float64Literal(l1), Float64Literal(l2)) => Float64Literal(l1.min(l2))
+        case (Float32Literal(l1), Float32Literal(l2)) => Float32Literal(fpMin(l1, l2))
+        case (Float64Literal(l1), Float64Literal(l2)) => Float64Literal(fpMin(l1, l2))
         case _ => throw EvalError(f"Unexpected operation: min($lhs, $rhs)")
       }
 
     case FPMax(lhs, rhs) =>
       (e(lhs), e(rhs)) match {
-        case (Float32Literal(l1), Float32Literal(l2)) => Float32Literal(l1.max(l2))
-        case (Float64Literal(l1), Float64Literal(l2)) => Float64Literal(l1.max(l2))
-        case _ => throw EvalError(f"Unexpected operation: min($lhs, $rhs)")
+        case (Float32Literal(l1), Float32Literal(l2)) => Float32Literal(fpMax(l1, l2))
+        case (Float64Literal(l1), Float64Literal(l2)) => Float64Literal(fpMax(l1, l2))
+        case _ => throw EvalError(f"Unexpected operation: max($lhs, $rhs)")
       }
 
     case FPRound(RoundNearestTiesToEven, expr) =>

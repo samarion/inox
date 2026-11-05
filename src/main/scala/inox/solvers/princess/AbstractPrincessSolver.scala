@@ -320,9 +320,7 @@ abstract class AbstractPrincessSolver(override val program: Program,
         case Remainder(lhs, rhs) => lhs.getType match {
           case BVType(true, _) => Mod.bvsrem(parseTerm(lhs), parseTerm(rhs))
           case BVType(false, _) => Mod.bvurem(parseTerm(lhs), parseTerm(rhs))
-          case IntegerType() =>
-            val q = parseTerm(Division(lhs, rhs))
-            parseTerm(lhs) - (parseTerm(rhs) * q)
+          case IntegerType() => p.mulTheory.tMod(parseTerm(lhs), parseTerm(rhs))
         }
 
         case Modulo(lhs, rhs) => lhs.getType match {
@@ -423,12 +421,41 @@ abstract class AbstractPrincessSolver(override val program: Program,
                 case Some(IFunApp(_, args)) => args(selectors.toA(fun)._2)
                 case _ => app
               }
+            // The model interprets applications in terms of the integer representations of
+            // functions, which it doesn't use when evaluating function-typed terms
+            case IFunApp(fun, args) if lambdas `containsB` fun =>
+              val ft = lambdas.toA(fun)
+              IFunApp(fun, (args zip (ft +: ft.from)).map {
+                case (arg, argType: FunctionType) =>
+                  functionIndex(arg, argType)(model).map(IIntLit(_)).getOrElse(arg)
+                case (arg, _) => arg
+              })
             case e => e
           }
       }
 
       visitor.visit(iexpr, ())
     }
+
+    /* Obtains the internal integer representation of the function `iterm` in two manners.
+     * The first is to simply call model.eval on iterm. If it succeeds, we obtain the integer
+     * representation of the function. Otherwise, it could happen that iterm evaluates to some
+     * constant, in which case the representation of the function can be retrieved by traversing
+     * the `individuals` fields of the InfUninterpretedSort of the constant in question. */
+    private def functionIndex(iterm: ITerm, ft: FunctionType)(model: Model): Option[IdealInt] =
+      model.eval(iterm).orElse(model.evalExpression(iterm) match {
+        case Some(ct: IConstant) =>
+          typeToSort(ft) match {
+            case sort: UninterpretedSortTheory.InfUninterpretedSort =>
+              // Constants are numbered, it suffices to apply the reverse operation done in
+              // InfUninterpretedSort#decodeToTerm.
+              val idx = IdealInt(ct.c.name.substring(ct.c.name.lastIndexOf('!') + 1))
+              if (idx % 2 == IdealInt(0)) Some(idx / 2)
+              else Some(-(idx + 1) / 2)
+            case _ => None // Should not happen, but if it does, we simply return None
+          }
+        case _ => None
+      })
 
     private def evalToTerm(iexpr: IExpression)(model: Model): Option[IExpression] = iexpr match {
       case app @ IFunApp(_, _) => Some(app)
@@ -481,29 +508,7 @@ abstract class AbstractPrincessSolver(override val program: Program,
 
         case ft: FunctionType =>
           val iterm = iexpr.asInstanceOf[ITerm]
-          // Try to obtain the internal integer representation of the function
-          // iterm in two manners.
-          // The first is to simply call model.eval on iterm (byEval). If it succeeds,
-          // we obtain the integer repr. of the function.
-          // Otherwise, it could happen that iterm evaluates to some constant,
-          // in which case the repr. of the function can be retrieved by traversing
-          // the `individuals` fields of the InfUninterpretedSort of the constant in question.
-          def byEval = ctx.model.eval(iterm)
-          def byIndividuals = ctx.model.evalExpression(iterm) match {
-            case Some(ct: IConstant) =>
-              val s = typeToSort(ft)
-              s match {
-                case sort: UninterpretedSortTheory.InfUninterpretedSort =>
-                  // Constants are numbered, it suffices to apply the reverse operation done in
-                  // InfUninterpretedSort#decodeToTerm.
-                  val idx = IdealInt(ct.c.name.substring(ct.c.name.lastIndexOf('!') + 1))
-                  if (idx % 2 == IdealInt(0)) Some(idx / 2)
-                  else Some(-(idx + 1) / 2)
-                case _ => None // Should not happen, but if it does, we simply return None
-              }
-            case _ => None
-          }
-          byEval.orElse(byIndividuals).map { ideal =>
+          functionIndex(iterm, ft)(ctx.model).map { ideal =>
             val n = BigInt(ideal.bigIntValue)
             if (ctx.seen(n)) {
               ctx.chooses.getOrElse(n, {

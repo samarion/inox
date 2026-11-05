@@ -369,16 +369,19 @@ trait SymbolOps extends TypeOps { self =>
           val newPred = transformExpr(vars + vd.toVariable, pred, inFunction, path)
           RefinementType(newVd, newPred)
         case SigmaType(params, to) =>
-          val toVars = typeOps.variablesOf(to)
-          val newParams = params.map { vd =>
-            if (toVars(vd.toVariable)) transformVal(vars, vd, inFunction, path)
-            else transformVar(vd.toVariable).toVal
+          // The parameter types are kept even when `to` doesn't depend on them, as they constrain the tuple
+          val newParams = params.zipWithIndex.map { (vd, i) =>
+            transformVal(vars ++ params.take(i).map(_.toVariable), vd, inFunction, path)
           }
           val newTo = transformType(vars ++ params.map(_.toVariable), to, inFunction, path)
           SigmaType(newParams, newTo)
         case PiType(params, to) =>
+          // The parameter types are kept, as they define the domain on which `to` holds
+          val newParams = params.zipWithIndex.map { (vd, i) =>
+            transformVal(vars ++ params.take(i).map(_.toVariable), vd, true, path)
+          }
           val newTo = transformType(vars ++ params.map(_.toVariable), to, true, path)
-          PiType(params map (vd => transformVar(vd.toVariable).toVal), newTo)
+          PiType(newParams, newTo)
         case NAryType(tps, recons) =>
           recons(tps.map(rec))
       }
@@ -721,6 +724,52 @@ trait SymbolOps extends TypeOps { self =>
     rec(e, Map.empty, false)
   }
 
+  /** Decides which functions [[simplifyForalls]] inlines: those reachable from the formula that
+    * contain a quantifier outside assumptions and are not (mutually) recursive. Calls are followed
+    * through ADT equalities, which count as calls to the sort's equality function.
+    *
+    * The call edges and the per-function decision only depend on the symbols, so they are cached
+    * here instead of being recomputed for every formula. */
+  private object forallInlining {
+    import java.util.concurrent.ConcurrentHashMap
+
+    private val callees = new ConcurrentHashMap[Identifier, Set[Identifier]]
+    private val inlinable = new ConcurrentHashMap[Identifier, java.lang.Boolean]
+
+    private def calleesOf(id: Identifier): Set[Identifier] =
+      callees.computeIfAbsent(id, id => exprOps.collect[Identifier] {
+        case fi: FunctionInvocation => Set(fi.id)
+        case Equals(IsTyped(_, adt: ADTType), _) if adt.getSort.hasEquality => Set(adt.getSort.equality.get.id)
+        case _ => Set.empty
+      } (getFunction(id).fullBody))
+
+    /** The functions in `roots` and those they transitively call. */
+    private def reachable(roots: Set[Identifier]): Set[Identifier] = {
+      val seen = MutableSet.empty[Identifier]
+      var todo = roots.toList
+      while (todo.nonEmpty) {
+        val id = todo.head
+        todo = todo.tail
+        if (seen.add(id)) todo = calleesOf(id).toList ++ todo
+      }
+      seen.toSet
+    }
+
+    private def hasForall(e: Expr): Boolean = e match {
+      case _: Forall => true
+      case Assume(_, body) => hasForall(body)
+      case Operator(es, _) => es.exists(hasForall)
+    }
+
+    private def isInlinable(id: Identifier): Boolean =
+      inlinable.computeIfAbsent(id, id => java.lang.Boolean.valueOf(
+        hasForall(getFunction(id).fullBody) && !reachable(calleesOf(id)).contains(id)
+      )).booleanValue
+
+    /** The functions to inline in `e`. */
+    def toInline(e: Expr): Set[Identifier] = reachable(functionCallsOf(e).map(_.id)).filter(isInlinable)
+  }
+
   /** Pre-processing for solvers that handle universal quantification
     * in order to increase the precision of polarity analysis for
     * quantification instantiations.
@@ -728,32 +777,7 @@ trait SymbolOps extends TypeOps { self =>
   def simplifyForalls(e: Expr)(using opts: PurityOptions): Expr = {
 
     def inlineFunctions(e: Expr): Expr = {
-      import utils.Graphs._
-      val initGraph = DiGraph[Identifier, SimpleEdge[Identifier]](functionCallsOf(e).map(_.id))
-
-      val graph = fixpoint { (graph: DiGraph[Identifier, SimpleEdge[Identifier]]) =>
-        var newGraph = graph
-        for (id <- graph.N) {
-          preTraversal {
-            case fi: FunctionInvocation =>
-              newGraph += SimpleEdge(id, fi.id)
-            case Equals(IsTyped(e1, adt: ADTType), e2) if adt.getSort.hasEquality =>
-              newGraph += SimpleEdge(id, adt.getSort.equality.get.id)
-            case _ =>
-          } (getFunction(id).fullBody)
-        }
-        newGraph
-      } (initGraph)
-
-      val toInline = graph.N.filter { id =>
-        def rec(e: Expr): Boolean = e match {
-          case _: Forall => true
-          case Assume(pred, body) => rec(body)
-          case Operator(es, _) => es.exists(rec)
-        }
-
-        !graph.transitiveSucc(id)(id) && rec(getFunction(id).fullBody)
-      }
+      val toInline = forallInlining.toInline(e)
 
       def inlineExpr(e: Expr): Expr = postMap {
         case fi: FunctionInvocation if toInline(fi.id) =>
