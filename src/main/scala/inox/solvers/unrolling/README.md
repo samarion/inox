@@ -163,8 +163,13 @@ when reading the proofs against the code.
   fresh arguments (`Membership` typings in `TypeTemplates.scala`).
 - **Return types are assumed only for well-typed arguments.** At a call
   `f(args)`, the refined return type of `f` is assumed once `args` are shown
-  to lie in the parameter types. The thesis takes this from typing
-  derivations (§3.6).
+  to satisfy the refinements written in `f`'s parameter types. The thesis
+  takes this from typing derivations (§3.6). Refinements that come from sort
+  definitions or from instantiated type parameters are not checked, since
+  Inox does not check them where values are constructed either. A front-end
+  that checks call arguments itself can erase the refinements of its
+  parameter types, so that the return type is assumed at every call.
+  Stainless does this.
 - **Type parameters may be empty.** The satisfaction check assumes that type
   parameters are inhabited, so models can be extracted, but an UNSAT answer is
   only returned once that assumption is dropped. When a model exists only with
