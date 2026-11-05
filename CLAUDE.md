@@ -15,6 +15,22 @@ fork's `main` and must never end up in a branch meant for upstream.
 - Work that depends on an unmerged fix stacks on that fix's branch.
 - Upstreaming is a PR from the feature branch to `epfl-lara/inox:main`.
 
+## Keeping main in sync
+
+- The fork's `main` is epfl-lara's `main` plus one "Fork-only setup" commit.
+  The `Sync fork main` workflow rebuilds it that way daily and on manual runs
+  (`gh workflow run sync-fork-main.yml -R samarion/inox`), folding in merge
+  commits from GitHub's "Sync fork" button, manual syncs, and fork-only PRs
+  merged into `main`. It force-pushes `main` and keeps the old one as
+  `backup/main-<timestamp>` (the last 5).
+- It needs the `FORK_SYNC_TOKEN` secret, a fine-grained token with Contents and
+  Workflows write on this repo.
+- If the fork-only changes conflict with upstream, the run fails. Merge
+  epfl-lara's `main` into `main` by hand, resolving the conflict, and rerun it.
+- Feature branches based on epfl-lara's `main` are unaffected. A fork-only PR
+  (one that changes the fork's CI) must be rebased onto the new `main` after
+  each rebuild.
+
 ## Building and testing
 
 - `sbt test` runs the unit tests (`src/test`), and `sbt it:test` runs the
