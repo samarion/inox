@@ -107,8 +107,7 @@ The semantics is the one implemented by `evaluators/RecursiveEvaluator`.
 - **Proofs are sound.** If the procedure answers UNSAT, no assignment of the
   free variables makes the query evaluate to `true`.
 - **Counterexamples are sound.** A model returned with SAT makes the query
-  evaluate to `true`, except in the nullary-function case listed under
-  known limitations below. Set `optCheckModels` to have each model re-checked with
+  evaluate to `true`. Set `optCheckModels` to have each model re-checked with
   the evaluator before it is returned. It is off by default.
 - **Counterexamples are complete.** If a satisfying assignment exists and its
   evaluation terminates, the procedure eventually finds a model, provided
@@ -132,7 +131,11 @@ when reading the proofs against the code.
 - **Closure normalization.** `normalizeStructure` lifts every closed, pure
   subterm of a lambda as a dependency, where the thesis lifts only
   pseudo-values. The solver and the evaluator use the same normalization, so
-  equality between lambdas is consistent across them.
+  equality between lambdas is consistent across them. One consequence is that
+  a nullary closure with a closed, pure body equals `() => result`, so models
+  give a nullary function the closure `() => choose(...)`, with the `choose`
+  mapped to its result, whenever inlining the result would make it equal to a
+  distinct function (`nullaryClosure` in `ast/SymbolOps.scala`).
 - **Model extraction.** First-class functions are rebuilt as `if`-chains over
   the applications seen in the SMT model, with a default branch. Cyclic
   functions are rebuilt with `choose`. The thesis instead builds named
@@ -166,16 +169,6 @@ when reading the proofs against the code.
   parameters are inhabited, so models can be extracted, but an UNSAT answer is
   only returned once that assumption is dropped. When a model exists only with
   an empty type parameter, the answer is `Unknown`.
-
-### Known limitations
-
-- **Nullary functions on decoding backends.** Closures with closed, pure
-  bodies are normalized to their results. When a model needs two free nullary
-  functions with equal results to differ, the extraction gives one of them a
-  closure over a `choose`. This works with the native Z3 backend. Backends that
-  decode the model before comparing values (SMT-LIB solvers, `unrollz3`,
-  Princess) can't tell such functions apart. Their models can then falsify the
-  query, which `optCheckModels` reports as `Unknown`.
 
 On the thesis side, the completeness argument of Chapter 2 relies on input
 lambdas being re-encoded the same way at each step, and the claim in §3.7 that
