@@ -16,13 +16,6 @@ object SymbolOps {
     for (i <- identifiers.size to index) identifiers += FreshIdentifier("x", true)
     identifiers(index)
   }
-
-  private val nullaryIdentifiers = new scala.collection.mutable.HashMap[(BigInt, Any), Identifier]
-  /** The binder of the `choose` in the closure of the nullary function value number `n` of type
-    * `tpe` in a model (@see [[SymbolOps.nullaryClosure]]). */
-  def getNullaryId(n: BigInt, tpe: Any): Identifier = synchronized {
-    nullaryIdentifiers.getOrElseUpdate(n -> tpe, FreshIdentifier("x", true))
-  }
 }
 
 /** Provides functions to manipulate [[Expressions.Expr]] in cases where
@@ -589,20 +582,19 @@ trait SymbolOps extends TypeOps { self =>
       (body, subst)
   }
 
-  /** Ensures the closure `res` can only be equal to some other closure if they share the same
-    * integer identifier `id`. This method makes sure this property is preserved after going through
-    * [[normalizeStructure(e:SymbolOps\.this\.trees\.Expr,onlySimple:Boolean)*]]. */
   /** Closures whose body is closed and pure are normalized to their result, so distinct nullary
     * functions with equal results would have equal closures. Models therefore represent nullary
     * functions as closures over a fresh `choose`, which the model maps to the function's result.
-    * Given the number `n` of the function value in the model, the closure is the same each time
-    * the value is extracted. Returns the closure and its `choose`. */
-  def nullaryClosure(to: Type, n: Option[BigInt] = None): (Lambda, Choose) = {
-    val id = n.map(SymbolOps.getNullaryId(_, to)).getOrElse(FreshIdentifier("x", true))
+    * Model decoders pass the same binder `id` each time they extract the same function value, so
+    * that its closure is the same. Returns the closure and its `choose`. */
+  def nullaryClosure(to: Type, id: Identifier = FreshIdentifier("x", true)): (Lambda, Choose) = {
     val c = Choose(ValDef(id, to), BooleanLiteral(true))
     (Lambda(Seq.empty, c), c)
   }
 
+  /** Ensures the closure `res` can only be equal to some other closure if they share the same
+    * integer identifier `id`. This method makes sure this property is preserved after going through
+    * [[normalizeStructure(e:SymbolOps\.this\.trees\.Expr,onlySimple:Boolean)*]]. */
   def uniquateClosure(id: Int, res: Lambda)(using PurityOptions): Lambda = {
     def allArgs(l: Lambda): Seq[ValDef] = l.params ++ (l.body match {
       case l2: Lambda => allArgs(l2)

@@ -89,6 +89,14 @@ trait SMTLIBTarget extends SMTLIBParser with Interruptible with ADTManagers {
   import scala.language.implicitConversions
   protected implicit def symbolToQualifiedId(s: SSymbol): QualifiedIdentifier = SimpleSymbol(s)
 
+  /** The binders of the `choose`s in the closures of nullary function values, by the value's number
+    * and result type in the model, so that a value always decodes to the same closure
+    * (@see [[SymbolOps.nullaryClosure]]). */
+  private val nullaryIds: MutableMap[(BigInt, Type), Identifier] = MutableMap.empty
+  private def nullaryId(n: BigInt, to: Type): Identifier = synchronized {
+    nullaryIds.getOrElseUpdate(n -> to, FreshIdentifier("x", true))
+  }
+
   protected val adtManager = new ADTManager
 
   protected def id2sym(id: Identifier): SSymbol = {
@@ -747,7 +755,7 @@ trait SMTLIBTarget extends SMTLIBParser with Interruptible with ADTManagers {
 
         // Distinct nullary functions with equal results must remain distinct (@see [[nullaryClosure]])
         val closure = if (ft.from.nonEmpty) res else {
-          val (closure, c) = nullaryClosure(ft.to, Some(n))
+          val (closure, c) = nullaryClosure(ft.to, nullaryId(n, ft.to))
           context.nullaryChooses(c) = res.body
           closure
         }

@@ -544,6 +544,14 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
     case _ => unhandled
   }
 
+  /** The binders of the `choose`s in the closures of nullary function values, by the value's number
+    * and result type in the model, so that a value always decodes to the same closure
+    * (@see [[SymbolOps.nullaryClosure]]). */
+  private val nullaryIds: MutableMap[(BigInt, Type), Identifier] = MutableMap.empty
+  private def nullaryId(n: BigInt, to: Type): Identifier = synchronized {
+    nullaryIds.getOrElseUpdate(n -> to, FreshIdentifier("x", true))
+  }
+
   protected lazy val emptySeq = {
     z3.getASTKind(z3.mkEmptySeq(typeToSort(StringType()))) match {
       case Z3AppAST(decl, _) => decl
@@ -644,7 +652,7 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
 
                 // Distinct nullary functions with equal results must remain distinct (@see [[nullaryClosure]])
                 val closure = if (fts.nonEmpty) res else {
-                  val (closure, c) = nullaryClosure(tt, Some(n))
+                  val (closure, c) = nullaryClosure(tt, nullaryId(n, tt))
                   nullaryChooses(c) = res.body
                   closure
                 }
