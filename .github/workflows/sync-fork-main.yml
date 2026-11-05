@@ -1,0 +1,87 @@
+name: Sync fork main
+
+# Fork-only: rebuilds main as epfl-lara/inox main plus one fork-only commit,
+# using .github/scripts/sync-fork-main.sh. It also folds in merge commits left
+# by GitHub's "Sync fork" button, manual syncs, or fork-only PRs merged into
+# main, so main always ends up 1 commit ahead and 0 behind upstream.
+#
+# Needs a FORK_SYNC_TOKEN secret: a fine-grained personal access token for
+# samarion/inox with "Contents" and "Workflows" read and write. The default
+# GITHUB_TOKEN can't push commits that touch .github/workflows, and its pushes
+# don't trigger the CI run on the new main.
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only show what would be pushed'
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: sync-fork-main
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    if: github.repository == 'samarion/inox'
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM: https://github.com/epfl-lara/inox.git
+      TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+    steps:
+    - name: Check the token
+      run: |
+        if [ -z "$TOKEN" ]; then
+          echo "::error::Add a FORK_SYNC_TOKEN secret (fine-grained token with Contents and Workflows write) to push to main."
+          exit 1
+        fi
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        ref: main
+        fetch-depth: 0
+        token: ${{ secrets.FORK_SYNC_TOKEN }}
+    - name: Rebuild main on top of upstream main
+      id: rebuild
+      run: |
+        git config user.name "Nicolas Voirol"
+        git config user.email "voirol.nicolas@gmail.com"
+        git fetch --no-tags "$UPSTREAM" main:refs/remotes/upstream/main
+        FORK="$(git rev-parse origin/main)"
+        echo "fork=$FORK" >> "$GITHUB_OUTPUT"
+        RESULT="$(.github/scripts/sync-fork-main.sh "$FORK" upstream/main | tail -n 1)"
+        echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+        {
+          echo "### Sync fork main: $RESULT"
+          echo
+          echo "- old main: \`$FORK\` ($(git rev-list --count upstream/main.."$FORK") ahead, $(git rev-list --count "$FORK"..upstream/main) behind upstream)"
+          if [ "$RESULT" != conflict ]; then
+            echo "- new main: \`$(git rev-parse fork-main-synced)\`"
+            echo
+            echo '```'
+            git diff --stat upstream/main fork-main-synced
+            echo '```'
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+        if [ "$RESULT" = conflict ]; then
+          echo "::error::The fork-only changes conflict with upstream main. Resolve by hand: merge epfl-lara main into main, then rerun this workflow."
+          exit 1
+        fi
+    - name: Push
+      if: steps.rebuild.outputs.result == 'rebuilt' && !inputs.dry_run
+      env:
+        FORK: ${{ steps.rebuild.outputs.fork }}
+      run: |
+        BACKUP="backup/main-$(date -u +%Y%m%d-%H%M%S)"
+        git push origin "$FORK:refs/heads/$BACKUP"
+        git push --force-with-lease="main:$FORK" origin fork-main-synced:main
+        echo "- backup of the old main: \`$BACKUP\`" >> "$GITHUB_STEP_SUMMARY"
+        # Keep the 5 most recent backups.
+        git ls-remote --heads origin 'backup/main-*' | awk '{print $2}' | sort -r | tail -n +6 \
+          | while read -r ref; do git push origin --delete "$ref"; done
