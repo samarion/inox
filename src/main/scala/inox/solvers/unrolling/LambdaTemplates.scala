@@ -17,6 +17,8 @@ trait LambdaTemplates { self: Templates =>
   import lambdasManager._
   import quantificationsManager._
 
+  private lazy val assumeChecked = options.findOptionOrDefault(optAssumeChecked)
+
   /** Represents a POTENTIAL application of a first-class function in the unfolding procedure
     *
     * The [[equals]] condition guards the application for equality of the concrete caller with
@@ -166,11 +168,14 @@ trait LambdaTemplates { self: Templates =>
         clauses += mkImplies(mkAnd(b, mkEquals(f, app.caller), typeBlocker), freshBlocker)
 
         val vars = typeOps.variablesOf(tpe).toSeq.sortBy(_.id)
-        val (subst, to) = tpe match {
-          case PiType(params, to) => ((params.map(_.toVariable) zip app.args).toMap ++ (vars zip closures), to)
-          case FunctionType(_, to) => ((vars zip closures).toMap, to)
+        // A function type `A => B` is the non-dependent Pi type `Pi(x: A). B`, so both are
+        // handled alike: the parameters are bound to the arguments of the application.
+        val (params, to) = tpe match {
+          case PiType(params, to) => (params, to)
+          case FunctionType(from, to) => (from.map(tpe => ValDef.fresh("x", tpe, true)), to)
           case _ => throw new InternalSolverError("Unexpected function type " + tpe.asString)
         }
+        val subst = (params.map(_.toVariable) zip app.args).toMap ++ (vars zip closures)
 
         val toVars = typeOps.variablesOf(to).toSeq.sortBy(_.id)
         val toClosures = toVars.map(subst)
@@ -179,16 +184,16 @@ trait LambdaTemplates { self: Templates =>
 
         // A function of type `Pi(x: A). B` only maps arguments in `A` to results in `B`, so the
         // codomain must only be assumed (or checked) for arguments that lie in the domain.
-        val domainResults = tpe match {
-          case PiType(params, _) => (params zip app.args).collect {
-            case (vd, arg) if ContractUnrolling.unroll(vd.tpe) =>
-              val domResult = encodeSymbol(Variable.fresh("dom", BooleanType(), true))
-              val domClosures = typeOps.variablesOf(vd.tpe).toSeq.sortBy(_.id).map(subst)
-              clauses ++= instantiateType(freshBlocker,
-                Typing(vd.tpe, arg.encoded, Membership(domResult, domClosures)))
-              domResult
-          }
-          case _ => Seq.empty
+        // Under `optAssumeChecked`, the front-end has checked that applications only receive
+        // arguments in the domain, so the codomain is assumed directly. This spares a membership
+        // check per application, which is costly when the domain is an ADT with refined fields.
+        val domainResults = if (assumeChecked) Seq.empty else (params zip app.args).collect {
+          case (vd, arg) if ContractUnrolling.unroll(vd.tpe) =>
+            val domResult = encodeSymbol(Variable.fresh("dom", BooleanType(), true))
+            val domClosures = typeOps.variablesOf(vd.tpe).toSeq.sortBy(_.id).map(subst)
+            clauses ++= instantiateType(freshBlocker,
+              Typing(vd.tpe, arg.encoded, Membership(domResult, domClosures)))
+            domResult
         }
 
         val appResult = if (domainResults.isEmpty) toResult else {
