@@ -22,10 +22,12 @@ trait Z3Solver extends SMTLIBSolver with Z3Target { self =>
     assumptions: Set[Expr]
   ): config.Response[Model, Assumptions] = config.cast(super.extractResponse(config, res, assumptions) match {
     case SatWithModel(model) =>
-      val evaluations = model.vars.map { case (k, v) => k -> evaluator.eval(v).result }
+      val defs = inox.Model(program)(Map.empty, Map.empty, model.defs)
+      val evaluations = model.vars.map { case (k, v) => k -> evaluator.eval(v, defs).result }
       SatWithModel(inox.Model(program)(
         evaluations.collect { case (k, Some(v)) => k -> v },
-        model.chooses
+        model.chooses,
+        model.defs
       ))
     case resp => resp
   })

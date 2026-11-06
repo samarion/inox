@@ -33,6 +33,22 @@ trait Semantics { self =>
   def getEvaluator(using ctx: Context): evaluators.DeterministicEvaluator {
     val program: self.program.type
   } = evaluatorCache.cached(ctx, createEvaluator(ctx))
+
+  /** The provider that created these semantics, set by [[Program.getSemantics]]. */
+  private[inox] var provider: SemanticsProvider { val trees: self.trees.type } = null
+
+  /** The semantics of the program extended with `functions`, under which the values of a model
+    * that defines functions are evaluated (see [[Model.symbols]]).
+    *
+    * They come from the provider that created these semantics, so semantics created directly
+    * rather than through [[Program.getSemantics]] must override this to support such models.
+    */
+  def withFunctions(functions: Seq[trees.FunDef]): inox.Semantics { val trees: self.trees.type } = {
+    if (provider eq null) {
+      throw FatalError("Cannot evaluate under model definitions without a semantics provider")
+    }
+    program.withFunctions(functions).getSemantics(using provider)
+  }
 }
 
 trait SemanticsProvider { self =>
