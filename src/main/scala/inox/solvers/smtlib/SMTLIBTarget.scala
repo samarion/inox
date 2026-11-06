@@ -426,23 +426,15 @@ trait SMTLIBTarget extends SMTLIBParser with Interruptible with ADTManagers {
     case Division(a, b)  => a.getType match {
       case BVType(true, _) => FixedSizeBitVectors.SDiv(toSMT(a), toSMT(b))
       case BVType(false, _) => FixedSizeBitVectors.UDiv(toSMT(a), toSMT(b))
-      case IntegerType() =>
-        val ar = toSMT(a)
-        val br = toSMT(b)
-        Core.ITE(
-          Ints.GreaterEquals(ar, Ints.NumeralLit(0)),
-          Ints.Div(ar, br),
-          Ints.Neg(Ints.Div(Ints.Neg(ar), br))
-        )
+      case IntegerType() => Ints.Div(toSMT(a), toSMT(b))
       case RealType() => Reals.Div(toSMT(a), toSMT(b))
     }
 
     case Remainder(a, b) => a.getType match {
       case BVType(true, _) => FixedSizeBitVectors.SRem(toSMT(a), toSMT(b))
       case BVType(false, _) => FixedSizeBitVectors.URem(toSMT(a), toSMT(b))
-      case IntegerType() =>
-        val q = toSMT(Division(a, b))
-        Ints.Sub(toSMT(a), Ints.Mul(toSMT(b), q))
+      // the remainder of the euclidean division
+      case IntegerType() => Ints.Mod(toSMT(a), toSMT(b))
     }
 
     case Modulo(a, b) => a.getType match {
@@ -524,21 +516,6 @@ trait SMTLIBTarget extends SMTLIBParser with Interruptible with ADTManagers {
     case _ => unhandled
   }
 
-  /** Encodes `a.max(b)` or `a.min(b)` as fp.max or fp.min, which SMT-LIB leaves open for +0.0
-    * and -0.0. These are ordered as the JVM does (and as the evaluator does), with -0.0 below +0.0.
-    */
-  private def fpMinMax(a: Expr, b: Expr, max: Boolean)(using bindings: Map[Identifier, Term]): Term = {
-    val (aSym, bSym) = (id2sym(FreshIdentifier("a", true)), id2sym(FreshIdentifier("b", true)))
-    // Among two zeros, max picks `a` unless it is -0.0, and min picks `a` if it is -0.0.
-    val zeros = if (max) Core.ITE(FloatingPoint.IsNegative(aSym), bSym, aSym)
-                else Core.ITE(FloatingPoint.IsNegative(aSym), aSym, bSym)
-    val op = if (max) FloatingPoint.Max(aSym, bSym) else FloatingPoint.Min(aSym, bSym)
-    SMTLet(
-      VarBinding(aSym, toSMT(a)), Seq(VarBinding(bSym, toSMT(b))),
-      Core.ITE(Core.And(FloatingPoint.IsZero(aSym), FloatingPoint.IsZero(bSym)), zeros, op)
-    )
-  }
-
   protected def toSMTFloatingPoint(e: Expr)(using bindings: Map[Identifier, Term]): Term = e match {
     case FPLiteral(e, s, bits) =>
       val size = e + s
@@ -557,21 +534,15 @@ trait SMTLIBTarget extends SMTLIBParser with Interruptible with ADTManagers {
     case FPFMA(rm, e1, e2, e3) => FloatingPoint.FMA(toSMT(rm), toSMT(e1), toSMT(e2), toSMT(e3))
     case FPAbs(e)        => FloatingPoint.Abs(toSMT(e))
     case Sqrt(rm, e)     => FloatingPoint.Sqrt(toSMT(rm), toSMT(e))
-    case FPMax(a, b) => fpMinMax(a, b, max = true)
-    case FPMin(a, b) => fpMinMax(a, b, max = false)
+    case FPMax(a, b) => FloatingPoint.Max(toSMT(a), toSMT(b))
+    case FPMin(a, b) => FloatingPoint.Min(toSMT(a), toSMT(b))
     case FPRound(rm, e) => FloatingPoint.RoundToIntegral(toSMT(rm), toSMT(e))
     case FPCast(ne, ns, rm, e) => e.getType match {
       case BVType(false, _) => FloatingPoint.ToFPUnsigned(ne, ns, toSMT(rm), toSMT(e))
       case _ => FloatingPoint.ToFP(ne, ns, toSMT(rm), toSMT(e))
     }
     case FPFromBinary(ne, ns, e) => FloatingPoint.ToFP(ne, ns, toSMT(e))
-    case FPToBV(s, signed, rm, e) =>
-      if (signed) {
-        FloatingPoint.ToSignedBitVector(s, toSMT(rm), toSMT(e))
-      }
-      else {
-        FloatingPoint.ToUnsignedBitVector(s, toSMT(rm), toSMT(e))
-      }
+    // Deprecated: Stainless will encode the JVM's casts itself with `FPToBV`
     case FPToBVJVM(eb, sb, toSize, e) =>
       toSize match
         case 8 => toSMT(BVNarrowingCast(FPToBVJVM(eb, sb, 32, e), Int8Type()))
@@ -588,7 +559,13 @@ trait SMTLIBTarget extends SMTLIBParser with Interruptible with ADTManagers {
               IfExpr(isSmall, minVal,
                 FPToBV(s, true, RoundTowardZero, e)))))
 
-
+    case FPToBV(s, signed, rm, e) =>
+      if (signed) {
+        FloatingPoint.ToSignedBitVector(s, toSMT(rm), toSMT(e))
+      }
+      else {
+        FloatingPoint.ToUnsignedBitVector(s, toSMT(rm), toSMT(e))
+      }
     case FPToReal(e) => FloatingPoint.ToReal(toSMT(e))
     case FPLessThan(a, b) => FloatingPoint.LessThan(toSMT(a), toSMT(b))
     case FPLessEquals(a, b) => FloatingPoint.LessEquals(toSMT(a), toSMT(b))
