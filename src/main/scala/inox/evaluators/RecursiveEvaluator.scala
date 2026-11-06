@@ -25,6 +25,19 @@ abstract class RecursiveEvaluator(override val program: Program,
 
   val name = "Recursive Evaluator"
 
+  /** Models that define functions are evaluated by an evaluator of the program extended with
+    * these definitions, so that their values can call them.
+    */
+  override def eval(ex: Expr, model: program.Model): EvaluationResult = {
+    if (model.defs.forall(fd => symbols.lookupFunction(fd.id).contains(fd))) {
+      super.eval(ex, model)
+    } else {
+      val ext = semantics.withFunctions(model.defs)
+      val evaluator = ext.getEvaluator(using context)
+      evaluator.eval(ex, model.withProgram(ext.program))
+    }
+  }
+
   private def shift(b: BitSet, size: Int, i: Int): BitSet =
     b.filter(bit => bit + i >= 1 && bit + i <= size).map(_ + i)
 

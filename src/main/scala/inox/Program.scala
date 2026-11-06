@@ -49,6 +49,7 @@ trait Program { self =>
       _semantics = ev.getSemantics(
         this.asInstanceOf[Program { val trees: self.trees.type }]
       ).asInstanceOf[Semantics]
+      _semantics.provider = ev
     }
     _semantics
   }
