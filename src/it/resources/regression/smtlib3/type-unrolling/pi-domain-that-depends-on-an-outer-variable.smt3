@@ -5,8 +5,8 @@
 ; (a: {y | y > n}) => {r: BigInt | r > a}
 (declare-const g (-> (! Int :var a :restrict (> a n)) (! Int :var r :restrict (> r a))))
 (declare-const h (-> (! Int :var a :restrict (> a m)) (! Int :var r :restrict (> r a))))
-; F: (k: (x: BigInt) => {r | r > n}) => {r | r > 0}, whose domain captures `n`
-(declare-const F (-> (! (-> (! Int :var x) (! Int :var r :restrict (> r n))) :var k) PosInt))
+; F: (BigInt => {r | r > n}) => {r | r > 0}, whose domain captures `n`
+(declare-const F (-> (-> Int (! Int :var r :restrict (> r n))) PosInt))
 
 ; inside
 (push 1)
