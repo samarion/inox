@@ -24,11 +24,17 @@ class TipTestSuite extends unrolling.UnrollingTestSuite with ResourceUtils {
   private def onNativeZ3(ctx: Context): FilterStatus =
     WithContext(ctx.withOpts(optSelectedSolvers(Set("nativez3"))))
 
+  /** Whether to leave out the benchmarks that take minutes, with `-Dinox.skip-slow-tests=true`
+    * (CI sets it for pull requests).
+    */
+  private lazy val skipSlowTests: Boolean = System.getProperty("inox.skip-slow-tests") == "true"
+
   private def ignoreSAT(ctx: Context, file: java.io.File): FilterStatus = 
     ctx.options.findOptionOrDefault(optSelectedSolvers).headOption match {
       case Some(solver) => (solver, file.getName) match {
         // takes about 90s even on native Z3, so it only runs once
         case (_, "ForallAssoc.scala-0.tip") if ctx.options.findOptionOrDefault(optAssumeChecked) => Skip
+        case (_, "ForallAssoc.scala-0.tip") if skipSlowTests => Ignore
         // Z3 and CVC4 binaries are exceedingly slow on these benchmarks
         case ("no-inc:smt-z3" | "smt-z3" | "smt-cvc4", "ForallAssoc.scala-0.tip") => onNativeZ3(ctx)
         // this test only holds when assumeChecked=false

@@ -89,9 +89,11 @@ jobs:
         SBT_COVERAGE: ${{ (matrix.runners.os == 'Linux' && matrix.java-version == 17) && 'coverage' || '' }}
     - name: Run integration tests
       id: integration-tests
-      run: sbt -Dtest-parallelism=10 -batch $SBT_COVERAGE it:test
+      run: sbt -Dtest-parallelism=10 -Dinox.skip-slow-tests=$SKIP_SLOW_TESTS -batch $SBT_COVERAGE it:test
       env:
         SBT_COVERAGE: ${{ (matrix.runners.os == 'Linux' && matrix.java-version == 17) && 'coverage' || '' }}
+        # Benchmarks that take minutes only run on main
+        SKIP_SLOW_TESTS: ${{ github.event_name == 'pull_request' }}
     - name: Generate coverage report
       if: ${{ !cancelled() && matrix.runners.os == 'Linux' && matrix.java-version == 17 }}
       run: |
