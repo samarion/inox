@@ -50,4 +50,11 @@ class CallArgumentTypeSuite extends SolverTestSuite {
     val res = s.solveSAT(Not(FunctionInvocation(countID, Seq(), Seq(x)) > E(BigInt(0))))
     assert(res.isUNSAT, s"expected UNSAT, got $res")
   }
+
+  test("return type is assumed for ill-typed arguments under assume-checked", Integers) { ctx =>
+    val s = solver(ctx.withOpts(optAssumeChecked(true)))
+    // the front-end has checked the arguments of every call, so id0(1) is assumed to be 0
+    val res = s.solveSAT(Not(FunctionInvocation(id0ID, Seq(), Seq(E(BigInt(1)))) === E(BigInt(0))))
+    assert(res.isUNSAT, s"expected UNSAT, got $res")
+  }
 }

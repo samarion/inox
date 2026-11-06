@@ -17,6 +17,8 @@ trait FunctionTemplates { self: Templates =>
   import functionsManager._
   import lambdasManager._
 
+  private lazy val assumeChecked = options.findOptionOrDefault(optAssumeChecked)
+
   protected def variableSeq(tpe: Type): Seq[Variable] = {
     val free = typeOps.variablesOf(tpe)
     val vars = new scala.collection.mutable.ListBuffer[Variable]
@@ -57,8 +59,10 @@ trait FunctionTemplates { self: Templates =>
           // Only the refinements written in the function's signature are conditions: those that
           // come from sort definitions or from the instantiation of type parameters are not
           // checked, so the return type is assumed directly when the signature has none.
+          // Under `optAssumeChecked`, the front-end has checked the arguments of every call, so
+          // the return type is assumed directly too.
           val (domains, domClauses) = (tfd.params zip tfd.fd.params).foldLeft((Seq.empty[Expr], emptyClauses)) {
-            case ((domains, domClauses), (vd, gvd)) if hasArgumentConditions(gvd.tpe) =>
+            case ((domains, domClauses), (vd, gvd)) if !assumeChecked && hasArgumentConditions(gvd.tpe) =>
               val (p, pClauses) = mkTypeClauses(start, vd.tpe, vd.toVariable, substMap, inDomain = true)(using MembershipGenerator)
               (domains :+ p, domClauses +++ pClauses)
             case (acc, _) => acc
