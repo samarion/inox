@@ -4,29 +4,18 @@ package inox
 package solvers
 package unrolling
 
-class QuantifiersSuite extends TestSuite {
+class QuantifiersSuite extends UnrollingTestSuite {
   import inox.trees._
   import dsl._
 
-  override def configurations = List(
-    ("nativez3",     false, false, false),
-    ("nativez3-opt", false, false, false),
-    ("princess",     false, false, false),
-    ("smt-z3",       false, false, false),
-    ("smt-z3-opt",   false, false, false),
-    ("smt-cvc4",     false, false, false),
-    ("nativez3",     true,  true,  false),
-    ("nativez3",     false, false, true ),
-    ("princess",     true,  true,  false),
-    ("smt-cvc4",     false, false, true ),
-    ("smt-cvc5",     false, false, true ),
-  ).map { case (solverName, checkModels, feelingLucky, unrollAssumptions) => Seq(
-    optSelectedSolvers(Set(solverName)),
+  override protected def optionMatrix = List(
+    (false, false, false),
+    (true,  true,  false),
+    (false, false, true ),
+  ).map { case (checkModels, feelingLucky, unrollAssumptions) => Seq(
     optCheckModels(checkModels),
     optFeelingLucky(feelingLucky),
-    optUnrollAssumptions(unrollAssumptions),
-    optTimeout(300),
-    ast.optPrintUniqueIds(true)
+    optUnrollAssumptions(unrollAssumptions)
   )}
 
   val isAssociativeID = FreshIdentifier("isAssociative")
@@ -125,9 +114,25 @@ class QuantifiersSuite extends TestSuite {
   test("Unification is unsatisfiable") {
     val aT = T("A")
     val f = ("f" :: ((aT, aT) =>: aT)).toVariable
-    val clause = forall("x" :: aT, "y" :: aT)((x,y) => !(f(x,y) === f(y,x)))
+    // `A` must be inhabited, as the quantifier holds vacuously otherwise
+    val a = ("a" :: aT).toVariable
+    val clause = forall("x" :: aT, "y" :: aT)((x,y) => !(f(x,y) === f(y,x))) && (f(a, a) === a)
 
     assert(SimpleSolverAPI(program.getSolver).solveSAT(clause).isUNSAT)
+  }
+
+  test("Universal quantifier under negated conjunction is not assumed") { ctx0 ?=>
+    // Without simplifications, the negation is not pushed inside the conjunction and the
+    // template generator encodes `!(e && fb)` directly. The universal quantifier of `e` must
+    // then not be asserted (`e` may be true), otherwise the formula is wrongly deemed UNSAT.
+    given ctx: inox.Context = ctx0.withOpts(optNoSimplifications(true))
+    val Seq(a, b, r) = Seq("a" :: IntegerType(), "b" :: IntegerType(), "r" :: IntegerType()).map(_.toVariable)
+    val e = !forall("k" :: IntegerType())(k => !(b === k * r))
+    val fa = forall("x" :: IntegerType())(x => (a === x) ==> (x <= r))
+    val fb = forall("x" :: IntegerType())(x => (b === x) ==> (x <= r))
+    val clause = e && fa && !(e && fb)
+
+    assert(!SimpleSolverAPI(program.getSolver).solveSAT(clause).isUNSAT)
   }
 
   private def isPrincess(ctx: Context): Boolean =

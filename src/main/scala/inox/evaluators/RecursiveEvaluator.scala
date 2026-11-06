@@ -6,6 +6,8 @@ package evaluators
 import inox.ast.Trees
 import inox.transformers.TreeTransformer
 
+import inox.utils.CaseSplit.*
+
 import scala.collection.immutable.BitSet
 
 abstract class RecursiveEvaluator(override val program: Program,
@@ -26,6 +28,16 @@ abstract class RecursiveEvaluator(override val program: Program,
   private def shift(b: BitSet, size: Int, i: Int): BitSet =
     b.filter(bit => bit + i >= 1 && bit + i <= size).map(_ + i)
 
+  /** The number of positions a bitvector of `size` bits is shifted by `amount`.
+    *
+    * As in SMT-LIB, the amount is read as an unsigned value, whatever the signedness of its type, and
+    * shifting by `size` or more vacates all the bits: the result is capped at `size`.
+    */
+  private def shiftAmount(amount: BVLiteral, size: Int): Int = {
+    val unsigned = BVLiteral(false, amount.value, amount.size).toBigInt
+    if (unsigned >= size) size else unsigned.toInt
+  }
+
   protected def finiteSet(els: Iterable[Expr], tpe: Type): FiniteSet = {
     FiniteSet(els.toSeq.distinct.sortBy(_.toString), tpe)
   }
@@ -34,11 +46,31 @@ abstract class RecursiveEvaluator(override val program: Program,
     FiniteBag(els.toMap.toSeq.filter { case (_, IntegerLiteral(i)) => i > 0 case _ => false }.sortBy(_._1.toString), tpe)
   }
 
+  // `max` and `min` follow SMT-LIB's fp.max and fp.min: a NaN operand is ignored unless both are
+  // NaN. SMT-LIB leaves the result open for +0.0 and -0.0, which we order as the JVM does.
+  private def fpMax(a: Double, b: Double): Double = if (a.isNaN) b else if (b.isNaN) a else a.max(b)
+  private def fpMin(a: Double, b: Double): Double = if (a.isNaN) b else if (b.isNaN) a else a.min(b)
+  private def fpMax(a: Float, b: Float): Float = if (a.isNaN) b else if (b.isNaN) a else a.max(b)
+  private def fpMin(a: Float, b: Float): Float = if (a.isNaN) b else if (b.isNaN) a else a.min(b)
+
   protected def finiteMap(els: Iterable[(Expr, Expr)], default: Expr, from: Type, to: Type): FiniteMap = {
     FiniteMap(els.toMap.toSeq.filter { case (_, value) => value != default }.sortBy(_._1.toString), default, from, to)
   }
 
-  protected[evaluators] def e(expr: Expr)(using rctx: RC, gctx: GC): Expr = expr match {
+  /** Evaluates `expr`.
+    *
+    * The cases are split by theory into the `eCore`, `eArithmetic`, ... methods below, which are
+    * tried in order (see [[utils.CaseSplit]]). Subclasses can override `e` itself, or a single family.
+    */
+  protected[evaluators] def e(expr: Expr)(using rctx: RC, gctx: GC): Expr =
+    eCore(expr) otherwise eArithmetic(expr) otherwise eStrings(expr) otherwise eBitVectors(expr) otherwise
+      eFloatingPoint(expr) otherwise eCollections(expr) otherwise unexpected(expr)
+
+  protected def unexpected(expr: Expr): Nothing =
+    throw EvalError("Unhandled case in Evaluator : [" + expr.getClass + "] " + expr.asString)
+
+  /** Variables, functions, booleans, ADTs, lambdas, quantifiers and literals. */
+  protected def eCore(expr: Expr)(using rctx: RC, gctx: GC): Expr = expr match {
     case v: Variable =>
       rctx.mappings.get(v.toVal) match {
         case Some(v) => v
@@ -160,6 +192,54 @@ abstract class RecursiveEvaluator(override val program: Program,
           throw EvalError(typeErrorMsg(le, expr.getType))
       }
 
+    case l @ Lambda(_, _) =>
+      def normalizeLambda(l: Lambda, onlySimple: Boolean = false): Lambda = {
+        val (nl, deps) = normalizeStructure(l, onlySimple = onlySimple)
+        val newCtx = deps.foldLeft(rctx) {
+          case (rctx, (v, dep, conds)) =>
+            if (conds.forall(e(_)(using rctx, gctx) == BooleanLiteral(true)))
+              rctx.withNewVar(v.toVal, e(dep)(using rctx, gctx))
+            else rctx
+        }
+        val mapping = variablesOf(nl).map(v => v -> newCtx.mappings(v.toVal)).toMap
+        replaceFromSymbols(mapping, nl).asInstanceOf[Lambda]
+      }
+
+      // We start by normalizing the structure of the lambda as in the solver to
+      // evaluate all normalizable ground expressions within its body.
+      val ground = normalizeLambda(l)
+
+      // Then, in order for nested lambdas to have fresh variables in their argument
+      // lists and let bindings, we re-normalize the identifiers by passing
+      // `onlySimple = true` to the call to `normalizeStructure` (this avoids lifting
+      // ground lambdas out in the deps).
+      val normalized = normalizeLambda(ground, onlySimple = true)
+      simplifyTrivialApps(normalized)
+
+    case f: Forall => onForallInvocation {
+      replaceFromSymbols(variablesOf(f).map(v => v -> e(v)).toMap, f).asInstanceOf[Forall]
+    }
+
+    case Error(_, msg) =>
+      throw RuntimeError("Error reached in evaluation: " + msg)
+
+    case c: Choose =>
+      rctx.getChoose(c.res.id) match {
+        case Some(expr) => e(expr)
+        case None => onChooseInvocation {
+          replaceFromSymbols(variablesOf(c).map(v => v -> e(v)).toMap, c).asInstanceOf[Choose]
+        }
+      }
+
+    case gl: GenericValue => gl
+    case fl : FractionLiteral => normalizeFraction(fl)
+    case l : Literal[_] => l
+
+    case _ => unhandled
+  }
+
+  /** Integer, real and bit-vector arithmetic and comparisons. */
+  protected def eArithmetic(expr: Expr)(using rctx: RC, gctx: GC): Expr = expr match {
     case Plus(l,r) =>
       (e(l), e(r)) match {
         case (BVLiteral(sig1, i1, s1), BVLiteral(sig2, i2, s2)) if sig1 == sig2 && s1 == s2 =>
@@ -183,23 +263,6 @@ abstract class RecursiveEvaluator(override val program: Program,
           normalizeFraction(FractionLiteral(ln * rd - rn * ld, ld * rd))
         case (le,re) => throw EvalError("Unexpected operation: (" + le.asString + ") - (" + re.asString + ")")
       }
-
-    case StringConcat(l, r) =>
-      (e(l), e(r)) match {
-        case (StringLiteral(i1), StringLiteral(i2)) => StringLiteral(i1 + i2)
-        case (le,re) => throw EvalError(typeErrorMsg(le, StringType()))
-      }
-
-    case StringLength(a) => e(a) match {
-      case StringLiteral(a) => IntegerLiteral(a.length)
-      case res => throw EvalError(typeErrorMsg(res, Int32Type()))
-    }
-
-    case SubString(a, start, end) => (e(a), e(start), e(end)) match {
-      case (StringLiteral(a), IntegerLiteral(b), IntegerLiteral(c))  =>
-        StringLiteral(a.substring(b.toInt, c.toInt))
-      case res => throw EvalError(typeErrorMsg(res._1, StringType()))
-    }
 
     case UMinus(ex) =>
       e(ex) match {
@@ -268,90 +331,6 @@ abstract class RecursiveEvaluator(override val program: Program,
         case (le,re) => throw EvalError("Unexpected operation: (" + le.asString + ") % (" + re.asString + ")")
       }
 
-    case BVNot(b) =>
-      e(b) match {
-        case BVLiteral(signed, bs, s) =>
-          BVLiteral(signed, BitSet.empty ++ (1 to s).flatMap(i => if (bs(i)) None else Some(i)), s)
-        case other => throw EvalError("Unexpected operation: ~(" + other.asString + ")")
-      }
-
-    case BVAnd(l, r) =>
-      (e(l), e(r)) match {
-        case (BVLiteral(sig1, i1, s1), BVLiteral(sig2, i2, s2)) if sig1 == sig2 && s1 == s2 => BVLiteral(sig1, i1 & i2, s1)
-        case (le, re) => throw EvalError("Unexpected operation: (" + le.asString + ") & (" + re.asString + ")")
-      }
-
-    case BVOr(l, r) =>
-      (e(l), e(r)) match {
-        case (BVLiteral(sig1, i1, s1), BVLiteral(sig2, i2, s2)) if sig1 == sig2 && s1 == s2 => BVLiteral(sig1, i1 | i2, s1)
-        case (le, re) => throw EvalError("Unexpected operation: (" + le.asString + ") | (" + re.asString + ")")
-      }
-
-    case BVXor(l,r) =>
-      (e(l), e(r)) match {
-        case (BVLiteral(sig1, i1, s1), BVLiteral(sig2, i2, s2)) if sig1 == sig2 && s1 == s2 => BVLiteral(sig1, i1 ^ i2, s1)
-        case (le,re) => throw EvalError("Unexpected operation: (" + le.asString + ") ^ (" + re.asString + ")")
-      }
-
-    case BVShiftLeft(l,r) =>
-      (e(l), e(r)) match {
-        case (BVLiteral(sig1, i1, s1), b2 @ BVLiteral(sig2, _, s2)) if sig1 == sig2 && s1 == s2 =>
-          BVLiteral(sig1, shift(i1, s1, b2.toBigInt.toInt), s1)
-        case (le,re) => throw EvalError("Unexpected operation: (" + le.asString + ") << (" + re.asString + ")")
-      }
-
-    case BVAShiftRight(l,r) =>
-      (e(l), e(r)) match {
-        case (BVLiteral(sig1, i1, s1), b2 @ BVLiteral(sig2, _, s2)) if sig1 == sig2 && s1 == s2 =>
-          val shiftCount = b2.toBigInt.toInt
-          val shifted = shift(i1, s1, -shiftCount)
-          BVLiteral(sig1, if (i1(s1) && sig1) shifted ++ ((s1 - shiftCount) to s1) else shifted, s1)
-        case (le,re) => throw EvalError("Unexpected operation: (" + le.asString + ") >> (" + re.asString + ")")
-      }
-
-    case BVLShiftRight(l,r) =>
-      (e(l), e(r)) match {
-        case (BVLiteral(sig1, i1, s1), b2 @ BVLiteral(sig2, _, s2)) if s1 == s2 && sig1 == sig2 =>
-          BVLiteral(sig1, shift(i1, s1, -b2.toBigInt.toInt), s1)
-        case (le,re) => throw EvalError("Unexpected operation: (" + le.asString + ") >>> (" + re.asString + ")")
-      }
-
-    case BVNarrowingCast(expr, bvt) =>
-      e(expr) match {
-        case bv @ BVLiteral(signed, _, _) => BVLiteral(signed, bv.toBigInt, bvt.size)
-        case x => throw EvalError(typeErrorMsg(x, BVType(bvt.signed, bvt.size + 1))) // or any larger BVType
-      }
-
-    case BVWideningCast(expr, bvt) =>
-      e(expr) match {
-        case bv @ BVLiteral(signed, _, _) => BVLiteral(signed, bv.toBigInt, bvt.size)
-        case x => throw EvalError(typeErrorMsg(x, BVType(bvt.signed, bvt.size - 1))) // or any smaller BVType
-      }
-
-    case BVUnsignedToSigned(expr) =>
-      e(expr) match {
-        case BVLiteral(false, bits, size) => BVLiteral(true, bits, size)
-        case x => throw EvalError("Expected unsigned bitvector type")
-      }
-
-    case BVSignedToUnsigned(expr) =>
-      e(expr) match {
-        case BVLiteral(true, bits, size) => BVLiteral(false, bits, size)
-        case x => throw EvalError("Expected signed bitvector type")
-      }
-
-    case BVToInt(expr) =>
-      e(expr) match {
-        case bv: BVLiteral => IntegerLiteral(bv.toBigInt)
-        case x => throw EvalError("Expected bitvector type")
-      }
-
-    case IntToBV(size, signed, expr) =>
-      e(expr) match {
-        case IntegerLiteral(value) => BVLiteral(signed, value mod BigInt(2).pow(size), size)
-        case x => throw EvalError(typeErrorMsg(x, IntegerType()))
-      }
-
     case LessThan(l,r) =>
       (e(l), e(r)) match {
         case (b1 @ BVLiteral(sig1, _, s1), b2 @ BVLiteral(sig2, _, s2)) if sig1 == sig2 && s1 == s2 =>
@@ -400,6 +379,123 @@ abstract class RecursiveEvaluator(override val program: Program,
         case (le,re) => throw EvalError(typeErrorMsg(le, Int32Type()))
       }
 
+    case _ => unhandled
+  }
+
+  protected def eStrings(expr: Expr)(using rctx: RC, gctx: GC): Expr = expr match {
+    case StringConcat(l, r) =>
+      (e(l), e(r)) match {
+        case (StringLiteral(i1), StringLiteral(i2)) => StringLiteral(i1 + i2)
+        case (le,re) => throw EvalError(typeErrorMsg(le, StringType()))
+      }
+
+    case StringLength(a) => e(a) match {
+      case StringLiteral(a) => IntegerLiteral(a.length)
+      case res => throw EvalError(typeErrorMsg(res, Int32Type()))
+    }
+
+    case SubString(a, start, end) => (e(a), e(start), e(end)) match {
+      // Like SMT-LIB's str.substr, out of bounds indices give an empty or truncated string
+      case (StringLiteral(a), IntegerLiteral(b), IntegerLiteral(c))  =>
+        if (b < 0 || b >= a.length || c <= b) StringLiteral("")
+        else StringLiteral(a.substring(b.toInt, (c min a.length).toInt))
+      case res => throw EvalError(typeErrorMsg(res._1, StringType()))
+    }
+
+    case _ => unhandled
+  }
+
+  /** Bit-vector specific operations and conversions. */
+  protected def eBitVectors(expr: Expr)(using rctx: RC, gctx: GC): Expr = expr match {
+    case BVNot(b) =>
+      e(b) match {
+        case BVLiteral(signed, bs, s) =>
+          BVLiteral(signed, BitSet.empty ++ (1 to s).flatMap(i => if (bs(i)) None else Some(i)), s)
+        case other => throw EvalError("Unexpected operation: ~(" + other.asString + ")")
+      }
+
+    case BVAnd(l, r) =>
+      (e(l), e(r)) match {
+        case (BVLiteral(sig1, i1, s1), BVLiteral(sig2, i2, s2)) if sig1 == sig2 && s1 == s2 => BVLiteral(sig1, i1 & i2, s1)
+        case (le, re) => throw EvalError("Unexpected operation: (" + le.asString + ") & (" + re.asString + ")")
+      }
+
+    case BVOr(l, r) =>
+      (e(l), e(r)) match {
+        case (BVLiteral(sig1, i1, s1), BVLiteral(sig2, i2, s2)) if sig1 == sig2 && s1 == s2 => BVLiteral(sig1, i1 | i2, s1)
+        case (le, re) => throw EvalError("Unexpected operation: (" + le.asString + ") | (" + re.asString + ")")
+      }
+
+    case BVXor(l,r) =>
+      (e(l), e(r)) match {
+        case (BVLiteral(sig1, i1, s1), BVLiteral(sig2, i2, s2)) if sig1 == sig2 && s1 == s2 => BVLiteral(sig1, i1 ^ i2, s1)
+        case (le,re) => throw EvalError("Unexpected operation: (" + le.asString + ") ^ (" + re.asString + ")")
+      }
+
+    case BVShiftLeft(l,r) =>
+      (e(l), e(r)) match {
+        case (BVLiteral(sig1, i1, s1), b2 @ BVLiteral(sig2, _, s2)) if sig1 == sig2 && s1 == s2 =>
+          BVLiteral(sig1, shift(i1, s1, shiftAmount(b2, s1)), s1)
+        case (le,re) => throw EvalError("Unexpected operation: (" + le.asString + ") << (" + re.asString + ")")
+      }
+
+    case BVAShiftRight(l,r) =>
+      (e(l), e(r)) match {
+        case (BVLiteral(sig1, i1, s1), b2 @ BVLiteral(sig2, _, s2)) if sig1 == sig2 && s1 == s2 =>
+          val amount = shiftAmount(b2, s1)
+          val shifted = shift(i1, s1, -amount)
+          // the vacated bits are copies of the most significant bit, as for SMT-LIB `bvashr`
+          BVLiteral(sig1, if (i1(s1)) shifted ++ ((s1 - amount + 1) to s1) else shifted, s1)
+        case (le,re) => throw EvalError("Unexpected operation: (" + le.asString + ") >> (" + re.asString + ")")
+      }
+
+    case BVLShiftRight(l,r) =>
+      (e(l), e(r)) match {
+        case (BVLiteral(sig1, i1, s1), b2 @ BVLiteral(sig2, _, s2)) if s1 == s2 && sig1 == sig2 =>
+          BVLiteral(sig1, shift(i1, s1, -shiftAmount(b2, s1)), s1)
+        case (le,re) => throw EvalError("Unexpected operation: (" + le.asString + ") >>> (" + re.asString + ")")
+      }
+
+    case BVNarrowingCast(expr, bvt) =>
+      e(expr) match {
+        case bv @ BVLiteral(signed, _, _) => BVLiteral(signed, bv.toBigInt, bvt.size)
+        case x => throw EvalError(typeErrorMsg(x, BVType(bvt.signed, bvt.size + 1))) // or any larger BVType
+      }
+
+    case BVWideningCast(expr, bvt) =>
+      e(expr) match {
+        case bv @ BVLiteral(signed, _, _) => BVLiteral(signed, bv.toBigInt, bvt.size)
+        case x => throw EvalError(typeErrorMsg(x, BVType(bvt.signed, bvt.size - 1))) // or any smaller BVType
+      }
+
+    case BVUnsignedToSigned(expr) =>
+      e(expr) match {
+        case BVLiteral(false, bits, size) => BVLiteral(true, bits, size)
+        case x => throw EvalError("Expected unsigned bitvector type")
+      }
+
+    case BVSignedToUnsigned(expr) =>
+      e(expr) match {
+        case BVLiteral(true, bits, size) => BVLiteral(false, bits, size)
+        case x => throw EvalError("Expected signed bitvector type")
+      }
+
+    case BVToInt(expr) =>
+      e(expr) match {
+        case bv: BVLiteral => IntegerLiteral(bv.toBigInt)
+        case x => throw EvalError("Expected bitvector type")
+      }
+
+    case IntToBV(size, signed, expr) =>
+      e(expr) match {
+        case IntegerLiteral(value) => BVLiteral(signed, value mod BigInt(2).pow(size), size)
+        case x => throw EvalError(typeErrorMsg(x, IntegerType()))
+      }
+
+    case _ => unhandled
+  }
+
+  protected def eFloatingPoint(expr: Expr)(using rctx: RC, gctx: GC): Expr = expr match {
     case FPEquals(lhs, rhs) =>
       (e(lhs), e(rhs)) match {
         case (Float32Literal(l1), Float32Literal(l2)) => BooleanLiteral(l1 == l2)
@@ -458,16 +554,16 @@ abstract class RecursiveEvaluator(override val program: Program,
 
     case FPMin(lhs, rhs) =>
       (e(lhs), e(rhs)) match {
-        case (Float32Literal(l1), Float32Literal(l2)) => Float32Literal(l1.min(l2))
-        case (Float64Literal(l1), Float64Literal(l2)) => Float64Literal(l1.min(l2))
+        case (Float32Literal(l1), Float32Literal(l2)) => Float32Literal(fpMin(l1, l2))
+        case (Float64Literal(l1), Float64Literal(l2)) => Float64Literal(fpMin(l1, l2))
         case _ => throw EvalError(f"Unexpected operation: min($lhs, $rhs)")
       }
 
     case FPMax(lhs, rhs) =>
       (e(lhs), e(rhs)) match {
-        case (Float32Literal(l1), Float32Literal(l2)) => Float32Literal(l1.max(l2))
-        case (Float64Literal(l1), Float64Literal(l2)) => Float64Literal(l1.max(l2))
-        case _ => throw EvalError(f"Unexpected operation: min($lhs, $rhs)")
+        case (Float32Literal(l1), Float32Literal(l2)) => Float32Literal(fpMax(l1, l2))
+        case (Float64Literal(l1), Float64Literal(l2)) => Float64Literal(fpMax(l1, l2))
+        case _ => throw EvalError(f"Unexpected operation: max($lhs, $rhs)")
       }
 
     case FPRound(RoundNearestTiesToEven, expr) =>
@@ -579,6 +675,11 @@ abstract class RecursiveEvaluator(override val program: Program,
         case _ => throw EvalError("Unexpected operation: (" + expr.asString + ").isNegative")
       }
 
+    case _ => unhandled
+  }
+
+  /** Sets, bags and maps. */
+  protected def eCollections(expr: Expr)(using rctx: RC, gctx: GC): Expr = expr match {
     case SetAdd(s1, elem) =>
       (e(s1), e(elem)) match {
         case (FiniteSet(els1, tpe), evElem) => finiteSet(els1 :+ evElem, tpe)
@@ -689,42 +790,6 @@ abstract class RecursiveEvaluator(override val program: Program,
     case FiniteBag(els, base) =>
       finiteBag(els.map { case (k, v) => (e(k), e(v)) }, base.getType)
 
-    case l @ Lambda(_, _) =>
-      def normalizeLambda(l: Lambda, onlySimple: Boolean = false): Lambda = {
-        val (nl, deps) = normalizeStructure(l, onlySimple = onlySimple)
-        val newCtx = deps.foldLeft(rctx) {
-          case (rctx, (v, dep, conds)) =>
-            if (conds.forall(e(_)(using rctx, gctx) == BooleanLiteral(true)))
-              rctx.withNewVar(v.toVal, e(dep)(using rctx, gctx))
-            else rctx
-        }
-        val mapping = variablesOf(nl).map(v => v -> newCtx.mappings(v.toVal)).toMap
-        replaceFromSymbols(mapping, nl).asInstanceOf[Lambda]
-      }
-
-      // We start by normalizing the structure of the lambda as in the solver to
-      // evaluate all normalizable ground expressions within its body.
-      val ground = normalizeLambda(l)
-
-      // Then, in order for nested lambdas to have fresh variables in their argument
-      // lists and let bindings, we re-normalize the identifiers by passing
-      // `onlySimple = true` to the call to `normalizeStructure` (this avoids lifting
-      // ground lambdas out in the deps).
-      val normalized = normalizeLambda(ground, onlySimple = true)
-      simplifyTrivialApps(normalized)
-
-    case f: Forall => onForallInvocation {
-      replaceFromSymbols(variablesOf(f).map(v => v -> e(v)).toMap, f).asInstanceOf[Forall]
-    }
-
-    case c: Choose =>
-      rctx.getChoose(c.res.id) match {
-        case Some(expr) => e(expr)
-        case None => onChooseInvocation {
-          replaceFromSymbols(variablesOf(c).map(v => v -> e(v)).toMap, c).asInstanceOf[Choose]
-        }
-      }
-
     case f @ FiniteMap(ss, dflt, kT, vT) =>
       finiteMap(ss.map{ case (k, v) => (e(k), e(v)) }, e(dflt), kT.getType, vT.getType)
 
@@ -743,15 +808,7 @@ abstract class RecursiveEvaluator(override val program: Program,
           ".updated(" + l.asString + ", " + r.asString + ")")
     }
 
-    case StringLiteral(str) =>
-      StringLiteral(utils.StringUtils.decode(str))
-
-    case gl: GenericValue => gl
-    case fl : FractionLiteral => normalizeFraction(fl)
-    case l : Literal[_] => l
-
-    case other =>
-      throw EvalError("Unhandled case in Evaluator : [" + other.getClass + "] " + other.asString)
+    case _ => unhandled
   }
 
   /**
