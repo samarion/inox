@@ -43,3 +43,9 @@ fork's `main` and must never end up in a branch meant for upstream.
 - The downstream CI skips Stainless's `verification/false-valid` and
   `termination/false-invalid` benchmarks, which encode known Stainless bugs
   and would block Inox fixes. Pass `-f false_benchmarks=true` to run them.
+- An Inox change that breaks Stainless until Stainless is updated for it puts
+  `Stainless: skip` (all tests) or `Stainless: skip <globs>` (benchmark paths
+  under `frontends/benchmarks`) in a commit message. The downstream CI honours
+  the lines of the Inox commits that Stainless main hasn't pinned yet, so the
+  Stainless PR that bumps Inox turns them off. `-f ignore_skip=true` ignores
+  them.
