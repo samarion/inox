@@ -42,7 +42,7 @@ jobs:
       benchmarks: ${{ steps.check.outputs.benchmarks }}
     steps:
     - name: Checkout Inox
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         fetch-depth: 0
     - name: Find the Stainless skip lines that Stainless hasn't picked up
@@ -90,7 +90,7 @@ jobs:
       STAINLESS_DIR: ${{ github.workspace }}/stainless
     steps:
     - name: Checkout Inox
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         path: inox
         fetch-depth: 0
@@ -112,7 +112,7 @@ jobs:
     - name: Remove previous Stainless checkout
       run: rm -rf "$STAINLESS_DIR"
     - name: Checkout Stainless
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         repository: epfl-lara/stainless
         ref: ${{ needs.check-skip.outputs.stainless }}
@@ -151,7 +151,7 @@ jobs:
           fi
         done <<< "$BENCHMARKS"
     - name: Setup JDK
-      uses: actions/setup-java@v4
+      uses: actions/setup-java@v6
       with:
         distribution: temurin
         java-version: 17

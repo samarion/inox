@@ -97,8 +97,11 @@ abstract class AbstractPrincessSolver(override val program: Program,
       def typeToSortRef(tpe: Type): PADT.CtorArgSort = {
         if (indexMap contains tpe) {
           PADT.ADTSort(indexMap(tpe))
-        } else {
-          PADT.OtherSort(typeToSort(tpe))
+        } else tpe match {
+          // Terms of signed bit-vectors are built in the unsigned range (see `parseTerm`), so
+          // fields of signed bit-vectors must have the unsigned sort to hold negative values
+          case BVType(true, size) => PADT.OtherSort(Mod.UnsignedBVSort(size))
+          case _ => PADT.OtherSort(typeToSort(tpe))
         }
       }
 
@@ -313,25 +316,19 @@ abstract class AbstractPrincessSolver(override val program: Program,
         case Division(lhs, rhs) => lhs.getType match {
           case BVType(true, _) => Mod.bvsdiv(parseTerm(lhs), parseTerm(rhs))
           case BVType(false, _) => Mod.bvudiv(parseTerm(lhs), parseTerm(rhs))
-          case IntegerType() => p.mulTheory.tDiv(parseTerm(lhs), parseTerm(rhs))
+          case IntegerType() => p.mulTheory.eDiv(parseTerm(lhs), parseTerm(rhs))
           case _ => unsupported(expr)
         }
 
         case Remainder(lhs, rhs) => lhs.getType match {
           case BVType(true, _) => Mod.bvsrem(parseTerm(lhs), parseTerm(rhs))
           case BVType(false, _) => Mod.bvurem(parseTerm(lhs), parseTerm(rhs))
-          case IntegerType() => p.mulTheory.tMod(parseTerm(lhs), parseTerm(rhs))
+          // the remainder of the euclidean division
+          case IntegerType() => p.mulTheory.eMod(parseTerm(lhs), parseTerm(rhs))
         }
 
         case Modulo(lhs, rhs) => lhs.getType match {
-          case BVType(true, size) => // we want x mod |y|
-            // Note that we cannot compute `bvsmod(x, -y)` when `y < 0` as `-y` overflows
-            // when `y` is the minimal value. Instead, we rely on the sign of `bvsmod(x, y)`
-            // following that of `y` and shift negative results by `|y|`.
-            val b = parseTerm(rhs)
-            val zero = parseTerm(BVLiteral(true, 0, size))
-            val smod = Mod.bvsmod(parseTerm(lhs), b)
-            ITermITE(Mod.bvslt(b, zero) & !(smod === zero), Mod.bvsub(smod, b), smod)
+          case BVType(true, _) => Mod.bvsmod(parseTerm(lhs), parseTerm(rhs))
           case BVType(false, _) => Mod.bvurem(parseTerm(lhs), parseTerm(rhs))
           case IntegerType() => p.mulTheory.eMod(parseTerm(lhs), parseTerm(rhs))
         }

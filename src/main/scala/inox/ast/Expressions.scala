@@ -480,30 +480,40 @@ trait Expressions { self: Trees =>
 
   /** $encodingof `... /  ...`
     *
-    * Division and Remainder follows Java/Scala semantics. Division corresponds
-    * to / operator on BigInt and Remainder corresponds to %. Note that in
-    * Java/Scala % is called remainder and the "mod" operator (Modulo in Inox) is also
-    * defined on BigInteger and differs from Remainder. The "mod" operator
-    * returns an always positive remainder, while Remainder could return
-    * a negative remainder. The following must hold:
+    * On integers, this is SMT-LIB's euclidean `div`: the quotient `q` of `x` by `y` satisfies
+    * `x == y * q + r` for `0 <= r < |y|`, where `r` is `Modulo(x, y)`. For example, `-7 / 2 == -4`
+    * and `7 / -2 == -3`. This differs from Scala's `BigInt./`, which rounds toward zero.
     *
-    *    Division(x, y) * y + Remainder(x, y) == x
+    * On reals, this is SMT-LIB's `/`. Division by zero is unspecified on integers and reals.
+    *
+    * On bit-vectors, this is SMT-LIB's `bvsdiv` for signed ones and `bvudiv` for unsigned ones, which
+    * round toward zero. Division by zero gives a value with all its bits set (1 for a negative signed
+    * dividend).
     */
   sealed case class Division(lhs: Expr, rhs: Expr) extends Expr with CachingTyped {
     override protected def computeTpe(stripRefinements: Boolean)(using Symbols): Type =
       getIntegerType(lhs, rhs) `orElse` getRealType(lhs, rhs) `orElse` getBVType(lhs, rhs)
   }
 
-  /** $encodingof `... %  ...` (can return negative numbers)
+  /** $encodingof `... %  ...`
     *
-    * @see [[Expressions.Division]]
+    * On bit-vectors, this is SMT-LIB's `bvsrem` for signed bit-vectors, whose result has the sign of
+    * the dividend, and `bvurem` for unsigned ones, so that `Division(x, y) * y + Remainder(x, y) == x`.
+    * The remainder of a division by zero is the dividend.
+    *
+    * On integers, this is the remainder of the euclidean [[Expressions.Division]], so that the same
+    * identity holds: it is SMT-LIB's `mod`, like [[Expressions.Modulo]], and is never negative.
     */
   sealed case class Remainder(lhs: Expr, rhs: Expr) extends Expr with CachingTyped {
     override protected def computeTpe(stripRefinements: Boolean)(using Symbols): Type =
       getIntegerType(lhs, rhs) `orElse` getBVType(lhs, rhs)
   }
 
-  /** $encodingof `... mod  ...` (cannot return negative numbers)
+  /** $encodingof `... mod  ...`
+    *
+    * On integers, this is SMT-LIB's `mod`, which never returns a negative number. On bit-vectors, it is
+    * SMT-LIB's `bvsmod` for signed ones, whose result has the sign of the divisor, and `bvurem` for
+    * unsigned ones. As in SMT-LIB, the modulo of a bit-vector by zero is the dividend.
     *
     * @see [[Expressions.Division]]
     */
@@ -745,12 +755,6 @@ trait Expressions { self: Trees =>
   sealed case class FPToBV(size: Int, signed: Boolean, rm: Expr, expr: Expr) extends Expr with CachingTyped {
     override protected def computeTpe(stripRefinements: Boolean)(using Symbols): Type =
       if getRoundingMode(rm).isTyped && getFPType(expr).isTyped then BVType(signed, size) else Untyped
-  }
-
-  /** Casts from floating-points to bitvectors with JVM semantics */
-  sealed case class FPToBVJVM(exponent: Int, significand: Int, toSize: Int, expr: Expr) extends Expr with CachingTyped {
-    override protected def computeTpe(stripRefinements: Boolean)(using Symbols): Type =
-      if getFPType(expr).isTyped then BVType(true, toSize) else Untyped
   }
 
   object FPToBinary {
