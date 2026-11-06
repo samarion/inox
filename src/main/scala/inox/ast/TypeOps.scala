@@ -183,4 +183,59 @@ trait TypeOps {
     rec(tpe)
     dependencies
   }
+
+  /** Erases the refinements that values of `tpe` must satisfy, i.e. those in positive positions.
+    *
+    * The domains of function types are conditions on the callee, so they are kept.
+    */
+  def erasePositiveRefinements(tpe: Type): Type = tpe match {
+    case RefinementType(vd, _) => erasePositiveRefinements(vd.tpe)
+    case FunctionType(from, to) => FunctionType(from, erasePositiveRefinements(to)).copiedFrom(tpe)
+    case PiType(params, to) => PiType(params, erasePositiveRefinements(to)).copiedFrom(tpe)
+    case SigmaType(params, to) =>
+      val (newParams, subst) = eraseBinders(params)
+      SigmaType(newParams, erasePositiveRefinements(typeOps.replaceFromSymbols(subst, to))).copiedFrom(tpe)
+    case NAryType(tps, recons) => recons(tps.map(erasePositiveRefinements))
+  }
+
+  /** Erases the positive refinements in the types of `vds`, where each type may refer to the
+    * earlier binders, and returns the new binders with the substitution from the old ones.
+    */
+  private def eraseBinders(vds: Seq[ValDef]): (Seq[ValDef], Map[ValDef, Expr]) =
+    vds.foldLeft((Seq.empty[ValDef], Map.empty[ValDef, Expr])) { case ((vds, subst), vd) =>
+      val tpe = erasePositiveRefinements(typeOps.replaceFromSymbols(subst, vd.tpe))
+      val nvd = if (tpe == vd.tpe) vd else vd.copy(tpe = tpe).copiedFrom(vd)
+      (vds :+ nvd, subst + (vd -> nvd.toVariable))
+    }
+
+  /** Removes the conditions that `fd`'s parameter types place on its arguments.
+    *
+    * Inox only assumes a function's return type at calls whose arguments have the parameter
+    * types. A front-end that checks call arguments against the parameter types itself (as
+    * Stainless does, with dedicated VCs) can drop these conditions, so that the return type is
+    * assumed at every call. Refinements at the top of a parameter type become an assumption on
+    * the body, so they still hold while unfolding it; nested ones are dropped. The parameters
+    * keep their identifiers.
+    */
+  def dropParamRefinements(fd: FunDef): FunDef = {
+    val (newParams, subst) = eraseBinders(fd.params)
+    if (newParams == fd.params) fd
+    else {
+      def topLevel(tpe: Type): Seq[(ValDef, Expr)] = tpe match {
+        case RefinementType(vd, pred) => topLevel(vd.tpe) :+ (vd -> pred)
+        case _ => Seq.empty
+      }
+
+      val conds = (fd.params zip newParams).flatMap { (vd, nvd) =>
+        topLevel(vd.tpe).map((v, pred) =>
+          exprOps.replaceFromSymbols(Map(v -> nvd.toVariable), exprOps.replaceFromSymbols(subst, pred)))
+      }
+      val body = exprOps.replaceFromSymbols(subst, fd.fullBody)
+      fd.copy(
+        params = newParams,
+        returnType = typeOps.replaceFromSymbols(subst, fd.returnType),
+        fullBody = if (conds.isEmpty) body else Assume(andJoin(conds), body).copiedFrom(fd.fullBody)
+      ).copiedFrom(fd)
+    }
+  }
 }
