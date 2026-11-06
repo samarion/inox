@@ -16,6 +16,13 @@ object SymbolOps {
     for (i <- identifiers.size to index) identifiers += FreshIdentifier("x", true)
     identifiers(index)
   }
+
+  /** The sorts with invariants whose simplest value a solver is currently looking for.
+    *
+    * Extracting that solver's model may need the simplest value of the same sort, which would
+    * start another solver, and so on without end. Inner searches for these sorts fail instead.
+    */
+  private[ast] val simplestValueSearches = new scala.util.DynamicVariable[Set[Any]](Set.empty)
 }
 
 /** Provides functions to manipulate [[Expressions.Expr]] in cases where
@@ -1001,6 +1008,8 @@ trait SymbolOps extends TypeOps { self =>
         else throw NoSimpleValue(adt)
       } else if (sort.hasInvariant) {
         if (!allowSolver) throw NoSimpleValue(adt)
+        val searches = SymbolOps.simplestValueSearches
+        if (searches.value(adt)) throw NoSimpleValue(adt)
 
         val p = Variable.fresh("p", FunctionType(Seq(adt), BooleanType()))
         val res = Variable.fresh("v", adt)
@@ -1008,7 +1017,9 @@ trait SymbolOps extends TypeOps { self =>
         import solvers._
         import SolverResponses._
 
-        SimpleSolverAPI(sem.getSolver).solveSAT(Application(p, Seq(res))) match {
+        searches.withValue(searches.value + adt) {
+          SimpleSolverAPI(sem.getSolver).solveSAT(Application(p, Seq(res)))
+        } match {
           case SatWithModel(model) => model.vars.getOrElse(res.toVal, throw NoSimpleValue(adt))
           case _ => throw NoSimpleValue(adt)
         }
