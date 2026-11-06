@@ -83,6 +83,10 @@ package object inox {
       protected def createEvaluator(ctx: Context): evaluators.DeterministicEvaluator {
         val program: self.program.type
       } = evaluators.RecursiveEvaluator(self.program, ctx)
+
+      override def forModel(model: program.Model): inox.Semantics { val trees: self.trees.type } =
+        if (model.defs.isEmpty) this
+        else program.withFunctions(model.defs).getSemantics(using inoxSemantics)
     }.asInstanceOf[p.Semantics]
   }
   given givenInoxSemantics: inoxSemantics.type = inoxSemantics
