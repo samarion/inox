@@ -27,6 +27,13 @@ jobs:
             os: macOS
             labels: ['macos-latest']
         java-version: [17, 21]
+        # Pull requests skip macOS on JDK 17: JDK 17 is still tested on Linux, and macOS on
+        # JDK 21. This is the slowest job, and hosted macOS runners can take long to start.
+        # Pushes to main run all four jobs.
+        exclude: >-
+          ${{ fromJSON(github.event_name == 'pull_request' && '[
+            {"runners": {"name": "macOS ARM64", "os": "macOS", "labels": ["macos-latest"]}, "java-version": 17}
+          ]' || '[]') }}
     env:
       # solver versions to test against
       INSTALL_SOLVERS: 1
