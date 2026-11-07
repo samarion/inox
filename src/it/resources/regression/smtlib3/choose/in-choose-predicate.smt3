@@ -1,0 +1,5 @@
+; the choose nested in f's choose refers to f's result, so each call of f has its own
+(set-info :status sat)
+(define-fun f ((x Int)) Int (choose (r Int) (and (> r x) (= (choose (s Int) (= s r)) r))))
+(assert (and (= (f 0) 1) (= (f 10) 20)))
+(check-sat)

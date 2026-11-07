@@ -80,7 +80,7 @@ object ChooseEncoder {
 
     val newFds = sourceProgram.symbols.functions.values.toList.map { fd =>
       def rec(e: Expr, params: Seq[ValDef]): Expr = e match {
-        case l: Let => l.copy(body = rec(l.body, params :+ l.vd)).copiedFrom(l)
+        case l: Let => l.copy(value = rec(l.value, params), body = rec(l.body, params :+ l.vd)).copiedFrom(l)
 
         case l: Lambda => l.copy(body = rec(l.body, params ++ l.params)).copiedFrom(l)
 
@@ -108,7 +108,7 @@ object ChooseEncoder {
       }
 
       fd.copy(fullBody = fd.fullBody match {
-        case c: Choose => c.copy(pred = rec(c.pred, fd.params)).copiedFrom(c)
+        case c: Choose => c.copy(pred = rec(c.pred, fd.params :+ c.res)).copiedFrom(c)
         case body => rec(body, fd.params)
       })
     }

@@ -1,0 +1,5 @@
+; the model must give the choose bound by the let a value
+(set-info :status sat)
+(define-fun f ((x Int)) Int (let ((y (choose (v Int) (> v x)))) (+ y 1)))
+(assert (= (f 0) 3))
+(check-sat)
