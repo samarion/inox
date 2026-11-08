@@ -601,7 +601,13 @@ trait SymbolOps extends TypeOps { self =>
     })
 
     val resArgs = allArgs(res)
-    val unique = if (resArgs.isEmpty) res else {
+    val unique = if (resArgs.isEmpty) {
+      // Without arguments to wrap, the identifier tells the closures apart. It is held by a choose,
+      // which normalization keeps in the body, so that evaluation doesn't fold it away.
+      val idVd = ValDef.fresh("id", IntegerType())
+      Lambda(res.params, Let(ValDef.fresh("id", IntegerType()),
+        Choose(idVd, Equals(idVd.toVariable, IntegerLiteral(id))), res.body))
+    } else {
       /* @nv: This is a hack to ensure that the notion of equality we define on closures
        *      is respected by those returned by the model. */
       Lambda(res.params, Let(
