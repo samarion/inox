@@ -5,6 +5,10 @@ package evaluators
 
 import org.scalatest.funsuite.AnyFunSuite
 
+import scala.concurrent.{Await, Future, TimeoutException}
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.duration._
+
 /** Evaluation of `forall` and `choose`, which the evaluator hands to a solver. */
 class SolvingEvaluatorSuite extends AnyFunSuite {
   import inox.trees.{given, _}
@@ -127,5 +131,42 @@ class SolvingEvaluatorSuite extends AnyFunSuite {
       Forall(Seq(empty), BooleanLiteral(false)),
       Choose(x, GreaterThan(x.toVariable, IntegerLiteral(0)))
     )) assert(!evaluator.eval(expr, Model.empty(program)).isInstanceOf[EvaluationResults.Successful[?]], s"$expr should fail")
+  }
+
+  // sealed abstract class Forest { require(this.isInstanceOf[Cons]) }
+  // case class Cons(head: BigInt, tail: Forest) extends Forest
+  // case class Leaf(t: BigInt) extends Forest
+  //
+  // The invariant only holds for infinite forests, as in Stainless's ForestNothing2.
+  val forestID = FreshIdentifier("Forest")
+  val consID = FreshIdentifier("Cons")
+  val leafID = FreshIdentifier("Leaf")
+  val forestInvID = FreshIdentifier("forestInv")
+  val forestInv = mkFunDef(forestInvID)() { _ => (
+    Seq("f" :: T(forestID)()), BooleanType(), { case Seq(f) => f.is(consID) })
+  }
+  val forestSort = mkSort(forestID, HasADTInvariant(forestInvID))() { _ => Seq(
+    (consID, Seq("head" :: IntegerType(), "tail" :: T(forestID)())),
+    (leafID, Seq("t" :: IntegerType()))
+  )}
+  val forestProgram = InoxProgram(NoSymbols.withFunctions(Seq(forestInv)).withSorts(Seq(forestSort)))
+
+  test("choose with an unconstrained result whose type only has infinite values") {
+    // A solver that looks for a value of the result's type never finds one, and evaluating
+    // these chooses used to run forever.
+    val ctx = TestContext.empty
+    val evaluator = RecursiveEvaluator(forestProgram, ctx)
+    val fn = "fn" :: (IntegerType() =>: T(forestID)())
+    val forest = "forest" :: T(forestID)()
+    for (choose <- Seq(Choose(fn, BooleanLiteral(true)), Choose(forest, BooleanLiteral(true)))) {
+      val result = Future(evaluator.eval(choose, Model.empty(forestProgram)))
+      try {
+        Await.result(result, 60.seconds)
+      } catch {
+        case _: TimeoutException =>
+          ctx.interruptManager.interrupt()
+          fail(s"Evaluating $choose did not end")
+      }
+    }
   }
 }
