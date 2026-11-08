@@ -49,7 +49,12 @@ trait SolvingEvaluator extends Evaluator { self =>
         try {
           // Declaring the result makes the solver respect its type even when the
           // predicate doesn't mention it, as with `choose((x: { v: BigInt | v > 5 }) => true)`.
-          solver.declare(choose.res)
+          // Only refinements need it: otherwise, the simplest value below respects the type when it
+          // exists, while the solver could search forever for a value of an empty type, such as a
+          // datatype whose invariant no value satisfies (or a function returning one).
+          if (typeOps.exists { case _: RefinementType => true; case _ => false }(choose.res.tpe)) {
+            solver.declare(choose.res)
+          }
           solver.assertCnstr(choose.pred)
           solver.check(Model)
         } finally {

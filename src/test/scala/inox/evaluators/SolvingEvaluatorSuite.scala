@@ -3,12 +3,14 @@
 package inox
 package evaluators
 
+import org.scalatest.concurrent.TimeLimits
 import org.scalatest.funsuite.AnyFunSuite
+import org.scalatest.time.{Seconds, Span}
 
 /** Evaluation of `forall` and `choose`, which the evaluator hands to a solver. */
-class SolvingEvaluatorSuite extends AnyFunSuite {
+class SolvingEvaluatorSuite extends AnyFunSuite with TimeLimits {
   import inox.trees.{given, _}
-  import inox.trees.dsl._
+  import inox.trees.dsl.{given, _}
 
   val program = InoxProgram(NoSymbols)
 
@@ -103,6 +105,29 @@ class SolvingEvaluatorSuite extends AnyFunSuite {
     }
     val empty = "empty" :: noValues
     assert(!evaluate(Choose(empty, BooleanLiteral(true))).isInstanceOf[EvaluationResults.Successful[?]])
+  }
+
+  test("choose of a function into a datatype without values is an error") {
+    // sealed abstract class Forest { require(this.isInstanceOf[More]) }
+    // case class More(rest: Forest) extends Forest; case class Done() extends Forest
+    val forestID = FreshIdentifier("Forest")
+    val moreID = FreshIdentifier("More")
+    val doneID = FreshIdentifier("Done")
+    val invID = FreshIdentifier("inv")
+    val inv = mkFunDef(invID)() { _ => (
+      Seq("f" :: T(forestID)()), BooleanType(), { case Seq(f) => f is moreID })
+    }
+    val forest = mkSort(forestID, HasADTInvariant(invID))() { _ =>
+      Seq((moreID, Seq("rest" :: T(forestID)())), (doneID, Seq()))
+    }
+    val program = InoxProgram(NoSymbols.withFunctions(Seq(inv)).withSorts(Seq(forest)))
+    val evaluator = RecursiveEvaluator(program, TestContext.empty)
+    // The solver can't show that no forest exists, and would look for one forever
+    val res = "res" :: (IntegerType() =>: T(forestID)())
+    val result = failAfter(Span(60, Seconds)) {
+      evaluator.eval(Choose(res, BooleanLiteral(true)), Model.empty(program))
+    }
+    assert(!result.isInstanceOf[EvaluationResults.Successful[?]])
   }
 
   test("forall over refined types") {
