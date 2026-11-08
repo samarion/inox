@@ -364,9 +364,11 @@ abstract class AbstractUnrollingSolver private
       // The default values of function models may refer to the free variables of their types
       val vs = extracted.map { case (v, e) => v.toVal -> exprOps.replaceFromSymbols(extracted, e) }
 
-      val cs = templates.getCalls
+      val calls = templates.getCalls
         .filter(p => modelEval(p._1, t.BooleanType()) == Some(t.BooleanLiteral(true)))
         .map(_._2)
+
+      val cs = calls
         .groupBy(_.tfd)
         .flatMap { case (tfd, calls) =>
           chooses.getChoose(tfd.fd).map { case (id, c, vds) =>
@@ -411,7 +413,35 @@ abstract class AbstractUnrollingSolver private
       val modelCs = vs.values.toSeq.flatMap(e => choosesOf(e, Seq.empty)) ++
         (cs ++ freeCs).flatMap { case ((id, tps), e) => choosesOf(e, tps) }
 
-      inox.Model(program)(vs, cs ++ freeCs ++ modelCs, getFunctions.map(programEncoder.decode(_)))
+      // Uninterpreted functions are defined at the type arguments of their calls by their results on
+      // the calls that were unrolled
+      val uninterpreted = calls
+        .filter(_.tfd.fd.flags contains t.Uninterpreted)
+        .groupBy(_.tfd)
+        .map { case (ttfd, calls) =>
+          val tfd = getFunction(ttfd.id, ttfd.tps.map(decode(_)))
+          val mappings = calls.flatMap { call =>
+            val from = call.tfd.params.map(_.getType(using call.tfd.symbols))
+            val optArgs = (call.args zip from).map(p => modelEval(p._1.encoded, p._2))
+            val optRes = modelEval(templates.mkCall(call.tfd, call.args.map(_.encoded)), call.tfd.getType)
+            if (optArgs.forall(_.isDefined) && optRes.isDefined) {
+              Some(optArgs.map(_.get) -> optRes.get)
+            } else {
+              None
+            }
+          }.distinct
+
+          val default: Expr = Error(tfd.returnType, s"No model for ${tfd.id.asString} on these arguments")
+          val body = mappings.foldRight(default) { case ((args, img), elze) =>
+            IfExpr(andJoin((tfd.params zip args).map { case (vd, arg) =>
+              Equals(vd.toVariable, decode(arg))
+            }), decode(img), elze)
+          }
+
+          (tfd.id, tfd.tps) -> body
+        }
+
+      inox.Model(program)(vs, cs ++ freeCs ++ modelCs, getFunctions.map(programEncoder.decode(_)), uninterpreted)
     }
   }
 
@@ -429,7 +459,8 @@ abstract class AbstractUnrollingSolver private
   private def validateModel(model: program.Model, assumptions: Seq[Expr], silenceErrors: Boolean): Boolean = {
     val expr = andJoin(assumptions ++ constraints)
 
-    val typingCond = andJoin(model.vars.toSeq.map { case (v, value) =>
+    // The condition that the model value `value` lies in `tpe`
+    def typing(value: Expr, tpe: Type): Expr = {
       def rec(e: Expr, tpe: Type): Expr = (e, tpe) match {
         // The models of functions are conditionals over their arguments, and their default values
         // are chosen in their codomains (see `defaultValue`)
@@ -477,12 +508,24 @@ abstract class AbstractUnrollingSolver private
         case _ => BooleanLiteral(true)
       }
 
-      rec(value, v.tpe)
-    })
+      rec(value, tpe)
+    }
+
+    val typingCond = andJoin(model.vars.toSeq.map { case (v, value) => typing(value, v.tpe) })
 
     // we have to check case class constructors in model for ADT invariants
     val newExpr = model.vars.toSeq.foldRight(and(typingCond, expr)) {
       case ((v, value), e) => Let(v, value, e)
+    }
+
+    // The results of uninterpreted functions are assumed to lie in their return types when their
+    // arguments lie in their parameter types, so the model's definitions must satisfy them
+    val interpretations = model.interpretations.map { case ((id, tps), body) =>
+      val tfd = getFunction(id, tps)
+      val res = ValDef.fresh("res", tfd.getType)
+      val domain = andJoin(tfd.params.map(vd => typing(vd.toVariable, vd.tpe)))
+      val range = typing(res.toVariable, tfd.returnType)
+      (id, tps) -> Let(res, body, Assume(implies(domain, range), res.toVariable))
     }
 
     val evaluator = semantics.withFunctions(model.functions).getEvaluator(using context.withOpts(
@@ -490,7 +533,7 @@ abstract class AbstractUnrollingSolver private
       optCheckModels(checkModels || feelingLucky)
     ))
 
-    evaluator.eval(newExpr, inox.Model(program)(Map.empty, model.chooses, model.functions)) match {
+    evaluator.eval(newExpr, inox.Model(program)(Map.empty, model.chooses, model.functions, interpretations)) match {
       case EvaluationResults.Successful(BooleanLiteral(true)) =>
         reporter.debug("- Model validated.")
         true
@@ -932,7 +975,7 @@ abstract class AbstractUnrollingSolver private
       })
     } exposedWitnesses += equality
 
-    inox.Model(program)(exModel.vars, exModel.chooses ++ chooses, exModel.functions)
+    inox.Model(program)(exModel.vars, exModel.chooses ++ chooses, exModel.functions, exModel.interpretations)
   }
 
   protected val emptyModel: Model =

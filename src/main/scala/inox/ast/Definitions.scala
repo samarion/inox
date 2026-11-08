@@ -313,6 +313,15 @@ trait Definitions { self: Trees =>
     */
   case object ModelFunction extends Flag("model", Seq.empty)
 
+  /** Denotes a function whose body is ignored: its calls return arbitrary values of its return type,
+    * with equal results on equal arguments.
+    *
+    * The unrolling only assumes that its results lie in its return type, and the evaluators can only
+    * call it at the type arguments where a model defines it (see [[inox.Model.interpretations]]). Its
+    * body must still be well-typed.
+    */
+  case object Uninterpreted extends Flag("uninterpreted", Seq.empty)
+
   /** Compiler annotations given in the source code as @annot.
     *
     * @see [[Flag]] for some notes on the actual type of [[args]]. */

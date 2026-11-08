@@ -36,7 +36,8 @@ trait FunctionTemplates { self: Templates =>
     private val cache: MutableMap[TypedFunDef, FunctionTemplate] = MutableMap.empty
 
     def apply(tfd: TypedFunDef): FunctionTemplate = cache.getOrElse(tfd, {
-      val body: Expr = timers.solvers.simplify.run { simplifyFormula(tfd.fullBody) }
+      // The calls of uninterpreted functions are only constrained by their return types
+      val uninterpreted = tfd.fd.flags contains Uninterpreted
 
       val tpVars = tfd.tps.flatMap(variableSeq).distinct
       val fdArgs: Seq[Variable] = tfd.params.map(_.toVariable)
@@ -48,12 +49,17 @@ trait FunctionTemplates { self: Templates =>
       val substMap = arguments.toMap + pathVar
 
       val tmplClauses: TemplateClauses = {
-        val (p, tmplClauses) = mkExprClauses(start, body, substMap)
-        val clauses = tmplClauses + (start -> Equals(call, p))
+        val clauses = if (uninterpreted) emptyClauses else {
+          val body: Expr = timers.solvers.simplify.run { simplifyFormula(tfd.fullBody) }
+          val (p, tmplClauses) = mkExprClauses(start, body, substMap)
+          tmplClauses + (start -> Equals(call, p))
+        }
 
         // Register the function's return as a contract typing to enable
-        // induction with refinement types
-        if (ContractUnrolling `unroll` tfd.returnType) {
+        // induction with refinement types. The results of uninterpreted functions are typed as
+        // free values, e.g. they also satisfy the invariants of their ADTs.
+        val unrolling: TypeUnrolling = if (uninterpreted) FreeUnrolling else ContractUnrolling
+        if (unrolling `unroll` tfd.returnType) {
           // The return type only holds for arguments that lie in the parameter types, so
           // it is assumed only once the arguments' membership in these types is shown.
           // Under `optAssumeChecked`, the front-end has checked the arguments of every call, so
@@ -70,12 +76,12 @@ trait FunctionTemplates { self: Templates =>
           val closures = typeOps.variablesOf(tfd.returnType).toSeq.sortBy(_.id).map(v => Left(substMap(v)))
           val call = mkCall(tfd, arguments.map(_._2))
           if (domains.isEmpty) {
-            val typing = Typing(tfd.returnType, call, Constraint(trueT, closures, false))
+            val typing = Typing(tfd.returnType, call, Constraint(trueT, closures, uninterpreted))
             (conds, exprs, tree, guarded, eqs, tps `merge` Map(pathVar._2 -> Set(typing)), equals, lambdas, quants)
           } else {
             val result = Variable.fresh("result", BooleanType(), true)
             val resultT = encodeSymbol(result)
-            val typing = Typing(tfd.returnType, call, Constraint(resultT, closures, false))
+            val typing = Typing(tfd.returnType, call, Constraint(resultT, closures, uninterpreted))
             (conds, exprs + (result -> resultT), tree, guarded `merge` (start -> Implies(andJoin(domains), result)),
               eqs, tps `merge` Map(pathVar._2 -> Set(typing)), equals, lambdas, quants)
           }
@@ -130,7 +136,10 @@ trait FunctionTemplates { self: Templates =>
   def getCalls: Seq[(Encoded, Call)] = defBlockers.toList.map(p => p._2 -> p._1)
 
   private val chooseCache: MutableMap[Identifier, Boolean] = MutableMap.empty
+  /** Whether the results of calls to `tfd` aren't determined by its body, i.e. whether its body
+    * contains a `choose` or it is uninterpreted. */
   private def hasChoose(tfd: TypedFunDef): Boolean = chooseCache.getOrElseUpdate(tfd.id,
+    (tfd.fd.flags contains Uninterpreted) ||
     exprOps.exists { case _: Choose => true case _ => false } (tfd.fd.fullBody))
 
   /** Clauses stating that the calls `call1` and `call2` of the same function on equal arguments
@@ -138,9 +147,9 @@ trait FunctionTemplates { self: Templates =>
     *
     * The results of calls are determined by the function body, so these clauses are only
     * shortcuts and their equalities need not be unrolled. A `choose` in the body however picks a
-    * fresh value for each call, so the results of calls on equal arguments are only related by
-    * these clauses. We then register the equalities so that they are unrolled before a model is
-    * accepted.
+    * fresh value for each call, and the results of uninterpreted functions aren't constrained, so
+    * the results of calls on equal arguments are only related by these clauses. We then register
+    * the equalities so that they are unrolled before a model is accepted.
     */
   private def purityClauses(call1: Call, blocker1: Encoded, call2: Call, blocker2: Encoded): Clauses = {
     val tfd = call1.tfd

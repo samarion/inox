@@ -66,7 +66,9 @@ trait SimplifierWithPC extends Transformer { self =>
     case None =>
       pureCache += id -> Checking
       val fndef = getFunction(id)
-      val p = fndef.params.forall(vd => hasInstance(vd.tpe) == Some(true)) &&
+      // The evaluators can't call uninterpreted functions, so their calls are never evaluated
+      val p = !(fndef.flags contains Uninterpreted) &&
+        fndef.params.forall(vd => hasInstance(vd.tpe) == Some(true)) &&
         isPure(fndef.fullBody, initEnv.withBounds(fndef.params))
       pureCache += id -> (if (p) Pure else Impure)
       p

@@ -24,11 +24,13 @@ trait Z3Solver extends SMTLIBSolver with Z3Target { self =>
   ): config.Response[Model, Assumptions] = config.cast(super.extractResponse(config, res, assumptions) match {
     case SatWithModel(model) =>
       val evaluator = semantics.withFunctions(model.functions).getEvaluator(using evalContext)
-      val evaluations = model.vars.map { case (k, v) => k -> evaluator.eval(v).result }
+      val interpretations = inox.Model(program)(Map.empty, Map.empty, is = model.interpretations)
+      val evaluations = model.vars.map { case (k, v) => k -> evaluator.eval(v, interpretations).result }
       SatWithModel(inox.Model(program)(
         evaluations.collect { case (k, Some(v)) => k -> v },
         model.chooses,
-        model.functions
+        model.functions,
+        model.interpretations
       ))
     case resp => resp
   })

@@ -567,7 +567,11 @@ trait TemplateGenerator { self: Templates =>
   private val callsMayFalsifyPath: MutableMap[Identifier, Boolean] = MutableMap.empty
 
   private def callMayFalsifyPath(id: Identifier): Boolean = callsMayFalsifyPath.getOrElseUpdate(id,
-    (transitiveCallees(id) + id).exists(fid => exprOps.exists(containsAssumption)(getFunction(fid).fullBody)))
+    (transitiveCallees(id) + id).exists { fid =>
+      // The results of uninterpreted functions are assumed to lie in their return types
+      val fd = getFunction(fid)
+      (fd.flags contains Uninterpreted) || exprOps.exists(containsAssumption)(fd.fullBody)
+    })
 
   /** Whether checking that a value belongs to `tpe` may falsify the path condition. */
   private def mayFalsifyPath(tpe: Type): Boolean = typeOps.exists {

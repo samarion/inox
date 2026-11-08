@@ -857,7 +857,21 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
       })
     }.toMap).getOrElse(Map.empty)
 
-    inox.Model(program)(vars, chooses.toMap)
+    // The definitions of uninterpreted functions at the type arguments of their calls
+    val uninterpreted = tryZ3(model.getFuncInterpretations.flatMap { case (decl, mapping, defaultValue) =>
+      functions.getA(decl).filter(_.fd.flags contains Uninterpreted).map { tfd =>
+        val ex = new ModelExtractor(model)
+        val body = mapping.foldRight(ex(defaultValue, tfd.getType)) { case ((args, res), elze) =>
+          IfExpr(andJoin((tfd.params.map(_.toVariable) zip args).map {
+            case (v, e) => Equals(v, ex(e, v.getType))
+          }), ex(res, tfd.getType), elze)
+        }
+        chooses ++= ex.chooses.map(p => (p._1, tfd.tps) -> p._2)
+        (tfd.id, tfd.tps) -> body
+      }
+    }.toMap).getOrElse(Map.empty)
+
+    inox.Model(program)(vars, chooses.toMap, is = uninterpreted)
   }
 
   def extractUnsatAssumptions(cores: Set[Z3AST]): Set[Expr] = {

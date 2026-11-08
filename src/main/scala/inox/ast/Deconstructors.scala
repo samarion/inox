@@ -730,6 +730,8 @@ trait TreeDeconstructor {
       (Seq(id), Seq(), Seq(), (ids, _, _) => t.HasADTInvariant(ids.head))
     case s.ModelFunction =>
       (Seq(), Seq(), Seq(), (_, _, _) => t.ModelFunction)
+    case s.Uninterpreted =>
+      (Seq(), Seq(), Seq(), (_, _, _) => t.Uninterpreted)
     case s.HasADTEquality(id) =>
       (Seq(id), Seq(), Seq(), (ids, _, _) => t.HasADTEquality(ids.head))
     case s.Annotation(name, args) =>

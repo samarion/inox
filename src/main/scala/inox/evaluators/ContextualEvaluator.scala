@@ -18,6 +18,7 @@ trait ContextualEvaluator extends Evaluator {
     def tps: Seq[Type]
     def mappings: Map[ValDef, Expr]
     def chooses: Map[(Identifier, Seq[Type]), Expr]
+    def interpretations: Map[(Identifier, Seq[Type]), Expr]
     def locallyIgnoreContracts: Boolean
 
     def newTypes(tps: Seq[Type]): RC
@@ -36,6 +37,7 @@ trait ContextualEvaluator extends Evaluator {
     tps: Seq[Type],
     mappings: Map[ValDef, Expr],
     chooses: Map[(Identifier, Seq[Type]), Expr],
+    interpretations: Map[(Identifier, Seq[Type]), Expr],
     locallyIgnoreContracts: Boolean
   ) extends RecContext[DefaultRecContext] {
     def newTypes(tps: Seq[Type]) = copy(tps = tps)
@@ -91,7 +93,7 @@ trait ContextualEvaluator extends Evaluator {
 trait HasDefaultRecContext extends ContextualEvaluator {
   import program.trees._
   type RC = DefaultRecContext
-  def initRC(model: program.Model) = DefaultRecContext(Seq.empty, model.vars, model.chooses, false)
+  def initRC(model: program.Model) = DefaultRecContext(Seq.empty, model.vars, model.chooses, model.interpretations, false)
 }
 
 trait HasDefaultGlobalContext extends ContextualEvaluator {

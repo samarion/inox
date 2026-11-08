@@ -128,7 +128,25 @@ abstract class SMTLIBSolver private(override val program: Program,
               case _ => None
             }.toMap
 
-            SatWithModel(inox.Model(program)(vars, chooses.toMap))
+            // The definitions of uninterpreted functions at the type arguments of their calls
+            val uninterpreted = smodel.flatMap {
+              case DefineFun(SMTFunDef(s, args, _, e)) if functions `containsB` s =>
+                val tfd = functions.toA(s)
+                if (tfd.fd.flags contains Uninterpreted) {
+                  try {
+                    val ctx = new Context(variables.bToA, Map(), modelFunDefs).withVariables(args.map(_.name) zip tfd.params.map(_.toVariable))
+                    val body = fromSMT(e, tfd.getType)(using ctx)
+                    chooses ++= ctx.getChooses.map(p => (p._1.res.id, tfd.tps) -> p._2)
+                    Some((tfd.id, tfd.tps) -> body)
+                  } catch {
+                    case _: Unsupported => None
+                    case _: java.lang.StackOverflowError => None
+                  }
+                } else None
+              case _ => None
+            }.toMap
+
+            SatWithModel(inox.Model(program)(vars, chooses.toMap, is = uninterpreted))
 
           case _ =>
             Unknown

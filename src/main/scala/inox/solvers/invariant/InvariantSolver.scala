@@ -717,6 +717,9 @@ abstract class AbstractInvariantSolver(override val program: Program,
       ()
 
   protected def encodeFunction(tfd: TypedFunDef): Set[Expr] = 
+    // unsupported, as with chooses: the body of an uninterpreted function must be ignored
+    if tfd.fd.flags contains Uninterpreted then ???
+
     // collect data
     val body = purify(tfd.fullBody)
     val pred = Context.predicateOf(tfd)

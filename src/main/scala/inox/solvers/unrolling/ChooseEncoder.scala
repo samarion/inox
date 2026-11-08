@@ -27,7 +27,7 @@ class ChooseEncoder private
   private lazy val chooses = {
     import program._
     import program.trees._
-    program.symbols.functions.values.flatMap { fd =>
+    program.symbols.functions.values.filterNot(_.flags contains Uninterpreted).flatMap { fd =>
       exprOps.collect { case c: Choose => Set(c) case _ => Set.empty[Choose] } (fd.fullBody)
         .map(c => c.res.id -> c)
     }.toMap
@@ -107,7 +107,9 @@ object ChooseEncoder {
         case Operator(es, recons) => recons(es.map(rec(_, params))).copiedFrom(e)
       }
 
-      fd.copy(fullBody = fd.fullBody match {
+      // The bodies of uninterpreted functions are ignored
+      if (fd.flags contains Uninterpreted) fd
+      else fd.copy(fullBody = fd.fullBody match {
         case c: Choose => c.copy(pred = rec(c.pred, fd.params)).copiedFrom(c)
         case body => rec(body, fd.params)
       })
@@ -115,7 +117,7 @@ object ChooseEncoder {
 
     val allFunctions = newFds ++ fdChooses.map(_._2)
     val allScopes = fdChooses.map(p => p._1 -> p._3).toMap ++ newFds.flatMap(fd => fd.fullBody match {
-      case c: Choose => Some(c.res.id -> fd.params)
+      case c: Choose if !(fd.flags contains Uninterpreted) => Some(c.res.id -> fd.params)
       case _ => None
     })
 

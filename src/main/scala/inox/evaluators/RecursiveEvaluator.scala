@@ -182,10 +182,17 @@ abstract class RecursiveEvaluator(override val program: Program,
       val tfd = getFunction(id, tps)
       val evArgs = args map e
 
+      // uninterpreted functions are defined by the model at the call's type arguments
+      val body = if (!(tfd.fd.flags contains Uninterpreted)) tfd.fullBody else {
+        rctx.interpretations.getOrElse(id -> tps, {
+          throw EvalError(s"Cannot call uninterpreted function ${id.asString} that the model doesn't define")
+        })
+      }
+
       // build a mapping for the function...
       val frame = rctx.withNewVars(tfd.paramSubst(evArgs)).newTypes(tps)
 
-      e(tfd.fullBody)(using frame, gctx)
+      e(body)(using frame, gctx)
 
     case And(Seq(e1, e2)) => e(e1) match {
       case BooleanLiteral(false) => BooleanLiteral(false)

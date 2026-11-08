@@ -10,14 +10,16 @@ object Model {
   def apply(p: Program)(
     vs: Map[p.trees.ValDef, p.trees.Expr],
     cs: Map[(Identifier, Seq[p.trees.Type]), p.trees.Expr],
-    fs: Seq[p.trees.FunDef] = Seq.empty
+    fs: Seq[p.trees.FunDef] = Seq.empty,
+    is: Map[(Identifier, Seq[p.trees.Type]), p.trees.Expr] = Map.empty[(Identifier, Seq[p.trees.Type]), p.trees.Expr]
   ): p.Model = {
     class Impl(override val program: p.type,
                override val vars: Map[p.trees.ValDef, p.trees.Expr],
                override val chooses: Map[(Identifier, Seq[p.trees.Type]), p.trees.Expr],
-               override val functions: Seq[p.trees.FunDef])
-      extends Model(program)(vars, chooses, functions)
-    new Impl(p, vs, cs, fs)
+               override val functions: Seq[p.trees.FunDef],
+               override val interpretations: Map[(Identifier, Seq[p.trees.Type]), p.trees.Expr])
+      extends Model(program)(vars, chooses, functions, interpretations)
+    new Impl(p, vs, cs, fs, is)
   }
 }
 
@@ -26,11 +28,15 @@ object Model {
   * The values may call functions that the program doesn't define. Their definitions are in `functions`,
   * and [[symbols]] is the program extended with them: model values are typed, printed and evaluated
   * with these symbols, as in the input extraction of Voirol's thesis (§2.2).
+  *
+  * The `interpretations` are the bodies of the uninterpreted functions at the type arguments of their
+  * calls, over the parameters of the functions.
   */
 class Model(val program: Program)
            (val vars: Map[program.trees.ValDef, program.trees.Expr],
             val chooses: Map[(Identifier, Seq[program.trees.Type]), program.trees.Expr],
-            val functions: Seq[program.trees.FunDef] = Seq.empty) { self =>
+            val functions: Seq[program.trees.FunDef] = Seq.empty,
+            val interpretations: Map[(Identifier, Seq[program.trees.Type]), program.trees.Expr] = Map.empty) { self =>
   import program.{Model => _, symbols => _, _}
   import program.trees._
 
@@ -38,7 +44,7 @@ class Model(val program: Program)
   lazy val symbols: Symbols =
     if (functions.isEmpty) program.symbols else program.symbols.withFunctions(functions)
 
-  def isEmpty: Boolean = vars.isEmpty && chooses.isEmpty && functions.isEmpty
+  def isEmpty: Boolean = vars.isEmpty && chooses.isEmpty && functions.isEmpty && interpretations.isEmpty
 
   def encode(t: transformers.ProgramTransformer {
     val sourceProgram: Program { val trees: program.trees.type }
@@ -46,7 +52,8 @@ class Model(val program: Program)
     Model(t.targetProgram)(
       self.vars.map { case (vd, e) => t.encode(vd) -> t.encode(e) },
       self.chooses.map { case ((id, tps), e) => (id, tps.map(t.encode(_))) -> t.encode(e) },
-      self.functions.map(t.encode(_))
+      self.functions.map(t.encode(_)),
+      self.interpretations.map { case ((id, tps), e) => (id, tps.map(t.encode(_))) -> t.encode(e) }
     )
   }
 
@@ -65,7 +72,7 @@ class Model(val program: Program)
       case _ => None
     }).toSeq
 
-    val functionString = (for {
+    val functionString = ((for {
       (fd, cs) <- chooseFds
       ((id, tps), e) <- cs
     } yield {
@@ -73,7 +80,13 @@ class Model(val program: Program)
       (if (tps.nonEmpty) "[" + tps.map(_.asString).mkString(",") + "]" else "") +
       (if (fd.params.nonEmpty) "(" + fd.params.map(_.asString).mkString(", ") + ")" else "") +
       " -> " + e.asString
-    }).mkString("\n")
+    }) ++ (for (((id, tps), e) <- interpretations) yield {
+      val fd = program.symbols.getFunction(id)
+      id.asString +
+      (if (tps.nonEmpty) "[" + tps.map(_.asString).mkString(",") + "]" else "") +
+      (if (fd.params.nonEmpty) "(" + fd.params.map(_.asString).mkString(", ") + ")" else "") +
+      " -> " + e.asString
+    })).mkString("\n")
 
     lazy val chooseString = if (!opts.printChooses) "" else {
       val fdChooses = program.symbols.functions.values.flatMap(fd => fd.fullBody match {

@@ -747,11 +747,16 @@ trait SymbolOps extends TypeOps { self =>
     private val inlinable = new ConcurrentHashMap[Identifier, java.lang.Boolean]
 
     private def calleesOf(id: Identifier): Set[Identifier] =
-      callees.computeIfAbsent(id, id => exprOps.collect[Identifier] {
-        case fi: FunctionInvocation => Set(fi.id)
-        case Equals(IsTyped(_, adt: ADTType), _) if adt.getSort.hasEquality => Set(adt.getSort.equality.get.id)
-        case _ => Set.empty
-      } (getFunction(id).fullBody))
+      callees.computeIfAbsent(id, id => {
+        val fd = getFunction(id)
+        // The bodies of uninterpreted functions are ignored
+        if (fd.flags contains Uninterpreted) Set.empty
+        else exprOps.collect[Identifier] {
+          case fi: FunctionInvocation => Set(fi.id)
+          case Equals(IsTyped(_, adt: ADTType), _) if adt.getSort.hasEquality => Set(adt.getSort.equality.get.id)
+          case _ => Set.empty
+        } (fd.fullBody)
+      })
 
     /** The functions in `roots` and those they transitively call. */
     private def reachable(roots: Set[Identifier]): Set[Identifier] = {
@@ -773,6 +778,7 @@ trait SymbolOps extends TypeOps { self =>
 
     private def isInlinable(id: Identifier): Boolean =
       inlinable.computeIfAbsent(id, id => java.lang.Boolean.valueOf(
+        !(getFunction(id).flags contains Uninterpreted) &&
         hasForall(getFunction(id).fullBody) && !reachable(calleesOf(id)).contains(id)
       )).booleanValue
 
@@ -815,7 +821,8 @@ trait SymbolOps extends TypeOps { self =>
       def inlineExpr(quantified: Set[Variable], e: Expr): Expr = andJoin(collectWithPC (e) {
         case (fi @ FunctionInvocation(_, _, args), path)
           if qArgs(quantified, args) &&
-             !path.elements.exists(_.isInstanceOf[Path.OpenBound])
+             !path.elements.exists(_.isInstanceOf[Path.OpenBound]) &&
+             !(fi.tfd.fd.flags contains Uninterpreted)
             =>
           val tfd = fi.tfd
           val nextQuantified = args.collect { case v: Variable if quantified(v) => v }.toSet
