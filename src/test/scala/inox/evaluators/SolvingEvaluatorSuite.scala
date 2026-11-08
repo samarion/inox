@@ -153,7 +153,8 @@ class SolvingEvaluatorSuite extends AnyFunSuite {
 
   test("choose with an unconstrained result whose type only has infinite values") {
     // A solver that looks for a value of the result's type never finds one, and evaluating
-    // these chooses used to run forever.
+    // these chooses used to run forever. Without a solver, these types have no simple value
+    // either (none satisfies the invariant), so the evaluation fails.
     val ctx = TestContext.empty
     val evaluator = RecursiveEvaluator(forestProgram, ctx)
     val fn = "fn" :: (IntegerType() =>: T(forestID)())
@@ -161,7 +162,8 @@ class SolvingEvaluatorSuite extends AnyFunSuite {
     for (choose <- Seq(Choose(fn, BooleanLiteral(true)), Choose(forest, BooleanLiteral(true)))) {
       val result = Future(evaluator.eval(choose, Model.empty(forestProgram)))
       try {
-        Await.result(result, 60.seconds)
+        val res = Await.result(result, 60.seconds)
+        assert(!res.isInstanceOf[EvaluationResults.Successful[?]], s"$choose should fail, got $res")
       } catch {
         case _: TimeoutException =>
           ctx.interruptManager.interrupt()
