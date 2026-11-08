@@ -683,15 +683,41 @@ abstract class AbstractUnrollingSolver private
           modelEq(tmpl.ids._2, f)
         }
 
-        optEqTemplate.map { tmpl =>
-          val localsSubst = tmpl.structure.locals.map { case (v, ev) =>
-            v -> extractValue(ev, v.getType, nextSeen)
-          }.toMap
+        optEqTemplate.map(templateLambda)
+      }
 
-          val res = exprOps.replaceFromSymbols(localsSubst, tmpl.structure.body)
-          val (nl, subst) = normalizeStructure(res, onlySimple = true)
-          exprOps.replaceFromSymbols(subst.map { case (v, e, _) => v -> e }.toMap, nl).asInstanceOf[Lambda]
+      // The lambda of `tmpl` in the model, with the model values of its closure
+      def templateLambda(tmpl: templates.LambdaTemplate): Lambda = {
+        val localsSubst = tmpl.structure.locals.map { case (v, ev) =>
+          v -> extractValue(ev, v.getType, nextSeen)
+        }.toMap
+
+        val res = exprOps.replaceFromSymbols(localsSubst, tmpl.structure.body)
+        val (nl, subst) = normalizeStructure(res, onlySimple = true)
+        exprOps.replaceFromSymbols(subst.map { case (v, e, _) => v -> e }.toMap, nl).asInstanceOf[Lambda]
+      }
+
+      // `lambda`, made structurally distinct from the functions that differ from `f` in the model:
+      // the other extracted functions and the lambdas of the query. Lambdas are compared
+      // structurally, up to the names of their parameters and locals (and to the values of their
+      // closures, as with the lambdas of the query).
+      def distinctFromOthers(lambda: Lambda): Lambda = {
+        def normal(l: Lambda): Expr = {
+          val (nl, subst) = normalizeStructure(l, onlySimple = true)
+          exprOps.replaceFromSymbols(subst.map { case (v, e, _) => v -> e }.toMap, nl)
         }
+
+        lazy val taken = lambdaExtractions.collect {
+          case (_, img: Lambda) if img.getType == lambda.getType => normal(img)
+        }.toSet ++ templates.getLambdaTemplates(tpe).filter { tmpl =>
+          wrapped.modelEval(tmpl.start, BooleanType()) == Some(BooleanLiteral(true)) &&
+          !modelEq(tmpl.ids._2, f)
+        }.map(tmpl => normal(templateLambda(tmpl)))
+
+        Iterator(lambda)
+          .concat(Iterator.from(1).map(uniquateClosure(_, lambda)))
+          .find(l => !taken(normal(l)))
+          .get
       }
 
       val params: Seq[ValDef] = tpe.from.map(tpe => ValDef.fresh("x", tpe, true))
@@ -730,7 +756,10 @@ abstract class AbstractUnrollingSolver private
           defaultValue(params, paramTypes, resultType).map(Lambda(params, _))
             .getOrElse(wrapped.modelEval(f, tpe).getOrThrow.asInstanceOf[Lambda])
         } else if (tpe.from.isEmpty) {
-          Lambda(Seq.empty, extractValue(templates.mkApp(f, tpe, Seq.empty), imageType, nextSeen))
+          val lambda = Lambda(Seq.empty, extractValue(templates.mkApp(f, tpe, Seq.empty), imageType, nextSeen))
+          lambdaExtractions.collectFirst {
+            case (e, img) if img.getType == lambda.getType && modelEq(e, f) => img
+          }.getOrElse(distinctFromOthers(lambda))
         } else {
           val projections: Map[Type, Encoded] = (arguments.head zip params)
             .groupBy(p => p._2.getType)
@@ -872,23 +901,7 @@ abstract class AbstractUnrollingSolver private
 
           lambdaExtractions.collectFirst {
             case (e, img) if img.getType == lambda.getType && modelEq(e, f) => img
-          }.getOrElse {
-            // Make sure `lambda` differs from the other distinct extracted functions. Lambdas are
-            // compared structurally, up to the names of their parameters and locals.
-            def normal(l: Lambda): Expr = {
-              val (nl, subst) = normalizeStructure(l, onlySimple = true)
-              exprOps.replaceFromSymbols(subst.map { case (v, e, _) => v -> e }.toMap, nl)
-            }
-
-            val taken = lambdaExtractions.collect {
-              case (_, img: Lambda) if img.getType == lambda.getType => normal(img)
-            }.toSet
-
-            Iterator(lambda)
-              .concat(Iterator.from(1).map(uniquateClosure(_, lambda)))
-              .find(l => !taken(normal(l)))
-              .get
-          }
+          }.getOrElse(distinctFromOthers(lambda))
         }
 
         lambdaExtractions :+= f -> res
