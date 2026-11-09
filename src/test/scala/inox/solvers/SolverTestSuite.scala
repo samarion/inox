@@ -79,9 +79,6 @@ object SolverTestSuite {
   val solvers: Seq[SolverInfo] = Seq(
     SolverInfo("nativez3", () => SolverFactory.hasNativeZ3,
       Set(BitVectorIntConversions, FloatingPoint),
-      knownIssues = Map(
-        "Function calls across push and pop" -> "returns Unknown once functions unfolded before a pop are called again",
-      ),
       groundOnly = Map("Bag Operations" -> z3BagUnionModels)),
     SolverInfo("unrollz3", () => SolverFactory.hasNativeZ3,
       Set(BitVectorIntConversions, FloatingPoint),
@@ -97,10 +94,7 @@ object SolverTestSuite {
       groundOnly = cvcGroundOnly),
     SolverInfo("smt-bitwuzla", () => SolverFactory.hasBitwuzla,
       Set(Integers, Reals, BitVectorIntConversions, Strings, Sets, Bags, BagAlgebra, Maps, NestedArrays, ADTs,
-        Quantifiers, TypeParameters),
-      knownIssues = Map(
-        "Model extraction of Char" -> "returns Unknown for characters",
-      )),
+        Quantifiers, TypeParameters)),
     SolverInfo("princess", () => true,
       Set(BitVectors, FloatingPoint, Sets, BagAlgebra, Maps, NestedArrays),
       // Times out on conjunctions of string checks that it solves quickly one by one
@@ -113,7 +107,6 @@ object SolverTestSuite {
         "Bag with several multiplicities" -> "returns Unknown after about two minutes",
         "Function returning bags" -> "crashes (None.get) extracting a function whose results are bags",
         "Function call over bit-vectors" -> "hangs on function calls over bit-vectors",
-        "Function calls across push and pop" -> "crashes once functions unfolded before a pop are called again",
       )),
   )
 
