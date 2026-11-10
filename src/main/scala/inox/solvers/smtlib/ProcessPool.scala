@@ -7,15 +7,18 @@ package smtlib
 import _root_.smtlib.interpreters.ProcessInterpreter
 
 import java.util.ArrayDeque
-import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.{ConcurrentHashMap, LinkedBlockingQueue, ThreadFactory, ThreadPoolExecutor, TimeUnit}
+import java.util.concurrent.atomic.AtomicInteger
+
+import scala.util.control.NonFatal
 
 /** Idle solver processes, which new solvers reuse instead of starting processes of their own.
   *
   * Starting a solver process and having it set up its first context takes several milliseconds
   * (about 10ms for Z3), which is often more than the queries of a solver take: Inox starts a
-  * solver for each query, and for each quantifier it evaluates in a model. A solver that is freed
-  * without having been interrupted resets its process and leaves it here for the next solver
-  * started with the same command line.
+  * solver for each query, and for each quantifier it evaluates in a model. The process of a solver
+  * that is freed without having been interrupted is reset in the background (see [[recycle]]),
+  * then left here for the next solver started with the same command line.
   *
   * At most one idle process per processor is kept for each command line, the others are freed.
   */
@@ -34,9 +37,41 @@ object ProcessPool {
     Option(queue.synchronized(queue.pollFirst()))
   }
 
+  // processes handed to `recycle` and not yet in the pool, so that at most `maxIdle` wait for it
+  private val recycling = new AtomicInteger
+
+  private val recycler = {
+    val factory: ThreadFactory = { r =>
+      val thread = new Thread(r, "inox-process-pool")
+      thread.setDaemon(true)
+      thread
+    }
+    val executor = new ThreadPoolExecutor(maxIdle, maxIdle, 1, TimeUnit.SECONDS, new LinkedBlockingQueue[Runnable], factory)
+    executor.allowCoreThreadTimeOut(true)
+    executor
+  }
+
+  /** Leaves the process `interpreter`, started with the command line `key`, for another solver
+    * once `prepare` returns true on it, which runs in the background so that the solver that freed
+    * the process doesn't wait for it. `prepare` must leave the process as a new one would be,
+    * and the process is freed if it returns false or throws. */
+  def recycle(key: Seq[String], interpreter: ProcessInterpreter)(prepare: ProcessInterpreter => Boolean): Unit = {
+    if (recycling.incrementAndGet() > maxIdle) {
+      recycling.decrementAndGet()
+      interpreter.free()
+    } else {
+      recycler.execute { () =>
+        val ready = try prepare(interpreter) catch { case NonFatal(_) => false }
+        recycling.decrementAndGet()
+        if (ready) give(key, interpreter)
+        else try interpreter.free() catch { case NonFatal(_) => }
+      }
+    }
+  }
+
   /** Leaves the idle process `interpreter`, started with the command line `key` and reset by the
     * caller, for another solver. */
-  def give(key: Seq[String], interpreter: ProcessInterpreter): Unit = {
+  private def give(key: Seq[String], interpreter: ProcessInterpreter): Unit = {
     val queue = processes(key)
     val kept = queue.synchronized {
       queue.size < maxIdle && { queue.addFirst(interpreter); true }

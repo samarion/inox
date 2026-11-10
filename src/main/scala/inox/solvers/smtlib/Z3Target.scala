@@ -50,13 +50,17 @@ trait Z3Target extends SMTLIBTarget with SMTLIBDebugger {
   }
 
   override protected def recycle(): Boolean = interpreter match {
-    // the interpreter is used directly, as the reset isn't part of the solver's session
-    case z3: Z3Interpreter => z3.eval(Reset()) match {
-      case Success =>
-        ProcessPool.give(processKey, z3)
-        true
-      case _ => false
-    }
+    case z3: Z3Interpreter =>
+      // the interpreter is used directly, as the reset isn't part of the solver's session
+      ProcessPool.recycle(processKey, z3) { process =>
+        // Z3 rebuilds its context on the first command that needs it after a reset, which takes
+        // about a millisecond: simplifying `true` makes it do so here rather than in the next
+        // solver's first declaration. Unlike a push and a pop, it leaves the solver alone, which
+        // would otherwise answer the next solver's first check in incremental mode.
+        process.eval(Reset()) == Success &&
+          process.eval(SList(SSymbol("simplify"), SSymbol("true"))) == SSymbol("true")
+      }
+      true
     case _ => false
   }
 
