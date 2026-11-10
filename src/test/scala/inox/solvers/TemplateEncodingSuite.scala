@@ -31,6 +31,13 @@ class TemplateEncodingSuite extends SolverTestSuite with DatastructureUtils {
     Seq("x" :: Int32Type()), Int32Type(), { case Seq(x) => x + E(1) })
   }
 
+  val headNegativeID = FreshIdentifier("headNegative")
+  val headNegative = mkFunDef(headNegativeID)() { _ => (
+    Seq("l" :: T(listID)(Int32Type())), BooleanType(), { case Seq(l) =>
+      (l `is` consID) && l.getField(head) < E(0)
+    })
+  }
+
   val lengthID = FreshIdentifier("length")
   val length = mkFunDef(lengthID)("A") { case Seq(aT) => (
     Seq("l" :: T(listID)(aT)), IntegerType(), { case Seq(l) =>
@@ -49,7 +56,7 @@ class TemplateEncodingSuite extends SolverTestSuite with DatastructureUtils {
     })
   }
 
-  override protected def symbols: Symbols = baseSymbols.withFunctions(Seq(inc, incBV, length, greater))
+  override protected def symbols: Symbols = baseSymbols.withFunctions(Seq(inc, incBV, headNegative, length, greater))
   given Symbols = symbols
 
   // Countermodels of quantified formulas can't be checked by evaluation
@@ -75,6 +82,13 @@ class TemplateEncodingSuite extends SolverTestSuite with DatastructureUtils {
     assert(s.solveVALID(Equals(incBV(incBV(x)), x + E(2))) contains true)
   }
 
+  test("Negative bit-vector in an ADT passed to a function", ADTs) { ctx =>
+    val s = solver(ctx)
+    val x = Variable.fresh("x", Int32Type())
+    val list = ADT(consID, Seq(Int32Type()), Seq(x, ADT(nilID, Seq(Int32Type()), Seq())))
+    assert(model(s, Equals(x, E(-1)) && headNegative(list)).vars.get(x.toVal) == Some(Int32Literal(-1)))
+  }
+
   test("Recursive function over ADTs", Integers, ADTs) { ctx =>
     val s = solver(ctx)
     val l = Variable.fresh("l", T(listID)(IntegerType()))
@@ -98,9 +112,15 @@ class TemplateEncodingSuite extends SolverTestSuite with DatastructureUtils {
   }
 
   test("Function equality", Integers, Functions) { ctx =>
-    val s = solver(ctx)
     val f = Variable.fresh("f", FunctionType(Seq(IntegerType()), IntegerType()))
     val succ = \("x" :: IntegerType())(x => x + int(1))
+
+    // Comparing functions is rejected without function equality...
+    val none = solver(ctx.withOpts(unrolling.optFunctionEquality(unrolling.FunctionEquality.None)))
+    intercept[ast.TypeOps#TypeErrorException](none.solveVALID(Equals(f, succ) ==> Equals(f(int(1)), int(2))))
+
+    // ...and structural under intensional function equality
+    val s = solver(ctx.withOpts(unrolling.optFunctionEquality(unrolling.FunctionEquality.Intensional)))
     assert(s.solveVALID(Equals(f, succ) ==> Equals(f(int(1)), int(2))) contains true)
     assert(s.solveVALID(Equals(f, succ) ==> Equals(f(int(1)), int(1))) contains false)
   }

@@ -57,6 +57,20 @@ abstract class SMTLIBSolver private(override val program: Program,
         throw new CantResetException(this)
       case _ =>
     }
+
+    // The solver forgot every declaration, so they must be emitted again when used
+    adtManager.reset()
+    constructors.reset()
+    selectors.reset()
+    testers.reset()
+    variables.reset()
+    sorts.reset()
+    lambdas.reset()
+    functions.reset()
+    predicates.reset()
+    predicateCalls.reset()
+
+    initialize()
   }
 
   protected def extractResponse(
@@ -70,9 +84,10 @@ abstract class SMTLIBSolver private(override val program: Program,
         val syms = variables.bSet ++ predicates.bSet
         emit(GetModel()) match {
           case GetModelResponseSuccess(smodel) =>
-            // first-pass to gather functions
+            // first-pass to gather functions, and the definitions of the functions of the program,
+            // which other definitions can call
             val modelFunDefs = smodel.collect {
-              case me @ DefineFun(SMTFunDef(a, args, _, _)) if args.nonEmpty =>
+              case me @ DefineFun(SMTFunDef(a, args, _, _)) if args.nonEmpty || (functions `containsB` a) =>
                 a -> me
             }.toMap
 

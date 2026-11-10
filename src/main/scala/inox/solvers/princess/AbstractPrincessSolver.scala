@@ -23,7 +23,7 @@ import ap.types.UninterpretedSortTheory
 import utils._
 import SolverResponses._
 
-import scala.collection.mutable.{Map => MutableMap}
+import scala.collection.mutable.{ListBuffer, Map => MutableMap}
 
 abstract class AbstractPrincessSolver(override val program: Program,
                                       override val context: Context)
@@ -97,8 +97,11 @@ abstract class AbstractPrincessSolver(override val program: Program,
       def typeToSortRef(tpe: Type): PADT.CtorArgSort = {
         if (indexMap contains tpe) {
           PADT.ADTSort(indexMap(tpe))
-        } else {
-          PADT.OtherSort(typeToSort(tpe))
+        } else tpe match {
+          // Terms of signed bit-vectors are built in the unsigned range (see `parseTerm`), so
+          // fields of signed bit-vectors must have the unsigned sort to hold negative values
+          case BVType(true, size) => PADT.OtherSort(Mod.UnsignedBVSort(size))
+          case _ => PADT.OtherSort(typeToSort(tpe))
         }
       }
 
@@ -215,14 +218,14 @@ abstract class AbstractPrincessSolver(override val program: Program,
       val res: ITerm = expr match {
         case FunctionInvocation(id, tps, args) =>
           val f = functions.cachedB(getFunction(id, tps.map(_.getType))) {
-            p.createFunction(id.uniqueName, args.size)
+            declared(p.createFunction(id.uniqueName, args.size))(p.addFunction(_))
           }
           val pArgs = for (a <- args) yield parseTerm(a)
           IFunApp(f, pArgs)
 
         case Application(caller, args) =>
           val f = lambdas.cachedB(caller.getType.asInstanceOf[FunctionType]) {
-            p.createFunction(FreshIdentifier("dynLambda").uniqueName, args.size + 1)
+            declared(p.createFunction(FreshIdentifier("dynLambda").uniqueName, args.size + 1))(p.addFunction(_))
           }
           val pArgs = for (a <- caller +: args) yield parseTerm(a)
           IFunApp(f, pArgs)
@@ -313,25 +316,19 @@ abstract class AbstractPrincessSolver(override val program: Program,
         case Division(lhs, rhs) => lhs.getType match {
           case BVType(true, _) => Mod.bvsdiv(parseTerm(lhs), parseTerm(rhs))
           case BVType(false, _) => Mod.bvudiv(parseTerm(lhs), parseTerm(rhs))
-          case IntegerType() => p.mulTheory.tDiv(parseTerm(lhs), parseTerm(rhs))
+          case IntegerType() => p.mulTheory.eDiv(parseTerm(lhs), parseTerm(rhs))
           case _ => unsupported(expr)
         }
 
         case Remainder(lhs, rhs) => lhs.getType match {
           case BVType(true, _) => Mod.bvsrem(parseTerm(lhs), parseTerm(rhs))
           case BVType(false, _) => Mod.bvurem(parseTerm(lhs), parseTerm(rhs))
-          case IntegerType() => p.mulTheory.tMod(parseTerm(lhs), parseTerm(rhs))
+          // the remainder of the euclidean division
+          case IntegerType() => p.mulTheory.eMod(parseTerm(lhs), parseTerm(rhs))
         }
 
         case Modulo(lhs, rhs) => lhs.getType match {
-          case BVType(true, size) => // we want x mod |y|
-            // Note that we cannot compute `bvsmod(x, -y)` when `y < 0` as `-y` overflows
-            // when `y` is the minimal value. Instead, we rely on the sign of `bvsmod(x, y)`
-            // following that of `y` and shift negative results by `|y|`.
-            val b = parseTerm(rhs)
-            val zero = parseTerm(BVLiteral(true, 0, size))
-            val smod = Mod.bvsmod(parseTerm(lhs), b)
-            ITermITE(Mod.bvslt(b, zero) & !(smod === zero), Mod.bvsub(smod, b), smod)
+          case BVType(true, _) => Mod.bvsmod(parseTerm(lhs), parseTerm(rhs))
           case BVType(false, _) => Mod.bvurem(parseTerm(lhs), parseTerm(rhs))
           case IntegerType() => p.mulTheory.eMod(parseTerm(lhs), parseTerm(rhs))
         }
@@ -615,8 +612,8 @@ abstract class AbstractPrincessSolver(override val program: Program,
   def declareVariable(v: Variable): IExpression = variables.cachedB(v)(freshSymbol(v))
 
   def freshSymbol(v: Variable): IExpression = v.getType match {
-    case BooleanType() => p.createBooleanVariable(v.id.freshen.uniqueName)
-    case tpe => p.createConstant(v.id.freshen.uniqueName, typeToSort(tpe))
+    case BooleanType() => declared(p.createBooleanVariable(v.id.freshen.uniqueName))(p.addBooleanVariable(_))
+    case tpe => declared(p.createConstant(v.id.freshen.uniqueName, typeToSort(tpe)))(p.addConstant(_))
   }
 
   def assertCnstr(formula: Trees): Unit = p !! formula.asInstanceOf[IFormula]
@@ -676,33 +673,26 @@ abstract class AbstractPrincessSolver(override val program: Program,
     p.shutDown
   }
 
+  // Princess forgets the symbols declared in a scope when the scope is popped, but the
+  // unrolling templates are encoded once and reused across pops. The symbols therefore stay
+  // in the maps above and are declared again after each pop of the scope that declared them.
+  private var scopes: List[ListBuffer[() => Unit]] = Nil
+
+  private def declared[T](symbol: T)(redeclare: T => Unit): T = {
+    for (scope <- scopes.headOption) scope += (() => redeclare(symbol))
+    symbol
+  }
+
   override def pop() = {
-    adtManager.pop()
-    variables.pop()
-    functions.pop()
-    lambdas.pop()
-
-    constructors.pop()
-    selectors.pop()
-    testers.pop()
-
-    sorts.pop()
-
+    val popped = scopes.head
+    scopes = scopes.tail
     p.pop()
+    for (redeclare <- popped) redeclare()
+    for (scope <- scopes.headOption) scope ++= popped
   }
 
   override def push() = {
-    adtManager.push()
-    variables.push()
-    functions.push()
-    lambdas.push()
-
-    constructors.push()
-    selectors.push()
-    testers.push()
-
-    sorts.push()
-
+    scopes = ListBuffer.empty[() => Unit] :: scopes
     p.push()
   }
 
@@ -718,6 +708,7 @@ abstract class AbstractPrincessSolver(override val program: Program,
 
     sorts.clear()
 
+    scopes = Nil
     p.reset
     interruptCheckSat.set(false)
   }

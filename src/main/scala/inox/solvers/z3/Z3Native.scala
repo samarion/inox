@@ -48,6 +48,10 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
     }
   }
 
+  /** The string alphabet of Z3 (its `encoding` parameter), which stays set while this solver lives. */
+  private val stringEncoding: String = if (maxStringChar == 0xFFFF) "bmp" else "unicode"
+  private val encodingHolder: Thread = Z3Native.acquireEncoding(stringEncoding)
+
   protected[z3] var z3 : Z3Context = new Z3Context(
     "MODEL"             -> true,
     "TYPE_CHECK"        -> true,
@@ -59,11 +63,14 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
   toggleWarningMessages(true)
 
   def free(): Unit = synchronized {
-    freed = true
     if (z3 ne null) {
       z3.delete()
       z3 = null
     }
+    // A solver whose construction failed (e.g. on an encoding conflict) never got the alphabet,
+    // and mustn't release it when it is finalized
+    if (!freed && (encodingHolder ne null)) Z3Native.releaseEncoding(stringEncoding, encodingHolder)
+    freed = true
     interruptManager.unregisterForInterrupts(this)
   }
 
@@ -101,31 +108,12 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
 
   private[z3] val sorts = new IncrementalMap[Type, Z3Sort]()
 
-  def push(): Unit = {
-    adtManager.push()
-    functions.push()
-    lambdas.push()
-    variables.push()
+  // Z3 declarations belong to the context rather than to the solver's scopes, so they stay
+  // valid after a pop. Keeping them lets the unrolling templates, which are encoded once
+  // and reused across pops, refer to the same declarations as the formulas asserted later.
+  def push(): Unit = ()
 
-    constructors.push()
-    selectors.push()
-    testers.push()
-
-    sorts.push()
-  }
-
-  def pop(): Unit = {
-    adtManager.pop()
-    functions.pop()
-    lambdas.pop()
-    variables.pop()
-
-    constructors.pop()
-    selectors.pop()
-    testers.pop()
-
-    sorts.pop()
-  }
+  def pop(): Unit = ()
 
   def reset(): Unit = {
     throw new CantResetException(this)
@@ -181,7 +169,11 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
   sorts += IntegerType() -> z3.mkIntSort()
   sorts += RealType() -> z3.mkRealSort()
   sorts += BooleanType() -> z3.mkBoolSort()
-  sorts += StringType() -> z3.mkSeqSort(z3.mkBVSort(16))
+  // Z3 strings, whose characters go up to 0x2FFFF, or 0xFFFF in the BMP (see `stringEncoding`)
+  sorts += StringType() -> z3.mkString("").getSort
+
+  /** The largest character of strings (see `optStringsBMP`). */
+  protected lazy val maxStringChar: Int = solvers.maxStringChar(options)
 
   // assumes prepareSorts has been called....
   protected def typeToSort(oldtt: Type): Z3Sort = oldtt match {
@@ -337,12 +329,6 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
     case Division(l, r) =>
       val (rl, rr) = (toZ3(l), toZ3(r))
       l.getType match {
-        case IntegerType() =>
-          z3.mkITE(
-            z3.mkGE(rl, z3.mkNumeral("0", typeToSort(IntegerType()))),
-            z3.mkDiv(rl, rr),
-            z3.mkUnaryMinus(z3.mkDiv(z3.mkUnaryMinus(rl), rr))
-          )
         case BVType(true, _) => z3.mkBVSdiv(rl, rr)
         case BVType(false, _) => z3.mkBVUdiv(rl, rr)
         case _ => z3.mkDiv(rl, rr)
@@ -350,26 +336,13 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
     case Remainder(l, r) => l.getType match {
       case BVType(true, _) => z3.mkBVSrem(toZ3(l), toZ3(r))
       case BVType(false, _) => z3.mkBVUrem(toZ3(l), toZ3(r))
-      case _ =>
-        val q = toZ3(Division(l, r))
-        z3.mkSub(toZ3(l), z3.mkMul(toZ3(r), q))
+      // the remainder of the euclidean division
+      case _ => z3.mkMod(toZ3(l), toZ3(r))
     }
 
     case Modulo(l, r) => l.getType match {
       case BVType(false, _) => z3.mkBVUrem(toZ3(l), toZ3(r))
-      case BVType(true, size) => // we want x mod |y|
-        // Note that we cannot compute `bvsmod(x, -y)` when `y < 0` as `-y` overflows
-        // when `y` is the minimal value. Instead, we rely on the sign of `bvsmod(x, y)`
-        // following that of `y` and shift negative results by `|y|`.
-        val rr = toZ3(r)
-        val zero = toZ3(BVLiteral(true, 0, size))
-        val smod = z3.mkBVSmod(toZ3(l), rr)
-        z3.mkITE(
-          z3.mkAnd(z3.mkBVSlt(rr, zero), z3.mkNot(z3.mkEq(smod, zero))),
-          z3.mkBVSub(smod, rr),
-          smod
-        )
-
+      case BVType(true, _) => z3.mkBVSmod(toZ3(l), toZ3(r))
       case _ =>
         z3.mkMod(toZ3(l), toZ3(r))
     }
@@ -524,11 +497,12 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
   }
 
   protected def toZ3Strings(ex: Expr)(using bindings: Map[Variable, Z3AST]): Z3AST = ex match {
-    case StringLiteral("") =>
-      z3.mkEmptySeq(typeToSort(StringType()))
+    case s: StringLiteral if s.value.exists(_ > maxStringChar) =>
+      unsupported(ex, "string with characters outside of the alphabet (see --strings-bmp)")
 
-    case StringLiteral(v) =>
-      z3.mkSeqConcat(v.map(c => z3.mkUnitSeq(z3.mkNumeral(c.toInt.toString, typeToSort(BVType(false, 16)))))*)
+    case s: StringLiteral =>
+      // Z3 reads the `\u{...}` escapes of SMT-LIB string literals
+      z3.mkString(StringUtils.encode(s.value))
 
     case StringLength(a) =>
       z3.mkSeqLength(toZ3(a))
@@ -545,20 +519,19 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
     case _ => unhandled
   }
 
-  protected lazy val emptySeq = {
-    z3.getASTKind(z3.mkEmptySeq(typeToSort(StringType()))) match {
-      case Z3AppAST(decl, _) => decl
-      case ast => error("Unexpected non-app AST " + ast)
-    }
-  }
-
   protected[z3] def fromZ3Formula(model: Z3Model, tree: Z3AST, tpe: Type): (Expr, Map[Choose, Expr]) = {
     val z3ToChooses: MutableMap[Z3AST, Choose] = MutableMap.empty
     val z3ToLambdas: MutableMap[Z3AST, Lambda] = MutableMap.empty
 
     def rec(t: Z3AST, tpe: Type, seen: Set[Z3AST]): Expr = {
       val kind = z3.getASTKind(t)
-      kind match {
+      if (tpe == StringType() && com.microsoft.z3.Native.isString(z3.ptr, t.ptr)) {
+        val size = com.microsoft.z3.Native.getStringLength(z3.ptr, t.ptr)
+        val chars = new Array[Int](size)
+        com.microsoft.z3.Native.getStringContents(z3.ptr, t.ptr, size, chars)
+        if (chars.exists(c => c < 0 || c > maxStringChar)) unsound(t, "string with characters outside of the alphabet")
+        else StringLiteral(chars.toSeq)
+      } else kind match {
         case Z3NumeralIntAST(Some(v)) =>
           tpe match {
             case BVType(signed, size) => BVLiteral(signed, BigInt(v), size)
@@ -674,27 +647,6 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
                     val elems = set.map(e => rec(e, dt, seen))
                     FiniteSet(elems.toSeq, dt)
                 }
-
-              case StringType() if z3.getDeclKind(decl) == OpSeqEmpty =>
-                assert(args.isEmpty)
-                StringLiteral("")
-
-              case StringType() if z3.getDeclKind(decl) == OpSeqUnit =>
-                assert(args.size == 1)
-                rec(args.head, BVType(false, 16), seen) match {
-                  case lit@BVLiteral(_, _, _) =>
-                    StringLiteral(String.valueOf(lit.toBigInt.toChar))
-                  case rarg => unsound(t, s"Cannot convert ${rarg.asString} into a string literal")
-                }
-
-              case StringType() if z3.getDeclKind(decl) == OpSeqConcat =>
-                val rargs = args.map(rec(_, StringType(), seen))
-                val res = rargs.foldLeft(Seq(StringLiteral(""): Expr)) {
-                  case (initAcc :+ StringLiteral(strAcc), StringLiteral(rarg)) =>
-                    initAcc :+ StringLiteral(strAcc ++ rarg)
-                  case (acc, rarg) => acc :+ rarg
-                }
-                res.reduceLeft(StringConcat.apply)
 
               case _ =>
                 import Z3DeclKind._
@@ -924,6 +876,60 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
 }
 
 object Z3Native {
+
+  /** A native Z3 solver that needs a string alphabet that another solver of the same thread is using. */
+  class EncodingConflictException(msg: String) extends Exception(msg)
+
+  /** The monitor under which the native solvers create and delete their Z3 contexts (see
+    * [[NativeZ3Solver]]). The string alphabet below is guarded by the same monitor, which a solver
+    * that waits for the alphabet releases (`wait`): the solvers that use the current alphabet can
+    * then be freed, which they couldn't under a monitor of their own.
+    */
+  private[z3] val lock = new Object
+
+  // Z3's string alphabet is a global parameter (`encoding`), which all the native Z3 solvers of the
+  // process share. A solver sets it when it is created, and it can't change while a solver uses it:
+  // a solver that needs the other alphabet waits until the solvers that use the current one are
+  // freed. The solvers that wait for a change go first, so that they aren't starved. A thread that
+  // holds a solver with the other alphabet would wait for itself, so it gets an exception instead.
+  private var encoding: String = "unicode"
+  private var encodingUsers: Int = 0
+  private val encodingWaiters = MutableMap.empty[String, Int].withDefaultValue(0)
+  private val encodingHolders = MutableMap.empty[(Thread, String), Int].withDefaultValue(0)
+
+  /** Sets Z3's string alphabet to `enc` for a new solver, and returns the thread that holds it. */
+  private[z3] def acquireEncoding(enc: String): Thread = lock.synchronized {
+    val thread = Thread.currentThread
+    if (encodingHolders.exists { case ((t, e), n) => t == thread && e != enc && n > 0 }) {
+      throw new EncodingConflictException(
+        s"Z3's string alphabet can't be set to $enc while this thread uses native Z3 solvers with $encoding strings")
+    }
+    // A thread that already holds the alphabet doesn't wait for the others.
+    if (encodingHolders((thread, enc)) == 0) {
+      def othersWaiting = encodingWaiters.exists { case (e, n) => e != enc && n > 0 }
+      encodingWaiters(enc) += 1
+      try {
+        while (!(encodingUsers == 0 || (encoding == enc && !othersWaiting))) lock.wait()
+      } finally {
+        encodingWaiters(enc) -= 1
+      }
+    }
+    if (encoding != enc) {
+      com.microsoft.z3.Native.globalParamSet("encoding", enc)
+      encoding = enc
+    }
+    encodingUsers += 1
+    encodingHolders((thread, enc)) += 1
+    thread
+  }
+
+  /** Releases the alphabet that `acquireEncoding` gave to `thread`. */
+  private[z3] def releaseEncoding(enc: String, thread: Thread): Unit = lock.synchronized {
+    encodingUsers -= 1
+    encodingHolders((thread, enc)) -= 1
+    if (encodingHolders((thread, enc)) == 0) encodingHolders -= ((thread, enc))
+    lock.notifyAll()
+  }
 
   def tryZ3[T](res: => T): Option[T] =
     // @nv: Z3 sometimes throws an exception when functions are called after Z3 has been canceled

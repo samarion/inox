@@ -16,7 +16,9 @@ class IncrementalSolverSuite extends SolverTestSuite {
 
   override protected def solverInfos: Seq[SolverInfo] = {
     val nonIncremental = Set("unrollz3", "smt-z3", "smt-cvc4", "smt-cvc5")
-    solvers ++ solvers.filter(info => nonIncremental(info.name)).map(info => info.copy(name = "no-inc:" + info.name))
+    // The wrappers replay the assertions in a fresh solver, so they can reset
+    solvers ++ solvers.filter(info => nonIncremental(info.name))
+      .map(info => info.copy(name = "no-inc:" + info.name, unsupported = info.unsupported - Feature.Reset))
   }
 
   val incID = FreshIdentifier("inc")
@@ -24,7 +26,17 @@ class IncrementalSolverSuite extends SolverTestSuite {
     Seq("x" :: IntegerType()), IntegerType(), { case Seq(x) => x + IntegerLiteral(1) })
   }
 
-  override protected def symbols: Symbols = NoSymbols.withFunctions(Seq(inc))
+  val boxID = FreshIdentifier("Box")
+  val boxCons = FreshIdentifier("Box")
+  val boxSort = mkSort(boxID)() { _ => Seq((boxCons, Seq(ValDef(FreshIdentifier("v"), IntegerType())))) }
+
+  // unbox(b) = b.v + 0, so that the unrolling solver unfolds its calls
+  val unboxID = FreshIdentifier("unbox")
+  val unbox = mkFunDef(unboxID)() { _ => (
+    Seq("b" :: T(boxID)()), IntegerType(), { case Seq(b) => b.getField(boxSort.constructors.head.fields.head.id) + E(BigInt(0)) })
+  }
+
+  override protected def symbols: Symbols = NoSymbols.withFunctions(Seq(inc, unbox)).withSorts(Seq(boxSort))
   given Symbols = symbols
 
   def withSolver(ctx: Context)(body: Solver { val program: InoxProgram } => Unit): Unit = {
@@ -77,6 +89,24 @@ class IncrementalSolverSuite extends SolverTestSuite {
     }
   }
 
+  // The unrolling templates are encoded once and reused, so the symbols they refer to (declared
+  // while a scope was open) must remain valid after the scope is popped.
+  test("Datatypes and lambdas across push and pop", Feature.Integers, Feature.ADTs, Feature.Functions) { ctx =>
+    withSolver(ctx) { s =>
+      val y = Variable.fresh("y", IntegerType())
+      val f = Variable.fresh("f", IntegerType() =>: IntegerType())
+      val box = (v: Expr) => ADT(boxCons, Seq(), Seq(v))
+      val succ = \("a" :: IntegerType())(a => a + E(BigInt(1)))
+      s.push()
+      s.assertCnstr(Equals(unbox(box(Application(succ, Seq(y)))), E(BigInt(5))))
+      assert(valueOf(s, y) == Some(IntegerLiteral(4)))
+      s.pop()
+      s.assertCnstr(Equals(f, succ))
+      s.assertCnstr(Equals(unbox(box(Application(f, Seq(y)))), E(BigInt(7))))
+      assert(valueOf(s, y) == Some(IntegerLiteral(6)))
+    }
+  }
+
   test("Check with assumptions") { ctx =>
     withSolver(ctx) { s =>
       val b1 = Variable.fresh("b1", BooleanType())
@@ -99,19 +129,33 @@ class IncrementalSolverSuite extends SolverTestSuite {
     }
   }
 
-  test("Reset") { ctx =>
+  test("Reset", Feature.Reset) { ctx =>
     withSolver(ctx) { s =>
       s.assertCnstr(x > E(0))
       s.assertCnstr(x < E(0))
       assert(s.check(Simple).isUNSAT)
-      try {
-        s.reset()
-      } catch {
-        // solvers may refuse to reset, but must otherwise forget the previous constraints
-        case _: CantResetException => cancel(s"${s.name} can't be reset")
-      }
+      s.reset()
       s.assertCnstr(Equals(x, E(3)))
       assert(valueOf(s, x) == Some(Int32Literal(3)))
+    }
+  }
+
+  testWithout("Solvers that can't reset say so", Feature.Reset) { ctx =>
+    withSolver(ctx) { s =>
+      s.assertCnstr(x > E(0))
+      assertThrows[CantResetException](s.reset())
+    }
+  }
+
+  test("Branches and function calls after a reset", Feature.Integers, Feature.Reset) { ctx =>
+    withSolver(ctx) { s =>
+      val y = Variable.fresh("y", IntegerType())
+      s.assertCnstr(Equals(inc(y), IntegerLiteral(5)))
+      assert(valueOf(s, y) == Some(IntegerLiteral(4)))
+      s.reset()
+      s.assertCnstr(if_ (x > E(0)) { Equals(inc(y), IntegerLiteral(7)) } else_ { Equals(inc(inc(y)), IntegerLiteral(7)) })
+      s.assertCnstr(x < E(0))
+      assert(valueOf(s, y) == Some(IntegerLiteral(5)))
     }
   }
 }

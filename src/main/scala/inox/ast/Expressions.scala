@@ -291,9 +291,47 @@ trait Expressions { self: Trees =>
     def getTpe(stripRefinements: Boolean)(using Symbols): Type = BooleanType()
   }
 
-  /** $encodingof a string literal */
-  sealed case class StringLiteral(value: String) extends Literal[String] {
+  /** $encodingof a string literal
+    *
+    * As in SMT-LIB, a string is a sequence of characters that are Unicode code points, from 0 to
+    * [[StringLiteral.MaxCodePoint]] (0x2FFFF). The solvers can be restricted to the BMP with `--strings-bmp`.
+    *
+    * A literal built from a Java string has a character for each of its UTF-16 code units, as on the JVM:
+    * `StringLiteral("😀")` is the two characters 0xD83D and 0xDE00, unlike
+    * `StringLiteral.fromUTF8("😀".getBytes(UTF_8))`, which is the single character 0x1F600. For compatibility with
+    * literals that held Java strings, the pattern `StringLiteral(s)` matches the Java string of the
+    * characters: match the literal by type and use `value` for the characters.
+    */
+  sealed case class StringLiteral(value: Seq[Int]) extends Literal[Seq[Int]] {
     def getTpe(stripRefinements: Boolean)(using Symbols): Type = StringType()
+
+    /** The Java string of these characters. Characters outside of the BMP become surrogate pairs, so the
+      * result is only read back to the same characters from its code points, with [[StringLiteral.fromUTF8]] for example.
+      */
+    def toJavaString: String = {
+      val sb = new java.lang.StringBuilder
+      value.foreach(sb.appendCodePoint)
+      sb.toString
+    }
+  }
+
+  object StringLiteral {
+    /** The largest character of SMT-LIB strings. */
+    val MaxCodePoint: Int = 0x2FFFF
+
+    /** The literal with a character for each UTF-16 code unit of `s`, as on the JVM. */
+    def apply(s: String): StringLiteral = StringLiteral(s.map(_.toInt))
+
+    /** The literal of the code points that the UTF-8 bytes `bytes` encode. Malformed sequences are
+      * replaced by U+FFFD, as by `new String(bytes, UTF_8)`.
+      */
+    def fromUTF8(bytes: Array[Byte]): StringLiteral =
+      StringLiteral(new String(bytes, java.nio.charset.StandardCharsets.UTF_8).codePoints.toArray.toSeq)
+
+    /** Matches a literal as the Java string of its characters (see [[StringLiteral.toJavaString]]), as
+      * when literals held Java strings. Match the literal by type and use `value` for its characters.
+      */
+    def unapply(s: StringLiteral): Some[String] = Some(s.toJavaString)
   }
 
   /** $encodingof the unit literal `()` */
@@ -480,30 +518,40 @@ trait Expressions { self: Trees =>
 
   /** $encodingof `... /  ...`
     *
-    * Division and Remainder follows Java/Scala semantics. Division corresponds
-    * to / operator on BigInt and Remainder corresponds to %. Note that in
-    * Java/Scala % is called remainder and the "mod" operator (Modulo in Inox) is also
-    * defined on BigInteger and differs from Remainder. The "mod" operator
-    * returns an always positive remainder, while Remainder could return
-    * a negative remainder. The following must hold:
+    * On integers, this is SMT-LIB's euclidean `div`: the quotient `q` of `x` by `y` satisfies
+    * `x == y * q + r` for `0 <= r < |y|`, where `r` is `Modulo(x, y)`. For example, `-7 / 2 == -4`
+    * and `7 / -2 == -3`. This differs from Scala's `BigInt./`, which rounds toward zero.
     *
-    *    Division(x, y) * y + Remainder(x, y) == x
+    * On reals, this is SMT-LIB's `/`. Division by zero is unspecified on integers and reals.
+    *
+    * On bit-vectors, this is SMT-LIB's `bvsdiv` for signed ones and `bvudiv` for unsigned ones, which
+    * round toward zero. Division by zero gives a value with all its bits set (1 for a negative signed
+    * dividend).
     */
   sealed case class Division(lhs: Expr, rhs: Expr) extends Expr with CachingTyped {
     override protected def computeTpe(stripRefinements: Boolean)(using Symbols): Type =
       getIntegerType(lhs, rhs) `orElse` getRealType(lhs, rhs) `orElse` getBVType(lhs, rhs)
   }
 
-  /** $encodingof `... %  ...` (can return negative numbers)
+  /** $encodingof `... %  ...`
     *
-    * @see [[Expressions.Division]]
+    * On bit-vectors, this is SMT-LIB's `bvsrem` for signed bit-vectors, whose result has the sign of
+    * the dividend, and `bvurem` for unsigned ones, so that `Division(x, y) * y + Remainder(x, y) == x`.
+    * The remainder of a division by zero is the dividend.
+    *
+    * On integers, this is the remainder of the euclidean [[Expressions.Division]], so that the same
+    * identity holds: it is SMT-LIB's `mod`, like [[Expressions.Modulo]], and is never negative.
     */
   sealed case class Remainder(lhs: Expr, rhs: Expr) extends Expr with CachingTyped {
     override protected def computeTpe(stripRefinements: Boolean)(using Symbols): Type =
       getIntegerType(lhs, rhs) `orElse` getBVType(lhs, rhs)
   }
 
-  /** $encodingof `... mod  ...` (cannot return negative numbers)
+  /** $encodingof `... mod  ...`
+    *
+    * On integers, this is SMT-LIB's `mod`, which never returns a negative number. On bit-vectors, it is
+    * SMT-LIB's `bvsmod` for signed ones, whose result has the sign of the divisor, and `bvurem` for
+    * unsigned ones. As in SMT-LIB, the modulo of a bit-vector by zero is the dividend.
     *
     * @see [[Expressions.Division]]
     */
@@ -745,12 +793,6 @@ trait Expressions { self: Trees =>
   sealed case class FPToBV(size: Int, signed: Boolean, rm: Expr, expr: Expr) extends Expr with CachingTyped {
     override protected def computeTpe(stripRefinements: Boolean)(using Symbols): Type =
       if getRoundingMode(rm).isTyped && getFPType(expr).isTyped then BVType(signed, size) else Untyped
-  }
-
-  /** Casts from floating-points to bitvectors with JVM semantics */
-  sealed case class FPToBVJVM(exponent: Int, significand: Int, toSize: Int, expr: Expr) extends Expr with CachingTyped {
-    override protected def computeTpe(stripRefinements: Boolean)(using Symbols): Type =
-      if getFPType(expr).isTyped then BVType(true, toSize) else Untyped
   }
 
   object FPToBinary {

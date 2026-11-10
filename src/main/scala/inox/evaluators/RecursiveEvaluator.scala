@@ -48,6 +48,25 @@ abstract class RecursiveEvaluator(override val program: Program,
 
   // `max` and `min` follow SMT-LIB's fp.max and fp.min: a NaN operand is ignored unless both are
   // NaN. SMT-LIB leaves the result open for +0.0 and -0.0, which we order as the JVM does.
+  private val roundingModes: Set[Expr] =
+    Set(RoundNearestTiesToEven, RoundNearestTiesToAway, RoundTowardPositive, RoundTowardNegative, RoundTowardZero)
+
+  /** Rounds `d` to an integral value with the rounding mode `rm`, keeping the sign of zeros. */
+  private def roundToIntegral(d: Double, rm: Expr): Double = rm match {
+    case RoundNearestTiesToEven => Math.rint(d)
+    case RoundTowardPositive => Math.ceil(d)
+    case RoundTowardNegative => Math.floor(d)
+    case RoundTowardZero => if (d < 0) Math.ceil(d) else Math.floor(d)
+    case RoundNearestTiesToAway =>
+      if (d.isNaN || d.isInfinite) d
+      else {
+        val abs = Math.abs(d)
+        val floor = Math.floor(abs)
+        Math.copySign(if (abs - floor >= 0.5) floor + 1 else floor, d)
+      }
+    case _ => throw EvalError(s"Unexpected rounding mode $rm")
+  }
+
   private def fpMax(a: Double, b: Double): Double = if (a.isNaN) b else if (b.isNaN) a else a.max(b)
   private def fpMin(a: Double, b: Double): Double = if (a.isNaN) b else if (b.isNaN) a else a.min(b)
   private def fpMax(a: Float, b: Float): Float = if (a.isNaN) b else if (b.isNaN) a else a.max(b)
@@ -55,6 +74,48 @@ abstract class RecursiveEvaluator(override val program: Program,
 
   protected def finiteMap(els: Iterable[(Expr, Expr)], default: Expr, from: Type, to: Type): FiniteMap = {
     FiniteMap(els.toMap.toSeq.filter { case (_, value) => value != default }.sortBy(_._1.toString), default, from, to)
+  }
+
+  private lazy val functionEquality = options.findOptionOrDefault(solvers.unrolling.optFunctionEquality)
+
+  /** Equality between the values `v1` and `v2` (see [[solvers.unrolling.optFunctionEquality]]).
+    *
+    * - Under `intensional` equality, functions are compared structurally.
+    * - Under `none`, comparing functions is an evaluation error. Extracted models never compare
+    *   functions, and queries that do are rejected by the solvers.
+    * - Under `extensional` equality, structurally distinct functions are equal iff they agree on every
+    *   input. They are told apart by their results on the closed subexpressions of the right type
+    *   that they contain (for extracted models, the inputs that tell them apart), and their equality
+    *   is undecidable otherwise. */
+  protected def valuesEqual(v1: Expr, v2: Expr)(using rctx: RC, gctx: GC): Boolean = (v1, v2) match {
+    case _ if functionEquality == solvers.unrolling.FunctionEquality.Intensional => v1 == v2
+    case (ADT(id1, _, args1), ADT(id2, _, args2)) =>
+      id1 == id2 && (args1 zip args2).forall(valuesEqual)
+    case (Tuple(es1), Tuple(es2)) =>
+      (es1 zip es2).forall(valuesEqual)
+    case (l1: Lambda, l2: Lambda) if functionEquality == solvers.unrolling.FunctionEquality.None =>
+      throw EvalError(s"Functions can't be compared under --function-equality=none: ${l1.asString} and ${l2.asString}")
+    case _ if v1 == v2 => true
+    case (l1: Lambda, l2: Lambda) =>
+      def candidates(tpe: Type): Seq[Expr] = (Seq(l1, l2).flatMap { l =>
+        exprOps.collect[Expr] {
+          case c if c.getType == tpe && exprOps.variablesOf(c).isEmpty => Set(c)
+          case _ => Set.empty
+        } (l.body)
+      } ++ scala.util.Try(simplestValue(tpe, allowSolver = false)).toOption).distinct
+
+      val inputs = l1.params.foldRight(Seq(Seq.empty[Expr])) { (vd, rest) =>
+        for (arg <- candidates(vd.getType); args <- rest) yield arg +: args
+      }.take(100)
+
+      def differOn(args: Seq[Expr]): Boolean = scala.util.Try {
+        val values = args.map(e)
+        !valuesEqual(e(Application(l1, values)), e(Application(l2, values)))
+      }.getOrElse(false)
+
+      if (inputs.exists(differOn)) false
+      else throw EvalError(s"Can't decide whether ${l1.asString} and ${l2.asString} are equal")
+    case _ => false
   }
 
   /** Evaluates `expr`.
@@ -158,7 +219,7 @@ abstract class RecursiveEvaluator(override val program: Program,
       }
 
     case Equals(le,re) =>
-      BooleanLiteral(e(le) == e(re))
+      BooleanLiteral(valuesEqual(e(le), e(re)))
 
     case ADT(id, tps, args) =>
       val cc = ADT(id, tps.map(_.getType), args.map(e))
@@ -288,10 +349,15 @@ abstract class RecursiveEvaluator(override val program: Program,
     case Division(l,r) =>
       (e(l), e(r)) match {
         case (b1 @ BVLiteral(sig1, _, s1), b2 @ BVLiteral(sig2, _, s2)) if sig1 == sig2 && s1 == s2 =>
-          val bi2 = b2.toBigInt
-          if (bi2 != 0) BVLiteral(sig1, b1.toBigInt / bi2, s1) else throw RuntimeError("Division by 0.")
+          val (bi1, bi2) = (b1.toBigInt, b2.toBigInt)
+          // As in SMT-LIB, `bvudiv` by zero sets all the bits, and `bvsdiv` by zero gives -1 for a
+          // non-negative dividend and 1 for a negative one
+          if (bi2 != 0) BVLiteral(sig1, bi1 / bi2, s1)
+          else if (!sig1) BVLiteral(false, BigInt(2).pow(s1) - 1, s1)
+          else BVLiteral(true, if (bi1 >= 0) -1 else 1, s1)
         case (IntegerLiteral(i1), IntegerLiteral(i2)) =>
-          if(i2 != BigInt(0)) IntegerLiteral(i1 / i2) else throw RuntimeError("Division by 0.")
+          // SMT-LIB's euclidean division, and leaves division by zero unspecified
+          if(i2 != BigInt(0)) IntegerLiteral(utils.euclideanDivision(i1, i2)) else throw RuntimeError("Division by 0.")
         case (FractionLiteral(ln, ld), FractionLiteral(rn, rd)) =>
           if (rn != 0)
             normalizeFraction(FractionLiteral(ln * rd, ld * rn))
@@ -302,24 +368,25 @@ abstract class RecursiveEvaluator(override val program: Program,
     case Remainder(l,r) =>
       (e(l), e(r)) match {
         case (b1 @ BVLiteral(sig1, _, s1), b2 @ BVLiteral(sig2, _, s2)) if sig1 == sig2 && s1 == s2 =>
+          // As in SMT-LIB, the remainder of a division by zero is the dividend
           val bi2 = b2.toBigInt
-          if (bi2 != 0) BVLiteral(sig1, b1.toBigInt % bi2, s1) else throw RuntimeError("Division by 0.")
+          if (bi2 != 0) BVLiteral(sig1, b1.toBigInt % bi2, s1) else b1
         case (IntegerLiteral(i1), IntegerLiteral(i2)) =>
-          if(i2 != BigInt(0)) IntegerLiteral(i1 % i2) else throw RuntimeError("Remainder of division by 0.")
+          // the remainder of the euclidean division, which is SMT-LIB's `mod`
+          if(i2 != BigInt(0)) IntegerLiteral(i1 mod i2.abs) else throw RuntimeError("Remainder of division by 0.")
         case (le,re) => throw EvalError("Unexpected operation: (" + le.asString + ") rem (" + re.asString + ")")
       }
 
     case Modulo(l,r) =>
       (e(l), e(r)) match {
         case (b1 @ BVLiteral(sig1, _, s1), b2 @ BVLiteral(sig2, _, s2)) if sig1 == sig2 && s1 == s2 =>
+          // SMT-LIB's `bvsmod` (or `bvurem`): the result has the sign of the divisor, and the modulo by zero
+          // is the dividend
           val bi2 = b2.toBigInt
-          if (bi2 < 0) {
-            assert(sig1, "Only signed bitvectors can contain negative values.")
-            BVLiteral(true, b1.toBigInt mod (-bi2), s1)
-          } else if (bi2 != 0) {
-            BVLiteral(sig1, b1.toBigInt mod bi2, s1)
-          } else {
-            throw RuntimeError("Modulo of division by 0.")
+          if (bi2 == 0) b1
+          else {
+            val r = b1.toBigInt mod bi2.abs
+            BVLiteral(sig1, if (bi2 < 0 && r != 0) r + bi2 else r, s1)
           }
         case (IntegerLiteral(i1), IntegerLiteral(i2)) =>
           if(i2 < 0)
@@ -385,20 +452,21 @@ abstract class RecursiveEvaluator(override val program: Program,
   protected def eStrings(expr: Expr)(using rctx: RC, gctx: GC): Expr = expr match {
     case StringConcat(l, r) =>
       (e(l), e(r)) match {
-        case (StringLiteral(i1), StringLiteral(i2)) => StringLiteral(i1 + i2)
+        case (i1: StringLiteral, i2: StringLiteral) => StringLiteral(i1.value ++ i2.value)
         case (le,re) => throw EvalError(typeErrorMsg(le, StringType()))
       }
 
     case StringLength(a) => e(a) match {
-      case StringLiteral(a) => IntegerLiteral(a.length)
+      case a: StringLiteral => IntegerLiteral(a.value.length)
       case res => throw EvalError(typeErrorMsg(res, Int32Type()))
     }
 
     case SubString(a, start, end) => (e(a), e(start), e(end)) match {
       // Like SMT-LIB's str.substr, out of bounds indices give an empty or truncated string
-      case (StringLiteral(a), IntegerLiteral(b), IntegerLiteral(c))  =>
-        if (b < 0 || b >= a.length || c <= b) StringLiteral("")
-        else StringLiteral(a.substring(b.toInt, (c min a.length).toInt))
+      case (s: StringLiteral, IntegerLiteral(b), IntegerLiteral(c))  =>
+        val a = s.value
+        if (b < 0 || b >= a.length || c <= b) StringLiteral(Seq())
+        else StringLiteral(a.slice(b.toInt, (c min a.length).toInt))
       case res => throw EvalError(typeErrorMsg(res._1, StringType()))
     }
 
@@ -566,17 +634,52 @@ abstract class RecursiveEvaluator(override val program: Program,
         case _ => throw EvalError(f"Unexpected operation: max($lhs, $rhs)")
       }
 
-    case FPRound(RoundNearestTiesToEven, expr) =>
+    case FPRound(rm, expr) if roundingModes.contains(rm) =>
       e(expr) match {
-        case Float64Literal(l) => Float64Literal(Math.rint(l))
-        case _ => throw EvalError(f"Unexpected operation: rint($expr)")
+        case Float32Literal(l) => Float32Literal(roundToIntegral(l.toDouble, rm).toFloat)
+        case Float64Literal(l) => Float64Literal(roundToIntegral(l, rm))
+        case _ => throw EvalError(f"Unexpected operation: round($expr)")
       }
 
     case Sqrt(RoundNearestTiesToEven, expr) =>
       e(expr) match {
+        // The square root of a float, computed in double precision, rounds to the correctly
+        // rounded float square root.
+        case Float32Literal(l) => Float32Literal(Math.sqrt(l.toDouble).toFloat)
         case Float64Literal(l) => Float64Literal(Math.sqrt(l))
         case _ => throw EvalError("Unexpected operation: Math.sqrt(" + expr.asString + ")")
       }
+
+    case FPToBV(size, signed, rm, expr) if roundingModes.contains(rm) =>
+      val d = e(expr) match {
+        case Float32Literal(l) => l.toDouble
+        case Float64Literal(l) => l
+        case _ => throw EvalError("Unexpected operation: fp.to_bv(" + expr.asString + ")")
+      }
+      val r = roundToIntegral(d, rm)
+      // SMT-LIB leaves the conversion of NaN, infinities and out-of-range values unspecified
+      if (r.isNaN || r.isInfinite) throw RuntimeError(s"Unspecified conversion of $d to a bitvector.")
+      val i = BigDecimal(r).toBigInt
+      val (lo, hi) =
+        if (signed) (-BigInt(2).pow(size - 1), BigInt(2).pow(size - 1) - 1)
+        else (BigInt(0), BigInt(2).pow(size) - 1)
+      if (i < lo || i > hi) throw RuntimeError(s"Unspecified conversion of $d to a bitvector of $size bits.")
+      BVLiteral(signed, i, size)
+
+    case FPToReal(expr) =>
+      val d = e(expr) match {
+        case Float32Literal(l) => l.toDouble
+        case Float64Literal(l) => l
+        case _ => throw EvalError("Unexpected operation: fp.to_real(" + expr.asString + ")")
+      }
+      // SMT-LIB leaves the real value of NaN and infinities unspecified
+      if (d.isNaN || d.isInfinite) throw RuntimeError(s"Unspecified conversion of $d to a real.")
+      val exact = new java.math.BigDecimal(d)
+      val unscaled = BigInt(exact.unscaledValue)
+      normalizeFraction(
+        if (exact.scale >= 0) FractionLiteral(unscaled, BigInt(10).pow(exact.scale))
+        else FractionLiteral(unscaled * BigInt(10).pow(-exact.scale), 1)
+      )
 
     case FPFromBinary(11, 53, expr) =>
       e(expr) match {
@@ -586,7 +689,7 @@ abstract class RecursiveEvaluator(override val program: Program,
 
     case FPFromBinary(8, 24, expr) =>
       e(expr) match {
-        case Int32Literal(l)   => Float64Literal(java.lang.Float.intBitsToFloat(l))
+        case Int32Literal(l)   => Float32Literal(java.lang.Float.intBitsToFloat(l))
         case _ => throw EvalError("Unexpected operation:" + expr.asString + ".toBinaryFP")
       }
 
@@ -598,6 +701,8 @@ abstract class RecursiveEvaluator(override val program: Program,
         case Int64Literal(l)   => Float64Literal(l.toDouble)
         case Float32Literal(l) => Float64Literal(l.toDouble)
         case Float64Literal(l) => Float64Literal(l)
+        // `BigInt.toDouble` and `BigInt.toFloat` round to the nearest value, ties to even
+        case bv @ BVLiteral(false, _, _) => Float64Literal(bv.toBigInt.toDouble)
         case _ => throw EvalError("Unexpected operation:" + expr.asString + ".toDouble")
       }
 
@@ -609,6 +714,7 @@ abstract class RecursiveEvaluator(override val program: Program,
         case Int64Literal(l)   => Float32Literal(l.toFloat)
         case Float32Literal(l) => Float32Literal(l)
         case Float64Literal(l) => Float32Literal(l.toFloat)
+        case bv @ BVLiteral(false, _, _) => Float32Literal(bv.toBigInt.toFloat)
         case _ => throw EvalError("Unexpected operation:" + expr.asString + ".toFloat")
       }
 
@@ -666,6 +772,20 @@ abstract class RecursiveEvaluator(override val program: Program,
         case Float32Literal(l) => BooleanLiteral(l > 0f || l.equals(+0.0f))
         case Float64Literal(l) => BooleanLiteral(l > 0d || l.equals(+0.0d))
         case _ => throw EvalError("Unexpected operation: (" + expr.asString + ").isPositive")
+      }
+
+    case FPIsNormal(expr) =>
+      e(expr) match {
+        case Float32Literal(l) => BooleanLiteral(!l.isNaN && !l.isInfinite && Math.abs(l) >= java.lang.Float.MIN_NORMAL)
+        case Float64Literal(l) => BooleanLiteral(!l.isNaN && !l.isInfinite && Math.abs(l) >= java.lang.Double.MIN_NORMAL)
+        case _ => throw EvalError("Unexpected operation: (" + expr.asString + ").isNormal")
+      }
+
+    case FPIsSubnormal(expr) =>
+      e(expr) match {
+        case Float32Literal(l) => BooleanLiteral(l != 0 && Math.abs(l) < java.lang.Float.MIN_NORMAL)
+        case Float64Literal(l) => BooleanLiteral(l != 0 && Math.abs(l) < java.lang.Double.MIN_NORMAL)
+        case _ => throw EvalError("Unexpected operation: (" + expr.asString + ").isSubnormal")
       }
 
     case FPIsNegative(expr) =>

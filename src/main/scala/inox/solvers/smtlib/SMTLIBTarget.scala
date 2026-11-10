@@ -45,6 +45,9 @@ trait SMTLIBTarget extends SMTLIBParser with Interruptible with ADTManagers {
 
   protected val interpreter: Interpreter
 
+  /** Emits the commands that set the solver up, again after each reset. */
+  protected def initialize(): Unit = ()
+
   protected val semantics: program.Semantics
   given givenSemantics: semantics.type = semantics
 
@@ -426,44 +429,20 @@ trait SMTLIBTarget extends SMTLIBParser with Interruptible with ADTManagers {
     case Division(a, b)  => a.getType match {
       case BVType(true, _) => FixedSizeBitVectors.SDiv(toSMT(a), toSMT(b))
       case BVType(false, _) => FixedSizeBitVectors.UDiv(toSMT(a), toSMT(b))
-      case IntegerType() =>
-        val ar = toSMT(a)
-        val br = toSMT(b)
-        Core.ITE(
-          Ints.GreaterEquals(ar, Ints.NumeralLit(0)),
-          Ints.Div(ar, br),
-          Ints.Neg(Ints.Div(Ints.Neg(ar), br))
-        )
+      case IntegerType() => Ints.Div(toSMT(a), toSMT(b))
       case RealType() => Reals.Div(toSMT(a), toSMT(b))
     }
 
     case Remainder(a, b) => a.getType match {
       case BVType(true, _) => FixedSizeBitVectors.SRem(toSMT(a), toSMT(b))
       case BVType(false, _) => FixedSizeBitVectors.URem(toSMT(a), toSMT(b))
-      case IntegerType() =>
-        val q = toSMT(Division(a, b))
-        Ints.Sub(toSMT(a), Ints.Mul(toSMT(b), q))
+      // the remainder of the euclidean division
+      case IntegerType() => Ints.Mod(toSMT(a), toSMT(b))
     }
 
     case Modulo(a, b) => a.getType match {
       case BVType(false, _) => FixedSizeBitVectors.URem(toSMT(a), toSMT(b))
-      case BVType(true, size) => // we want x mod |y|
-        // Note that we cannot compute `bvsmod(x, -y)` when `y < 0` as `-y` overflows
-        // when `y` is the minimal value. Instead, we rely on the sign of `bvsmod(x, y)`
-        // following that of `y` and shift negative results by `|y|`.
-        val br = toSMT(b)
-        val r = freshSym("r")
-        SMTLet(
-          VarBinding(r, FixedSizeBitVectors.SMod(toSMT(a), br)), Seq(),
-          Core.ITE(
-            Core.And(
-              FixedSizeBitVectors.SLessThan(br, toSMT(BVLiteral(true, 0, size))),
-              Core.Not(Core.Equals(r, toSMT(BVLiteral(true, 0, size))))
-            ),
-            FixedSizeBitVectors.Sub(r, br),
-            r
-          )
-        )
+      case BVType(true, _) => FixedSizeBitVectors.SMod(toSMT(a), toSMT(b))
 
       case IntegerType() => Ints.Mod(toSMT(a), toSMT(b))
     }
@@ -540,21 +519,6 @@ trait SMTLIBTarget extends SMTLIBParser with Interruptible with ADTManagers {
     case _ => unhandled
   }
 
-  /** Encodes `a.max(b)` or `a.min(b)` as fp.max or fp.min, which SMT-LIB leaves open for +0.0
-    * and -0.0. These are ordered as the JVM does (and as the evaluator does), with -0.0 below +0.0.
-    */
-  private def fpMinMax(a: Expr, b: Expr, max: Boolean)(using bindings: Map[Identifier, Term]): Term = {
-    val (aSym, bSym) = (id2sym(FreshIdentifier("a", true)), id2sym(FreshIdentifier("b", true)))
-    // Among two zeros, max picks `a` unless it is -0.0, and min picks `a` if it is -0.0.
-    val zeros = if (max) Core.ITE(FloatingPoint.IsNegative(aSym), bSym, aSym)
-                else Core.ITE(FloatingPoint.IsNegative(aSym), aSym, bSym)
-    val op = if (max) FloatingPoint.Max(aSym, bSym) else FloatingPoint.Min(aSym, bSym)
-    SMTLet(
-      VarBinding(aSym, toSMT(a)), Seq(VarBinding(bSym, toSMT(b))),
-      Core.ITE(Core.And(FloatingPoint.IsZero(aSym), FloatingPoint.IsZero(bSym)), zeros, op)
-    )
-  }
-
   protected def toSMTFloatingPoint(e: Expr)(using bindings: Map[Identifier, Term]): Term = e match {
     case FPLiteral(e, s, bits) =>
       val size = e + s
@@ -573,10 +537,13 @@ trait SMTLIBTarget extends SMTLIBParser with Interruptible with ADTManagers {
     case FPFMA(rm, e1, e2, e3) => FloatingPoint.FMA(toSMT(rm), toSMT(e1), toSMT(e2), toSMT(e3))
     case FPAbs(e)        => FloatingPoint.Abs(toSMT(e))
     case Sqrt(rm, e)     => FloatingPoint.Sqrt(toSMT(rm), toSMT(e))
-    case FPMax(a, b) => fpMinMax(a, b, max = true)
-    case FPMin(a, b) => fpMinMax(a, b, max = false)
+    case FPMax(a, b) => FloatingPoint.Max(toSMT(a), toSMT(b))
+    case FPMin(a, b) => FloatingPoint.Min(toSMT(a), toSMT(b))
     case FPRound(rm, e) => FloatingPoint.RoundToIntegral(toSMT(rm), toSMT(e))
-    case FPCast(ne, ns, rm, e) => FloatingPoint.ToFP(ne, ns, toSMT(rm), toSMT(e))
+    case FPCast(ne, ns, rm, e) => e.getType match {
+      case BVType(false, _) => FloatingPoint.ToFPUnsigned(ne, ns, toSMT(rm), toSMT(e))
+      case _ => FloatingPoint.ToFP(ne, ns, toSMT(rm), toSMT(e))
+    }
     case FPFromBinary(ne, ns, e) => FloatingPoint.ToFP(ne, ns, toSMT(e))
     case FPToBV(s, signed, rm, e) =>
       if (signed) {
@@ -585,23 +552,6 @@ trait SMTLIBTarget extends SMTLIBParser with Interruptible with ADTManagers {
       else {
         FloatingPoint.ToUnsignedBitVector(s, toSMT(rm), toSMT(e))
       }
-    case FPToBVJVM(eb, sb, toSize, e) =>
-      toSize match
-        case 8 => toSMT(BVNarrowingCast(FPToBVJVM(eb, sb, 32, e), Int8Type()))
-        case 16 => toSMT(BVNarrowingCast(FPToBVJVM(eb, sb, 32, e), Int16Type()))
-        case s @ (32 | 64) =>
-          val (maxVal, minVal, zero) = s match
-            case 32 => (Int32Literal(Int.MaxValue), Int32Literal(Int.MinValue), Int32Literal(0))
-            case 64 => (Int64Literal(Long.MaxValue), Int64Literal(Long.MinValue), Int64Literal(0))
-
-          val isLarge = FPGreaterThan(e, FPCast(eb, sb, RoundTowardZero, maxVal))
-          val isSmall = FPLessThan(e, FPCast(eb, sb, RoundTowardZero, minVal))
-          toSMT(IfExpr(FPIsNaN(e), zero,
-            IfExpr(isLarge, maxVal,
-              IfExpr(isSmall, minVal,
-                FPToBV(s, true, RoundTowardZero, e)))))
-
-
     case FPToReal(e) => FloatingPoint.ToReal(toSMT(e))
     case FPLessThan(a, b) => FloatingPoint.LessThan(toSMT(a), toSMT(b))
     case FPLessEquals(a, b) => FloatingPoint.LessEquals(toSMT(a), toSMT(b))
@@ -625,10 +575,14 @@ trait SMTLIBTarget extends SMTLIBParser with Interruptible with ADTManagers {
   }
 
   // FIXME: replace by Seq(BV(16)) once solvers can handle them
+  /** The largest character of strings (see [[optStringsBMP]]). */
+  protected lazy val maxStringChar: Int = solvers.maxStringChar(options)
+
   protected def toSMTStrings(e: Expr)(using bindings: Map[Identifier, Term]): Term = e match {
-    case StringLiteral(v) =>
+    case s: StringLiteral =>
+      if (s.value.exists(_ > maxStringChar)) unsupported(e, "string with characters outside of the alphabet (see --strings-bmp)")
       declareSort(StringType())
-      Strings.StringLit(utils.StringUtils.encode(v))
+      Strings.StringLit(utils.StringUtils.encode(s.value))
 
     case StringLength(a) => Strings.Length(toSMT(a))
     case StringConcat(a, b) => Strings.Concat(toSMT(a), toSMT(b))
@@ -652,6 +606,11 @@ trait SMTLIBTarget extends SMTLIBParser with Interruptible with ADTManagers {
     def withVariable(sym: SSymbol, expr: Expr): Context = new Context(vars + (sym -> expr), smtVars, functions, seen, chooses, lambdas)
     def withSMTVariable(sym: SSymbol, term: Term): Context = new Context(vars, smtVars + (sym -> term), functions, seen, chooses, lambdas)
     def withSMTVariables(bindings: Seq[(SSymbol, Term)]): Context = bindings.foldLeft(this)((ctx, p) => ctx.withSMTVariable(p._1, p._2))
+
+    /** The context in which the body of a model definition is read: its parameters are bound to
+      * `args`, and the let-bindings of the caller are out of scope. */
+    def withArguments(params: Seq[SSymbol], args: Seq[Expr]): Context =
+      new Context(vars ++ (params zip args), Map(), functions, seen, chooses, lambdas)
 
     def getFunction(sym: SSymbol, ft: FunctionType): Option[Lambda] = functions.get(sym).map {
       case df @ DefineFun(SMTFunDef(a, args, _, body)) =>
@@ -677,6 +636,15 @@ trait SMTLIBTarget extends SMTLIBParser with Interruptible with ADTManagers {
       case FunctionApplication(f, Seq(SNumeral(n))) if f.toString == "-" => Some(-n)
       case _ => None
     }
+  }
+
+  private def fromModelFunction(s: SSymbol, args: Seq[Term], otpe: Option[Type])(using context: Context): Expr = {
+    val tfd = functions.toA(s)
+    val DefineFun(SMTFunDef(_, params, _, body)) = context.functions(s)
+    if (params.size != args.size || tfd.params.size != args.size)
+      throw new MissformedSMTException(body, s"Unexpected number of arguments for ${tfd.id}")
+    val vargs = (args zip tfd.params.map(_.getType)).map(fromSMT)
+    fromSMT(body, otpe orElse Some(tfd.getType))(using context.withArguments(params.map(_.name), vargs))
   }
 
   /* Translate an SMTLIB term back to a Inox Expr */
@@ -714,12 +682,13 @@ trait SMTLIBTarget extends SMTLIBParser with Interruptible with ADTManagers {
           value.bigDecimal.movePointRight(value.scale).toBigInteger.negate,
           BigInt(10).pow(value.scale)))
 
-      // Characters outside of the BMP don't correspond to any Inox character. They can only
-      // appear in models of solvers whose alphabet can't be restricted to the BMP (CVC4).
+      // Under `--strings-bmp`, characters outside of the BMP can only appear in models of solvers whose
+      // alphabet can't be restricted to the BMP (CVC4).
       case (SString(v), _) =>
-        utils.StringUtils.decodeBMP(v).map(StringLiteral(_)).getOrElse {
-          throw new Unsupported(s"Can't decode string \"$v\" with characters outside of the BMP")
-        }
+        val cps = utils.StringUtils.decode(v)
+        if (cps.exists(_ > maxStringChar))
+          throw new Unsupported(s"Can't decode string \"$v\" with characters outside of the alphabet (see --strings-bmp)")
+        StringLiteral(cps)
 
       case (Num(n), Some(ft: FunctionType)) if context.seen(n -> ft) =>
         context.chooses.getOrElse(n -> ft, {
@@ -803,6 +772,14 @@ trait SMTLIBTarget extends SMTLIBParser with Interruptible with ADTManagers {
           case t =>
             unsupported(t, "Woot? structural type that is non-structural")
         }
+
+      // A model definition can call the functions of the model, whose definitions we inline
+      // (cvc5 does this, see epfl-lara/stainless#1549).
+      case (SimpleSymbol(s), _) if functions.containsB(s) && context.functions.contains(s) =>
+        fromModelFunction(s, Seq.empty, otpe)
+
+      case (FunctionApplication(SimpleSymbol(s), args), _) if functions.containsB(s) && context.functions.contains(s) =>
+        fromModelFunction(s, args, otpe)
 
       // @nv and @jad: hack to extract values with let-bindings from Z3 models
       case (QualifiedIdentifier(SimpleIdentifier(sym), None), _) if context.smtVars contains sym =>

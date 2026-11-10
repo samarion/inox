@@ -231,24 +231,16 @@ class EvaluatorSuite extends AnyFunSuite {
     eval(e, Times(IntegerLiteral(2), IntegerLiteral(3))) === IntegerLiteral(6)
   }
 
-  test("BigInt Modulo and Remainder") {
+  test("BigInt Division and Modulo") {
     val e = evaluator(ctx)
 
-    eval(e, Division(IntegerLiteral(10), IntegerLiteral(3)))   === IntegerLiteral(3)
-    eval(e, Remainder(IntegerLiteral(10), IntegerLiteral(3)))  === IntegerLiteral(1)
-    eval(e, Modulo(IntegerLiteral(10), IntegerLiteral(3)))     === IntegerLiteral(1)
-
-    eval(e, Division(IntegerLiteral(-1), IntegerLiteral(3)))   === IntegerLiteral(0)
-    eval(e, Remainder(IntegerLiteral(-1), IntegerLiteral(3)))  === IntegerLiteral(-1)
-    eval(e, Modulo(IntegerLiteral(-1), IntegerLiteral(3)))     === IntegerLiteral(2)
-
-    eval(e, Division(IntegerLiteral(-1), IntegerLiteral(-3)))  === IntegerLiteral(0)
-    eval(e, Remainder(IntegerLiteral(-1), IntegerLiteral(-3))) === IntegerLiteral(-1)
-    eval(e, Modulo(IntegerLiteral(-1), IntegerLiteral(-3)))    === IntegerLiteral(2)
-
-    eval(e, Division(IntegerLiteral(1), IntegerLiteral(-3)))   === IntegerLiteral(0)
-    eval(e, Remainder(IntegerLiteral(1), IntegerLiteral(-3)))  === IntegerLiteral(1)
-    eval(e, Modulo(IntegerLiteral(1), IntegerLiteral(-3)))     === IntegerLiteral(1)
+    // SMT-LIB's euclidean `div` and `mod`, and the remainder of the euclidean division, on the operands
+    // where they agree with the JVM's semantics (see RecursiveEvaluatorSuite for the others)
+    for ((x, y, q, r) <- Seq((10, 3, 3, 1), (1, -3, 0, 1), (6, -3, -2, 0))) {
+      eval(e, Division(IntegerLiteral(x), IntegerLiteral(y)))  === IntegerLiteral(q)
+      eval(e, Remainder(IntegerLiteral(x), IntegerLiteral(y))) === IntegerLiteral(r)
+      eval(e, Modulo(IntegerLiteral(x), IntegerLiteral(y)))    === IntegerLiteral(r)
+    }
   }
 
   test("BigInt Comparisons") {
@@ -331,11 +323,9 @@ class EvaluatorSuite extends AnyFunSuite {
 
     eval(e, Division(Int32Literal(-1), Int32Literal(-3)))   === Int32Literal(0)
     eval(e, Remainder(Int32Literal(-1), Int32Literal(-3)))  === Int32Literal(-1)
-    eval(e, Modulo(Int32Literal(-1), Int32Literal(-3)))     === Int32Literal(2)
 
     eval(e, Division(Int32Literal(1), Int32Literal(-3)))    === Int32Literal(0)
     eval(e, Remainder(Int32Literal(1), Int32Literal(-3)))   === Int32Literal(1)
-    eval(e, Modulo(Int32Literal(1), Int32Literal(-3)))      === Int32Literal(1)
 
     eval(e, Division(Int8Literal(1), Int8Literal(-3)))      === Int8Literal(0)
     eval(e, Remainder(Int8Literal(1), Int8Literal(-3)))     === Int8Literal(1)
@@ -710,6 +700,54 @@ class EvaluatorSuite extends AnyFunSuite {
     ), Seq(StringLiteral("Mikael")))
 
     eval(e, Equals(body, StringLiteral("Winner:Mikael"))) === BooleanLiteral(true)
+  }
+
+  test("Function equality") {
+    import solvers.unrolling.{optFunctionEquality, FunctionEquality}
+    // uses the recursive evaluator directly, as subclasses of this suite test other evaluators
+    // (eg. Stainless's code generator) that don't implement these semantics
+    def recursive(semantics: FunctionEquality) = RecursiveEvaluator(program, ctx.withOpts(optFunctionEquality(semantics)))
+
+    def lambda(body: Expr => Expr): Lambda = {
+      val x = ValDef.fresh("x", IntegerType())
+      Lambda(Seq(x), body(x.toVariable))
+    }
+    def int(i: Int) = IntegerLiteral(i)
+
+    val succ = lambda(x => Plus(x, int(1)))
+    val succ2 = lambda(x => Plus(int(1), x))
+    val pred = lambda(x => Minus(x, int(1)))
+    val id = lambda(x => x)
+    val alsoId = lambda(x => IfExpr(Equals(x, int(0)), int(0), x))
+    // the shape of extracted models: the inputs that tell functions apart appear in their bodies
+    val model1 = lambda(x => IfExpr(Equals(x, int(2)), int(5), int(0)))
+    val model2 = lambda(x => IfExpr(Equals(x, int(2)), int(6), int(0)))
+
+    val intensional = recursive(FunctionEquality.Intensional)
+    eval(intensional, Equals(succ, succ))   === BooleanLiteral(true)
+    eval(intensional, Equals(succ, succ2))  === BooleanLiteral(false)
+    eval(intensional, Equals(id, alsoId))   === BooleanLiteral(false)
+    eval(intensional, Equals(model1, model2)) === BooleanLiteral(false)
+
+    val extensional = recursive(FunctionEquality.Extensional)
+    eval(extensional, Equals(succ, succ))     === BooleanLiteral(true)
+    eval(extensional, Equals(succ, pred))     === BooleanLiteral(false)
+    eval(extensional, Equals(model1, model2)) === BooleanLiteral(false)
+    eval(extensional, Equals(Tuple(Seq(succ, int(1))), Tuple(Seq(pred, int(1))))) === BooleanLiteral(false)
+    eval(extensional, Equals(Tuple(Seq(succ, int(1))), Tuple(Seq(succ, int(2))))) === BooleanLiteral(false)
+    eval(extensional, Equals(Tuple(Seq(succ, int(1))), Tuple(Seq(succ, int(1))))) === BooleanLiteral(true)
+    // functions that agree on every candidate input can't be told apart
+    eval(extensional, Equals(succ, succ2)).failed
+    eval(extensional, Equals(id, alsoId)).failed
+
+    // without function equality, functions can't be compared at all
+    val none = recursive(FunctionEquality.None)
+    eval(none, Equals(succ, succ)).failed
+    eval(none, Equals(succ, pred)).failed
+    eval(none, Equals(Tuple(Seq(succ, int(1))), Tuple(Seq(succ, int(1))))).failed
+    // but values that hold functions can differ elsewhere
+    eval(none, Equals(Tuple(Seq(int(1), succ)), Tuple(Seq(int(2), succ)))) === BooleanLiteral(false)
+    eval(none, Equals(Tuple(Seq(int(1), int(2))), Tuple(Seq(int(1), int(2))))) === BooleanLiteral(true)
   }
 
   abstract class EvalDSL {

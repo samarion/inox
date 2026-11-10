@@ -43,6 +43,8 @@ enum Feature {
   case Quantifiers
   /** Type parameters, encoded as uninterpreted sorts. */
   case TypeParameters
+  /** Forgetting every constraint with `reset`. */
+  case Reset
 }
 
 object SolverTestSuite {
@@ -50,8 +52,8 @@ object SolverTestSuite {
 
   /** A solver checked by the solver suites, with the features it doesn't support, the tests it
     * fails because of known bugs (test name -> reason), and the tests whose checks it only passes
-    * on ground expressions (see [[SolverTestSuite.check]]), and how many variable-form checks it
-    * solves in one query.
+    * on ground expressions (see [[SolverTestSuite.check]]), and how many checks it solves in one
+    * query.
     */
   case class SolverInfo(
     name: String,
@@ -59,7 +61,7 @@ object SolverTestSuite {
     unsupported: Set[Feature],
     knownIssues: Map[String, String] = Map.empty,
     groundOnly: Map[String, String] = Map.empty,
-    symbolicBatchSize: Int = 8
+    batchSize: Int = 8
   ) {
     def supports(features: Seq[Feature]): Boolean = features.forall(f => !unsupported(f))
   }
@@ -78,46 +80,35 @@ object SolverTestSuite {
     */
   val solvers: Seq[SolverInfo] = Seq(
     SolverInfo("nativez3", () => SolverFactory.hasNativeZ3,
-      Set(BitVectorIntConversions, FloatingPoint),
-      knownIssues = Map(
-        "Function calls across push and pop" -> "returns Unknown once functions unfolded before a pop are called again",
-      ),
+      Set(BitVectorIntConversions, FloatingPoint, Reset),
       groundOnly = Map("Bag Operations" -> z3BagUnionModels)),
     SolverInfo("unrollz3", () => SolverFactory.hasNativeZ3,
-      Set(BitVectorIntConversions, FloatingPoint),
+      Set(BitVectorIntConversions, FloatingPoint, Reset),
       groundOnly = Map("Bag Operations" -> z3BagUnionModels)),
     SolverInfo("smt-z3", () => SolverFactory.hasZ3,
       Set(),
-      knownIssues = Map("Reset" -> "reset() also drops the declarations and options set up when the solver starts"),
       groundOnly = Map("Bag Operations" -> z3BagUnionModels)),
     SolverInfo("smt-cvc4", () => SolverFactory.hasCVC4,
       Set(FloatingPoint, BagAlgebra, NestedArrays),
-      knownIssues = Map("Reset" -> "reset() also drops the declarations and options set up when the solver starts"),
       groundOnly = cvcGroundOnly),
     SolverInfo("smt-cvc5", () => SolverFactory.hasCVC5,
       Set(BagAlgebra, NestedArrays),
-      knownIssues = Map("Reset" -> "reset() also drops the declarations and options set up when the solver starts"),
       groundOnly = cvcGroundOnly),
     SolverInfo("smt-bitwuzla", () => SolverFactory.hasBitwuzla,
       Set(Integers, Reals, BitVectorIntConversions, Strings, Sets, Bags, BagAlgebra, Maps, NestedArrays, ADTs,
-        Quantifiers, TypeParameters),
-      knownIssues = Map(
-        "Reset" -> "reset() also drops the declarations and options set up when the solver starts",
-        "Model extraction of Char" -> "returns Unknown for characters",
-      )),
+        Quantifiers, TypeParameters, Reset)),
     SolverInfo("princess", () => true,
-      Set(BitVectors, FloatingPoint, Sets, BagAlgebra, Maps, NestedArrays),
+      Set(BitVectors, FloatingPoint, Sets, BagAlgebra, Maps, NestedArrays, Reset),
       // Times out on conjunctions of string checks that it solves quickly one by one
-      symbolicBatchSize = 1,
+      batchSize = 1,
       groundOnly = Map(
-        "BigInt Division, Modulo and Remainder" -> "throws on division by a variable, which Presburger arithmetic lacks",
+        "BigInt Division and Modulo" -> "throws on division by a variable, which Presburger arithmetic lacks",
       ),
       knownIssues = Map(
         "Simple Bag Operations" -> "struggles with bit-vector keys in bags, as in sets and maps",
         "Bag with several multiplicities" -> "returns Unknown after about two minutes",
         "Function returning bags" -> "crashes (None.get) extracting a function whose results are bags",
         "Function call over bit-vectors" -> "hangs on function calls over bit-vectors",
-        "Function calls across push and pop" -> "crashes once functions unfolded before a pop are called again",
       )),
   )
 
@@ -162,34 +153,53 @@ trait SolverTestSuite extends AnyFunSuite with org.scalatest.ParallelTestExecuti
     * it. Ground expressions are mostly evaluated by the simplifier before they reach the solver,
     * so only the second form checks how the solver encodes and evaluates each operation.
     *
-    * The second form is checked when the test ends, together with the test's other checks: one
-    * query per [[SolverInfo.symbolicBatchSize]] checks instead of one per check keeps the suites fast.
+    * Both forms are checked when the test ends, together with the test's other checks: one query
+    * per [[SolverInfo.batchSize]] checks instead of one per check keeps the suites fast.
+    *
+    * `e` must also evaluate to `expected` with the recursive evaluator when it has no free
+    * variables, so that the evaluator and the solvers agree, and survive a round trip through the
+    * serializer.
     */
   protected def check(s: SimpleSolverAPI { val program: InoxProgram }, e: Expr, expected: Expr): Unit = {
-    val v = Variable.fresh("v", e.getType(using symbols))
-    s.solveSAT(Equals(v, e)) match {
-      case SatWithModel(model) =>
-        assert(model.vars.get(v.toVal) == Some(expected), s"for '$e'")
-      case got => fail(s"Solving of '$e' failed with $got.")
+    // Expressions with free variables, such as the encoding of FPToBinary, have no value to evaluate to
+    if (exprOps.variablesOf(e).isEmpty) {
+      evaluator.eval(e) match {
+        case evaluators.EvaluationResults.Successful(value) =>
+          assert(value == expected, s"for '$e' with the evaluator")
+        case got => fail(s"Evaluation of '$e' failed with $got.")
+      }
     }
+
+    assert(serializer.deserialize[Expr](serializer.serialize(e)) == e, s"for '$e' after serialization")
+
+    val tpe = e.getType(using symbols)
+    solveLater(s, PendingCheck(Variable.fresh("v", tpe), e, Map.empty, expected))
 
     val (symbolic, literals) = liftLiterals(e)
     if (literals.nonEmpty && !groundOnly.value) {
-      val c = SymbolicCheck(v, symbolic, literals, expected)
-      pendingChecks.value match {
-        case Some(pending) => pending += s -> c
-        case None => checkSymbolic(s, Seq(c))
-      }
+      solveLater(s, PendingCheck(Variable.fresh("v", tpe), symbolic, literals, expected))
     }
   }
 
-  private case class SymbolicCheck(v: Variable, symbolic: Expr, literals: Map[Expr, Variable], expected: Expr) {
-    def constraint: Expr = andJoin(literals.toSeq.map { case (lit, x) => Equals(x, lit) } :+ Equals(v, symbolic))
-    def description: String = s"'$symbolic' where ${literals.map { case (l, x) => s"$x = $l" }.mkString(", ")}"
+  /** A check that `e`, where each variable of `literals` equals its literal, has the value `expected`. */
+  private case class PendingCheck(v: Variable, e: Expr, literals: Map[Expr, Variable], expected: Expr) {
+    def constraint: Expr = andJoin(literals.toSeq.map { case (lit, x) => Equals(x, lit) } :+ Equals(v, e))
+    def description: String =
+      if (literals.isEmpty) s"'$e'"
+      else s"'$e' where ${literals.map { case (l, x) => s"$x = $l" }.mkString(", ")}"
   }
 
+  private lazy val evaluator = program.getEvaluator(TestContext.empty)
+  private lazy val serializer = utils.Serializer(inox.trees)
+
+  private def solveLater(s: SimpleSolverAPI { val program: InoxProgram }, c: PendingCheck): Unit =
+    pendingChecks.value match {
+      case Some(pending) => pending += s -> c
+      case None => solveChecks(s, Seq(c))
+    }
+
   /** Solves `checks` in one query, and each check on its own when that query fails to pinpoint it. */
-  private def checkSymbolic(s: SimpleSolverAPI { val program: InoxProgram }, checks: Seq[SymbolicCheck]): Unit = {
+  private def solveChecks(s: SimpleSolverAPI { val program: InoxProgram }, checks: Seq[PendingCheck]): Unit = {
     s.solveSAT(andJoin(checks.map(_.constraint))) match {
       case SatWithModel(model) =>
         for (c <- checks) {
@@ -198,20 +208,20 @@ trait SolverTestSuite extends AnyFunSuite with org.scalatest.ParallelTestExecuti
       case got if checks.size == 1 =>
         fail(s"Solving of ${checks.head.description} failed with $got.")
       case _ =>
-        checks.foreach(c => checkSymbolic(s, Seq(c)))
+        checks.foreach(c => solveChecks(s, Seq(c)))
     }
   }
 
-  /** The variable-form checks of the running test that remain to be solved. */
+  /** The checks of the running test that remain to be solved. */
   private val pendingChecks =
-    new scala.util.DynamicVariable[Option[scala.collection.mutable.ArrayBuffer[(SimpleSolverAPI { val program: InoxProgram }, SymbolicCheck)]]](None)
+    new scala.util.DynamicVariable[Option[scala.collection.mutable.ArrayBuffer[(SimpleSolverAPI { val program: InoxProgram }, PendingCheck)]]](None)
 
-  /** Runs `body`, then solves the variable-form checks it made. */
-  private def withSymbolicChecks(batchSize: Int)(body: => Unit): Unit = {
-    val pending = scala.collection.mutable.ArrayBuffer.empty[(SimpleSolverAPI { val program: InoxProgram }, SymbolicCheck)]
+  /** Runs `body`, then solves the checks it made. */
+  private def withBatchedChecks(batchSize: Int)(body: => Unit): Unit = {
+    val pending = scala.collection.mutable.ArrayBuffer.empty[(SimpleSolverAPI { val program: InoxProgram }, PendingCheck)]
     pendingChecks.withValue(Some(pending))(body)
     for ((s, checks) <- pending.groupBy(_._1); batch <- checks.map(_._2).grouped(batchSize)) {
-      checkSymbolic(s, batch.toSeq)
+      solveChecks(s, batch.toSeq)
     }
   }
 
@@ -242,21 +252,28 @@ trait SolverTestSuite extends AnyFunSuite with org.scalatest.ParallelTestExecuti
     TestContext(Options(options :+ optSelectedSolvers(Set(solver))))
 
   /** Registers `body` once per solver that supports all of `requires`. */
-  protected def test(name: String, requires: Feature*)(body: Context => Unit): Unit = {
+  protected def test(name: String, requires: Feature*)(body: Context => Unit): Unit =
+    register(name, solverInfos.filter(_.supports(requires)))(body)
+
+  /** Registers `body` once per solver that does not support `feature`. */
+  protected def testWithout(name: String, feature: Feature)(body: Context => Unit): Unit =
+    register(name, solverInfos.filterNot(_.supports(Seq(feature))))(body)
+
+  private def register(name: String, infos: Seq[SolverInfo])(body: Context => Unit): Unit = {
     // Workaround for a compiler crash caused by calling super.test
     def superTest(self: AnyFunSuite, name: String)(body: => Unit): Unit = self.test(name)(body)
     def superIgnore(self: AnyFunSuite, name: String)(body: => Unit): Unit = self.ignore(name)(body)
 
-    for (info <- solverInfos if info.supports(requires)) {
+    for (info <- infos) {
       val testName = s"$name solver=${info.name}"
       if (info.knownIssues.contains(name)) {
         superIgnore(this, s"$testName (known issue: ${info.knownIssues(name)})")(())
       } else if (info.available() && info.groundOnly.contains(name)) {
         superTest(this, s"$testName (ground checks only: ${info.groundOnly(name)})") {
-          groundOnly.withValue(true)(body(contextFor(info.name)))
+          groundOnly.withValue(true)(withBatchedChecks(info.batchSize)(body(contextFor(info.name))))
         }
       } else if (info.available()) {
-        superTest(this, testName)(withSymbolicChecks(info.symbolicBatchSize)(body(contextFor(info.name))))
+        superTest(this, testName)(withBatchedChecks(info.batchSize)(body(contextFor(info.name))))
       } else if (requiredSolvers(info.name)) {
         superTest(this, testName)(fail(s"Solver ${info.name} is required but isn't available"))
       } else {

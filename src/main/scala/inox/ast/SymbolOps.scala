@@ -11,6 +11,13 @@ import transformers._
 import scala.collection.mutable.{Map => MutableMap, Set => MutableSet}
 
 object SymbolOps {
+  /** Whether `simplestValue` may run a solver to find a value of a sort with an invariant.
+    *
+    * It is turned off in the context of that solver, so that extracting its model doesn't start
+    * another solver, and so on without end.
+    */
+  private object optSimplestValueSolver extends FlagOptionDef("simplest-value-solver", true)
+
   private val identifiers = new scala.collection.mutable.ArrayBuffer[Identifier]
   def getId(index: Int): Identifier = synchronized {
     for (i <- identifiers.size to index) identifiers += FreshIdentifier("x", true)
@@ -403,8 +410,11 @@ trait SymbolOps extends TypeOps { self =>
         (tvs & allBoundVars).isEmpty && (unconditional || (pathFreeVars & allBoundVars).isEmpty)
       }
 
-      def containsChoose(e: Expr): Boolean =
-        exists { case _: Choose | _: Error => true case _ => false } (e)
+      def containsChoose(e: Expr): Boolean = exists {
+        case _: Choose | _: Error => true
+        case fi: FunctionInvocation => fi.tfd.fd.flags contains ModelFunction
+        case _ => false
+      } (e)
 
       def containsRecursive(e: Expr): Boolean =
         exists { case fi: FunctionInvocation => fi.tfd.fd.isRecursive case _ => false } (e)
@@ -414,7 +424,7 @@ trait SymbolOps extends TypeOps { self =>
           // The set of minimal conditions that must be met for an expression to be liftable
           val minimal =
             (isSimple(e) || !onlySimple)           && // check whether we want only simple expression
-            !containsChoose(e)                     && // expressions containing chooses or errors can't be lifted
+            !containsChoose(e)                     && // expressions containing chooses, errors or model calls can't be lifted
             (!inFunction || !containsRecursive(e))    // recursive functions can't be lifted from lambdas
 
           // Whether the expression is guaranteed to be called, typically in foralls
@@ -979,7 +989,7 @@ trait SymbolOps extends TypeOps { self =>
   /** Returns simplest value of a given type */
   protected def simplestValue(tpe: Type, seen: Set[Type], allowSolver: Boolean, inLambda: Boolean)
                              (using sem: symbols.Semantics, ctx: Context): Expr = tpe match {
-    case StringType()               => StringLiteral("")
+    case StringType()               => StringLiteral(Seq())
     case BVType(signed, size)       => BVLiteral(signed, 0, size)
     case FPType(exponent, significand) => FPLiteral.plusZero(exponent, significand)
     case RealType()                 => FractionLiteral(0, 1)
@@ -1000,7 +1010,9 @@ trait SymbolOps extends TypeOps { self =>
         if (inLambda) Choose(ValDef.fresh("res", adt), BooleanLiteral(true))
         else throw NoSimpleValue(adt)
       } else if (sort.hasInvariant) {
-        if (!allowSolver) throw NoSimpleValue(adt)
+        if (!allowSolver || !ctx.options.findOptionOrDefault(SymbolOps.optSimplestValueSolver)) {
+          throw NoSimpleValue(adt)
+        }
 
         val p = Variable.fresh("p", FunctionType(Seq(adt), BooleanType()))
         val res = Variable.fresh("v", adt)
@@ -1008,7 +1020,10 @@ trait SymbolOps extends TypeOps { self =>
         import solvers._
         import SolverResponses._
 
-        SimpleSolverAPI(sem.getSolver).solveSAT(Application(p, Seq(res))) match {
+        // Extracting this solver's model may need simplest values, which must not start
+        // another solver, and so on without end.
+        val solverCtx = ctx.withOpts(SymbolOps.optSimplestValueSolver(false))
+        SimpleSolverAPI(sem.getSolver(using solverCtx)).solveSAT(Application(p, Seq(res))) match {
           case SatWithModel(model) => model.vars.getOrElse(res.toVal, throw NoSimpleValue(adt))
           case _ => throw NoSimpleValue(adt)
         }
@@ -1127,7 +1142,7 @@ trait SymbolOps extends TypeOps { self =>
 
   /** Returns true if expr is a value of type t */
   def isValueOfType(e: Expr, t: Type): Boolean = (e, t) match {
-    case (StringLiteral(_), StringType()) => true
+    case (_: StringLiteral, StringType()) => true
     case (BVLiteral(s1, _, s), BVType(s2, t)) => s1 == s2 && s == t
     case (FPLiteral(e, s, v), FPType(e2, s2)) => e == e2 && s == s2
     case (IntegerLiteral(_), IntegerType()) => true

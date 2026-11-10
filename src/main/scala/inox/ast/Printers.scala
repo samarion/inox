@@ -200,7 +200,8 @@ trait Printer {
       case CharLiteral(v) => p"'${StringEscapeUtils.escapeJava(v.toString)}'"
       case BooleanLiteral(v) => p"$v"
       case UnitLiteral() => p"()"
-      case StringLiteral(v) =>
+      case sl: StringLiteral =>
+        val v = sl.toJavaString
         if (v.count(c => c == '\n') >= 1 && v.length >= 80 && v.indexOf("\"\"\"") == -1) {
           p"$dbquote$dbquote$dbquote$v$dbquote$dbquote$dbquote"
         } else {
@@ -358,10 +359,6 @@ trait Printer {
       case ToDouble(e) => p"${rcv(e)}.toDouble"
       case FPCast(eb, sb, _, e) => p"${rcv(e)}.toFP($eb, $sb)"
       case FPFromBinary(eb, sb, e) => p"${rcv(e)}.toBinaryFP($eb, $sb)"
-      case FPToBVJVM(_, _, 8, e)   => p"${rcv(e)}.toByte"
-      case FPToBVJVM(_, _, 16, e)   => p"${rcv(e)}.toShort"
-      case FPToBVJVM(_, _, 32, e)   => p"${rcv(e)}.toInt"
-      case FPToBVJVM(_, _, 64, e)   => p"${rcv(e)}.toLong"
       case FPToBV(size, true, _, e)   => p"${rcv(e)}.toSBV($size)"
       case FPToBV(size, false, _, e)   => p"${rcv(e)}.toUBV($size)"
       case FPToReal(e)      => p"${rcv(e)}.toReal"

@@ -132,6 +132,14 @@ trait Definitions { self: Trees =>
 
     given givenSymbols: symbols.type = symbols
 
+    /** Identifies this symbol table in the type caches of the trees (see `CachingTyped`).
+      *
+      * A tree caches its type together with this object, and not with the symbol table that the type
+      * was computed with. Otherwise, a tree shared by two programs would keep alive the symbol table
+      * of the last program that typed it, such as the encoded program of a solver that was freed.
+      */
+    private[ast] final val typingKey: AnyRef = new AnyRef
+
     val sorts: Map[Identifier, ADTSort]
     val functions: Map[Identifier, FunDef]
 
@@ -297,6 +305,13 @@ trait Definitions { self: Trees =>
 
   /** Denotes that this adt has an overriden equality relation given by ''id'' */
   sealed case class HasADTEquality(id: Identifier) extends Flag("equality", Seq(id))
+
+  /** Denotes a function that a model defines, such as the body of an extracted function value.
+    *
+    * Calls to it are never lifted out of lambdas: two closures that call different model functions
+    * are different values, even if the functions return the same results.
+    */
+  case object ModelFunction extends Flag("model", Seq.empty)
 
   /** Compiler annotations given in the source code as @annot.
     *

@@ -141,7 +141,7 @@ trait TreeDeconstructor {
         (_, _, _, _, _) => t.BooleanLiteral(b))
     },
     classOf[s.StringLiteral] -> { expr =>
-      val s.StringLiteral(st) = expr: @unchecked
+      val st = expr.asInstanceOf[s.StringLiteral].value
       (NoIdentifiers, NoVariables, NoExpressions, NoTypes, NoFlags,
         (_, _, _, _, _) => t.StringLiteral(st))
     },
@@ -416,11 +416,6 @@ trait TreeDeconstructor {
       val s.FPToBV(size, signed, rm, e) = expr: @unchecked
       (NoIdentifiers, NoVariables, Seq(rm, e), NoTypes, NoFlags,
         (_, _, es, _, _) => t.FPToBV(size, signed, es(0), es(1)))
-    },
-    classOf[s.FPToBVJVM] -> { expr =>
-      val s.FPToBVJVM(eb, sb, size, e) = expr: @unchecked
-      (NoIdentifiers, NoVariables, Seq(e), NoTypes, NoFlags,
-        (_, _, es, _, _) => t.FPToBVJVM(eb, sb, size, es(0)))
     },
     classOf[s.FPToReal] -> { expr =>
       val s.FPToReal(e) = expr: @unchecked
@@ -733,6 +728,8 @@ trait TreeDeconstructor {
   def deconstruct(f: s.Flag): DeconstructedFlag = f match {
     case s.HasADTInvariant(id) =>
       (Seq(id), Seq(), Seq(), (ids, _, _) => t.HasADTInvariant(ids.head))
+    case s.ModelFunction =>
+      (Seq(), Seq(), Seq(), (_, _, _) => t.ModelFunction)
     case s.HasADTEquality(id) =>
       (Seq(id), Seq(), Seq(), (ids, _, _) => t.HasADTEquality(ids.head))
     case s.Annotation(name, args) =>
