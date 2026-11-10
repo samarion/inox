@@ -21,6 +21,18 @@ trait Semantics { self =>
     type S <: solvers.combinators.TimeoutSolver { val program: self.program.type }
   }
 
+  /** Creates the solvers that operate under `model`. Semantics whose solvers can't operate under a
+    * model only accept models without interpretations, and fall back onto
+    * [[createSolver(ctx:inox\.Context)*]]. */
+  protected def createSolver(ctx: Context, model: program.Model): solvers.SolverFactory {
+    val program: self.program.type
+    type S <: solvers.combinators.TimeoutSolver { val program: self.program.type }
+  } = {
+    if (model.chooses.nonEmpty)
+      throw FatalError("These semantics can't solve under a model that interprets functions")
+    createSolver(ctx)
+  }
+
   protected def createEvaluator(ctx: Context): evaluators.DeterministicEvaluator {
     val program: self.program.type
   }
@@ -30,19 +42,17 @@ trait Semantics { self =>
     type S <: solvers.combinators.TimeoutSolver { val program: self.program.type }
   } = solverCache.cached(ctx, createSolver(ctx))
 
+  /** The solvers that operate under `model`, as when an evaluator solves for the foralls and chooses
+    * of an expression that it evaluates in this model. They aren't cached, since they depend on the
+    * model. */
+  def getSolver(model: program.Model)(using ctx: Context): solvers.SolverFactory {
+    val program: self.program.type
+    type S <: solvers.combinators.TimeoutSolver { val program: self.program.type }
+  } = createSolver(ctx, model)
+
   def getEvaluator(using ctx: Context): evaluators.DeterministicEvaluator {
     val program: self.program.type
   } = evaluatorCache.cached(ctx, createEvaluator(ctx))
-
-  /** The semantics of the program extended with `functions`, under which the values of a model
-    * that defines functions are typed and evaluated (see [[Model.symbols]]).
-    *
-    * Semantics that support such models override this, typically by building the extended
-    * program's semantics with the provider that created them.
-    */
-  def withFunctions(functions: Seq[trees.FunDef]): inox.Semantics { val trees: self.trees.type } =
-    if (functions.isEmpty) this
-    else throw FatalError("These semantics do not support programs extended with new functions")
 }
 
 trait SemanticsProvider { self =>

@@ -80,13 +80,15 @@ package object inox {
         type S <: solvers.combinators.TimeoutSolver { val program: self.program.type }
       } = solvers.SolverFactory(self.program, ctx)
 
+      override protected def createSolver(ctx: Context, model: self.program.Model): solvers.SolverFactory {
+        val program: self.program.type
+        type S <: solvers.combinators.TimeoutSolver { val program: self.program.type }
+      } = solvers.SolverFactory.getFromSettings(self.program, ctx, Some(model))(
+        transformers.ProgramEncoder.empty(self.program))(using self.asInstanceOf[self.program.Semantics])
+
       protected def createEvaluator(ctx: Context): evaluators.DeterministicEvaluator {
         val program: self.program.type
       } = evaluators.RecursiveEvaluator(self.program, ctx)
-
-      override def withFunctions(functions: Seq[trees.FunDef]): inox.Semantics { val trees: self.trees.type } =
-        if (functions.isEmpty) this
-        else program.withFunctions(functions).getSemantics(using inoxSemantics)
     }.asInstanceOf[p.Semantics]
   }
   given givenInoxSemantics: inoxSemantics.type = inoxSemantics

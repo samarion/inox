@@ -25,6 +25,30 @@ trait TemplateGenerator { self: Templates =>
     Seq[QuantificationTemplate]
   )
 
+  /** The interpretation of the uninterpreted function `id` at `tps` in the model that the solver
+    * operates under (see [[AbstractUnrollingSolver.partialModel]]), if the model interprets it. */
+  def interpretation(id: Identifier, tps: Seq[Type]): Option[Lambda]
+
+  /** The free functions that stand for the uninterpreted functions at their type arguments, whose
+    * applications are the uninterpreted calls. They are shared by all templates, and their models are
+    * those of the uninterpreted functions. */
+  private[unrolling] val uninterpretedFunctions: MutableMap[(Identifier, Seq[Type]), (Variable, Encoded)] = MutableMap.empty
+  private[unrolling] val uninterpretedSubst: MutableMap[Variable, Encoded] = MutableMap.empty
+
+  /** The free functions of the uninterpreted functions that the model interprets, whose applications
+    * are calls that unfold the interpretation, as calls of the functions of the program unfold their
+    * bodies (see [[FunctionTemplates]]). Their interpretations may then be recursive. */
+  private[unrolling] val interpretedFunctions: MutableMap[Variable, Interpreted] = MutableMap.empty
+
+  private def uninterpretedFunction(uc: UninterpretedCall): Variable =
+    uninterpretedFunctions.getOrElseUpdate(uc.id -> uc.tps, {
+      val f = Variable.fresh(uc.id.name, uc.tpe.getType, true)
+      val fT = encodeSymbol(f)
+      uninterpretedSubst(f) = fT
+      if (interpretation(uc.id, uc.tps).isDefined) interpretedFunctions(f) = Interpreted(uc.id, uc.tps)
+      (f, fT)
+    })._1
+
   protected def emptyClauses: TemplateClauses =
     (Map.empty, Map.empty, Map.empty, Map.empty, Seq.empty, Map.empty, Map.empty, Seq.empty, Seq.empty)
 
@@ -182,8 +206,8 @@ trait TemplateGenerator { self: Templates =>
             val clauseSubst: Map[Variable, Encoded] = depSubst ++ conds ++ exprs ++
               lmbds.map(_.ids) ++ quants.flatMap(_.mapping) ++ equals.flatMap(_._2.map(_.symbols))
 
-            val (eCalls, eApps, eMatchers, ePointers) = Template.extractCalls(e, clauseSubst)
-            val (clsClauses, clsCalls, clsApps, clsMatchers, clsPointers, _) =
+            val (eCalls, eApps, eMatchers, eReads, ePointers) = Template.extractCalls(e, clauseSubst)
+            val (clsClauses, clsCalls, clsApps, clsMatchers, clsReads, clsPointers, _) =
               Template.encode(pathVar -> substMap(pathVar), Seq.empty, cls, clauseSubst)
 
             (depSubst + (v -> mkEncoder(clauseSubst)(e)), contents `merge` (
@@ -191,6 +215,7 @@ trait TemplateGenerator { self: Templates =>
               clsCalls `merge` Map(substMap(pathVar) -> eCalls),
               clsApps `merge` Map(substMap(pathVar) -> eApps),
               clsMatchers `merge` Map(substMap(pathVar) -> eMatchers),
+              clsReads `merge` Map(substMap(pathVar) -> eReads),
               equals, lmbds, quants, clsPointers ++ ePointers
             ))
           } else {
@@ -206,14 +231,14 @@ trait TemplateGenerator { self: Templates =>
             val clauseSubst: Map[Variable, Encoded] = localSubst ++ conds ++ exprs ++
               lmbds.map(_.ids) ++ quants.flatMap(_.mapping) ++ equals.flatMap(_._2.map(_.symbols))
 
-            val (clsClauses, clsCalls, clsApps, clsMatchers, clsPointers, _) =
+            val (clsClauses, clsCalls, clsApps, clsMatchers, clsReads, clsPointers, _) =
               Template.encode(pathVar -> substMap(pathVar), Seq.empty, cls, clauseSubst)
 
             (depSubst + (v -> localSubst(exprVar)), contents `merge` (
               conds + (condVar -> localSubst(condVar)),
               exprs + (exprVar -> localSubst(exprVar)),
               tree `merge` Map(pathVar -> Set(condVar)),
-              clsClauses, types, clsCalls, clsApps, clsMatchers, equals, lmbds, quants, clsPointers
+              clsClauses, types, clsCalls, clsApps, clsMatchers, clsReads, equals, lmbds, quants, clsPointers
             ))
           }
       }
@@ -289,6 +314,24 @@ trait TemplateGenerator { self: Templates =>
       result
     }
 
+    // Types the reads of a collection whose elements have contracts or ADT invariants (see [[Collection]]).
+    // The elements that only need unrolling as free values (e.g. sets, functions or type parameters) aren't typed:
+    // their reads may be many (e.g. those of the heap in Stainless) and typing them doesn't help proofs.
+    def storeReads(pathVar: Variable, tpe: Type, elemTpe: Type, arg: Expr, inDomain: Boolean)
+                  (using generator: TypingGenerator): Expr =
+      if (!(generator == FreeGenerator || (generator == ContractGenerator && !inDomain)) ||
+          !(ReadUnrolling `unroll` elemTpe)) BooleanLiteral(true)
+      else {
+        val b = encodedCond(pathVar)
+        val encoder = mkEncoder(localSubst)
+        val closures = typeOps.variablesOf(tpe).toSeq.sortBy(_.id).map(encoder).map(Left(_))
+        val readsCall: Variable = Variable.fresh("tp", BooleanType(), true)
+        storeExpr(readsCall)
+        val typing = Typing(tpe, encoder(arg), Collection(exprVars(readsCall), closures, generator == FreeGenerator))
+        types += b -> (types.getOrElse(b, Set.empty) + typing)
+        readsCall
+      }
+
     // Represents equations (simple formulas)
     var equations = Seq[Expr]()
     @inline def iff(e1: Expr, e2: Expr): Unit = equations :+= Equals(e1, e2)
@@ -309,7 +352,7 @@ trait TemplateGenerator { self: Templates =>
     }
 
     @inline def localSubst: Map[Variable, Encoded] =
-      substMap ++ condVars ++ exprVars ++ lambdas.map(_.ids)
+      substMap ++ uninterpretedSubst ++ condVars ++ exprVars ++ lambdas.map(_.ids)
 
     def result: TemplateClauses =
       (condVars, exprVars, condTree, guardedExprs, equations, types, equalities, lambdas, quantifications)
@@ -360,6 +403,32 @@ trait TemplateGenerator { self: Templates =>
 
         val p = rec(pathVar, exprOps.replace(Map(res.toVariable -> newExpr), pred), Some(true))
         storeGuarded(pathVar, p)
+        newExpr
+
+      case uc @ UninterpretedCall(id, tps, args, tpe) =>
+        // An application of the free function that stands for the uninterpreted function, whose
+        // result is an arbitrary value of the call's type, or is given by the interpretation of the
+        // function once the call is unfolded
+        val f = uninterpretedFunction(uc)
+        val (fExpr, fClauses) = mkTypeClauses(pathVar, f.tpe, f, localSubst)(using FreeGenerator)
+        storeGuarded(pathVar, fExpr)
+        builder ++= fClauses
+
+        val recArgs = args.map(rec(pathVar, _, None))
+        val app = Application(f, recArgs).copiedFrom(uc)
+        // The result type of the function, with its parameters bound to the arguments of the call
+        val resTpe = tpe match {
+          case PiType(params, to) => typeOps.replaceFromSymbols((params zip recArgs).toMap, to)
+          case FunctionType(_, to) => to
+          case _ => throw new IllegalArgumentException(s"Uninterpreted call with type $tpe: $uc")
+        }
+        val newExpr = Variable.fresh("uc", resTpe.getType, true)
+        storeExpr(newExpr)
+        storeGuarded(pathVar, Equals(newExpr, app))
+
+        val (tpeExpr, tmplClauses) = mkTypeClauses(pathVar, resTpe, newExpr, localSubst)(using FreeGenerator)
+        storeGuarded(pathVar, tpeExpr)
+        builder ++= tmplClauses
         newExpr
 
       case Error(tpe, _) =>
@@ -560,7 +629,7 @@ trait TemplateGenerator { self: Templates =>
   }(expr)
 
   private def containsAssumption(e: Expr): Boolean = e match {
-    case _: Assume | _: Choose | _: Error => true
+    case _: Assume | _: Choose | _: UninterpretedCall | _: Error => true
     case _ => false
   }
 
@@ -625,6 +694,17 @@ trait TemplateGenerator { self: Templates =>
         newExpr
       }
 
+    // A blocker under `pathVar` that the solver sets freely, under which a membership check
+    // instantiates its counterexample (see the function case below).
+    def membershipGuard(pathVar: Variable): Variable = {
+      val choice = Variable.fresh("choice", BooleanType(), true)
+      storeExpr(choice)
+      val w = Variable.fresh("w", BooleanType(), true)
+      storeCond(pathVar, w)
+      iff(and(pathVar, choice), w)
+      w
+    }
+
     def rec(pathVar: Variable, tpe: Type, expr: Expr, state: RecursionState): Expr = tpe match {
       case tpe if !(generator `unroll` tpe) => BooleanLiteral(true) // nothing to do here!
 
@@ -644,11 +724,7 @@ trait TemplateGenerator { self: Templates =>
           case _ => throw new InternalSolverError(s"Unexpected function type: ${tpe.asString}")
         }
 
-        val choice = Variable.fresh("choice", BooleanType(), true)
-        storeExpr(choice)
-        val w = Variable.fresh("w", BooleanType(), true)
-        storeCond(pathVar, w)
-        iff(and(pathVar, choice), w)
+        val w = membershipGuard(pathVar)
 
         val (args, subst) = params.foldLeft((Seq.empty[Variable], Map.empty[ValDef, Expr])) {
           case ((args, subst), vd) =>
@@ -663,6 +739,34 @@ trait TemplateGenerator { self: Templates =>
 
         val res = rec(w, typeOps.replaceFromSymbols(subst, to), Application(expr, args), state)
         implies(w, res)
+
+      // Maps, sets and bags are checked the same way as functions: a map lies in `Map[A, B]` iff its
+      // value at every key lies in `B`, and a set or bag lies in `Set[A]` or `Bag[A]` iff each of its
+      // elements lies in `A`, so the result can only be false at a key or element that the solver
+      // picks as a counterexample. Decomposing the value instead (see below) would let the solver
+      // pick a decomposition whose parts lie outside of the type although the value doesn't, and
+      // never completes for collections that may hold infinitely many elements. The keys of maps
+      // must be unrefined, as the value of a map at a key outside of `A` must be its default.
+      case MapType(from, to) if !(ContractUnrolling `unroll` from) &&
+          (generator == MembershipGenerator || (inDomain && generator == ContractGenerator)) =>
+        val w = membershipGuard(pathVar)
+        val key = Variable.fresh("key", from, true)
+        storeExpr(key)
+        implies(w, rec(w, to, MapApply(expr, key), state))
+
+      case SetType(base) if generator == MembershipGenerator || (inDomain && generator == ContractGenerator) =>
+        val w = membershipGuard(pathVar)
+        val elem = Variable.fresh("elem", base.getType, true)
+        storeExpr(elem)
+        storeGuarded(w, ElementOfSet(elem, expr))
+        implies(w, rec(w, base, elem, state))
+
+      case BagType(base) if generator == MembershipGenerator || (inDomain && generator == ContractGenerator) =>
+        val w = membershipGuard(pathVar)
+        val elem = Variable.fresh("elem", base.getType, true)
+        storeExpr(elem)
+        storeGuarded(w, GreaterThan(MultiplicityInBag(elem, expr), IntegerLiteral(0)))
+        implies(w, rec(w, base, elem, state))
 
       case (_: FunctionType | _: PiType) => storeType(pathVar, tpe, expr, inDomain)
 
@@ -796,7 +900,7 @@ trait TemplateGenerator { self: Templates =>
             rec(newBool2, to, valueExpr, state)
           )))
 
-          and(rec(pathVar, to, defaultExpr, state), newExpr)
+          and(rec(pathVar, to, defaultExpr, state), newExpr, storeReads(pathVar, tpe, to, expr, inDomain))
         }
 
       case SetType(base) =>
@@ -828,7 +932,7 @@ trait TemplateGenerator { self: Templates =>
             rec(newBool2, base, elemExpr, state)
           )))
 
-          newExpr
+          and(newExpr, storeReads(pathVar, tpe, base, expr, inDomain))
         }
 
       case BagType(base) =>
@@ -864,7 +968,7 @@ trait TemplateGenerator { self: Templates =>
             rec(newBool2, IntegerType(), multExpr, state)
           )))
 
-          newExpr
+          and(newExpr, storeReads(pathVar, tpe, base, expr, inDomain))
         }
 
       case _ => throw new InternalSolverError(s"Unexpected unrollable: ${tpe.asString}")

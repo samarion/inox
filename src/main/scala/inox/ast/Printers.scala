@@ -151,6 +151,12 @@ trait Printer {
       case Choose(res, pred) =>
         p"choose(($res) => $pred)"
 
+      case UninterpretedCall(id, tps, args, _) =>
+        p"$id${nary(tps, ", ", "[", "]")}"
+        if (args.nonEmpty) {
+          p"($args)"
+        }
+
       case Error(tpe, msg) =>
         p"""error[$tpe]("$msg")"""
 

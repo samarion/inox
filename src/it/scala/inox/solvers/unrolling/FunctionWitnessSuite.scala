@@ -95,15 +95,21 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     })
   }
 
+  // returns a lambda that captures its argument
+  val constID = FreshIdentifier("const")
+  val constFd = mkFunDef(constID)() { _ => (
+    Seq("b" :: BooleanType()), BooleanType() =>: BooleanType(), { case Seq(b) => \("x" :: BooleanType())(_ => b) })
+  }
+
   val program = InoxProgram(new Symbols(
-    Map(sizeID -> sizeFd, sameID -> sameFd, sameViaID -> sameViaFd, polyID -> polyFd),
+    Map(sizeID -> sizeFd, sameID -> sameFd, sameViaID -> sameViaFd, polyID -> polyFd, constID -> constFd),
     Map(listID -> List, boxID -> Box, objID -> Obj)))
 
   val intList = T(listID)(IntegerType())
 
-  private def solve(clause: Expr)(using Context): Map[ValDef, Expr] = {
-    SimpleSolverAPI(program.getSolver).solveSAT(clause) match {
-      case SatWithModel(model) => model.vars
+  private def solve(clause: Expr)(using Context): program.Model = {
+    result(clause) match {
+      case SatWithModel(model) => model
       case res => fail(s"Expected a model, got $res")
     }
   }
@@ -118,10 +124,11 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     } (e)
   }
 
-  /** Whether `f1` and `f2` give different results on some inputs taken from `pool` (by default,
-    * the two functions themselves). Results of function type are compared the same way, so curried
-    * functions are distinguished by a sequence of inputs. */
-  private def distinguishable(f1: Expr, f2: Expr, pool: Expr*)(using ctx: Context): Boolean = {
+  /** Whether `f1` and `f2` give different results in `model` on some inputs taken from `pool` (by
+    * default, the two functions themselves). Results of function type are compared the same way, so
+    * curried functions are distinguished by a sequence of inputs. The model gives the functions that
+    * the closures of its values call. */
+  private def distinguishable(model: program.Model)(f1: Expr, f2: Expr, pool: Expr*)(using ctx: Context): Boolean = {
     val FunctionType(from, _) = f1.getType(using program.symbols): @unchecked
     val exprs = pool ++ Seq(f1, f2)
     val evaluator = program.getEvaluator
@@ -129,12 +136,12 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
       for (arg <- candidates(tpe, exprs).toSeq; args <- rest) yield arg +: args
     }
     argss.exists { args =>
-      val r1 = evaluator.eval(Application(f1, args))
-      val r2 = evaluator.eval(Application(f2, args))
+      val r1 = evaluator.eval(Application(f1, args), model)
+      val r2 = evaluator.eval(Application(f2, args), model)
       (r1, r2) match {
         case (EvaluationResults.Successful(v1), EvaluationResults.Successful(v2)) =>
           v1.getType(using program.symbols) match {
-            case _: FunctionType => distinguishable(v1, v2, (exprs :+ v1 :+ v2)*)
+            case _: FunctionType => distinguishable(model)(v1, v2, (exprs :+ v1 :+ v2)*)
             case _ => v1 != v2
           }
         case _ => false
@@ -159,7 +166,7 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     val g = ("g" :: (IntegerType() =>: IntegerType())).toVariable
     val h = ("h" :: (IntegerType() =>: IntegerType())).toVariable
     val model = solve(f(g) !== f(h))
-    assert(!model.values.exists(comparesFunctions))
+    assert(!model.vars.values.exists(comparesFunctions))
   }
 
   test("functions applied to a function and a lambda", hasHigherOrderModels) {
@@ -167,7 +174,7 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     val g = ("g" :: (IntegerType() =>: IntegerType())).toVariable
     val succ = \("x" :: IntegerType())(x => x + E(BigInt(1)))
     val model = solve(f(g) !== f(succ))
-    assert(!model.values.exists(comparesFunctions))
+    assert(!model.vars.values.exists(comparesFunctions))
   }
 
   test("structurally distinct lambdas remain distinct") {
@@ -186,21 +193,21 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     val g = ("g" :: tpe).toVariable
     val h = ("h" :: tpe).toVariable
     val model = solve(f(g) !== f(h))
-    assert(!model.values.exists(comparesFunctions))
+    assert(!model.vars.values.exists(comparesFunctions))
   }
 
   test("distinct first-order functions") {
     val f = ("f" :: (IntegerType() =>: IntegerType())).toVariable
     val g = ("g" :: (IntegerType() =>: IntegerType())).toVariable
     val model = solve(f !== g)
-    assert(distinguishable(model(f.toVal), model(g.toVal)))
+    assert(distinguishable(model)(model.vars(f.toVal), model.vars(g.toVal)))
   }
 
   test("distinct function and lambda") {
     val f = ("f" :: (IntegerType() =>: IntegerType())).toVariable
     val clause = f !== \("x" :: IntegerType())(x => x + E(BigInt(1)))
     val model = solve(clause)
-    assert(distinguishable(model(f.toVal), \("x" :: IntegerType())(x => x + E(BigInt(1)))))
+    assert(distinguishable(model)(model.vars(f.toVal), \("x" :: IntegerType())(x => x + E(BigInt(1)))))
   }
 
   test("distinct higher-order functions", hasHigherOrderModels) {
@@ -209,8 +216,8 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     val g = ("g" :: tpe).toVariable
     val model = solve(f !== g)
     val id = \("x" :: IntegerType())(x => x)
-    assert(distinguishable(model(f.toVal), model(g.toVal), id))
-    assert(!model.values.exists(comparesFunctions))
+    assert(distinguishable(model)(model.vars(f.toVal), model.vars(g.toVal), id))
+    assert(!model.vars.values.exists(comparesFunctions))
   }
 
   test("distinct functions agreeing on an input") {
@@ -218,7 +225,7 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     val g = ("g" :: (IntegerType() =>: IntegerType())).toVariable
     val clause = (f !== g) && f(E(BigInt(0))) === g(E(BigInt(0)))
     val model = solve(clause)
-    assert(distinguishable(model(f.toVal), model(g.toVal)))
+    assert(distinguishable(model)(model.vars(f.toVal), model.vars(g.toVal)))
   }
 
   test("many pairwise distinct functions") {
@@ -229,7 +236,7 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     val clause = andJoin(fs.map(f => f(E(true)) === E(BigInt(0))) ++ pairs.map((f1, f2) => f1 !== f2))
     val model = solve(clause)
     val evaluator = program.getEvaluator
-    def resultOnFalse(f: Variable): Option[Expr] = evaluator.eval(Application(model(f.toVal), Seq(E(false)))) match {
+    def resultOnFalse(f: Variable): Option[Expr] = evaluator.eval(Application(model.vars(f.toVal), Seq(E(false))), model) match {
       case EvaluationResults.Successful(v) => Some(v)
       case _ => None
     }
@@ -244,7 +251,7 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     val f = ("f" :: FunctionType(Seq(), IntegerType())).toVariable
     val g = ("g" :: FunctionType(Seq(), IntegerType())).toVariable
     val model = solve(f !== g)
-    assert(distinguishable(model(f.toVal), model(g.toVal)))
+    assert(distinguishable(model)(model.vars(f.toVal), model.vars(g.toVal)))
   }
 
   test("distinct nullary function and lambda") {
@@ -252,7 +259,7 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     val g = ("g" :: (IntegerType() =>: IntegerType())).toVariable
     val lambda = Lambda(Seq(), g(E(BigInt(5))))
     val model = solve(f !== lambda)
-    assert(distinguishable(model(f.toVal), exprOps.replaceFromSymbols(Map(g -> model(g.toVal)), lambda)))
+    assert(distinguishable(model)(model.vars(f.toVal), exprOps.replaceFromSymbols(Map(g -> model.vars(g.toVal)), lambda)))
   }
 
   test("nullary functions with equal results") { ctx ?=>
@@ -280,7 +287,7 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     val g = ("g" :: tpe).toVariable
     val zero = E(BigInt(0))
     val model = solve((f !== g) && f(zero, zero) === g(zero, zero))
-    assert(distinguishable(model(f.toVal), model(g.toVal)))
+    assert(distinguishable(model)(model.vars(f.toVal), model.vars(g.toVal)))
   }
 
   test("distinct curried functions") {
@@ -288,7 +295,7 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     val f = ("f" :: tpe).toVariable
     val g = ("g" :: tpe).toVariable
     val model = solve(f !== g)
-    assert(distinguishable(model(f.toVal), model(g.toVal)))
+    assert(distinguishable(model)(model.vars(f.toVal), model.vars(g.toVal)))
   }
 
   test("distinct function and closure") {
@@ -297,8 +304,8 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     val y = ("y" :: IntegerType()).toVariable
     val lambda = \("x" :: IntegerType())(x => x + y)
     val model = solve((f !== lambda) && f(E(BigInt(0))) === y)
-    val closed = \("x" :: IntegerType())(x => x + model(y.toVal))
-    assert(distinguishable(model(f.toVal), closed))
+    val closed = \("x" :: IntegerType())(x => x + model.vars(y.toVal))
+    assert(distinguishable(model)(model.vars(f.toVal), closed))
   }
 
   test("distinct functions in datatypes") {
@@ -306,8 +313,8 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     val b2 = ("b2" :: T(boxID)()).toVariable
     val zero = E(BigInt(0))
     val model = solve((b1 !== b2) && b1.getField(fn)(zero) === b2.getField(fn)(zero))
-    (model(b1.toVal), model(b2.toVal)) match {
-      case (ADT(_, _, Seq(f1)), ADT(_, _, Seq(f2))) => assert(distinguishable(f1, f2))
+    (model.vars(b1.toVal), model.vars(b2.toVal)) match {
+      case (ADT(_, _, Seq(f1)), ADT(_, _, Seq(f2))) => assert(distinguishable(model)(f1, f2))
       case res => fail(s"Unexpected model: $res")
     }
   }
@@ -317,7 +324,7 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     val f = ("f" :: (tp =>: tp)).toVariable
     val g = ("g" :: (tp =>: tp)).toVariable
     val model = solve(f !== g)
-    assert(distinguishable(model(f.toVal), model(g.toVal)))
+    assert(distinguishable(model)(model.vars(f.toVal), model.vars(g.toVal)))
   }
 
   test("all Boolean functions") {
@@ -327,7 +334,7 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     val pairs = for (f1 <- fs; f2 <- fs if f1.id.globalId < f2.id.globalId) yield (f1, f2)
     val model = solve(andJoin(pairs.map((f1, f2) => f1 !== f2)))
     for ((f1, f2) <- pairs) {
-      assert(distinguishable(model(f1.toVal), model(f2.toVal), E(true), E(false)), s"$f1 and $f2 aren't distinguished")
+      assert(distinguishable(model)(model.vars(f1.toVal), model.vars(f2.toVal), E(true), E(false)), s"$f1 and $f2 aren't distinguished")
     }
   }
 
@@ -340,7 +347,7 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     val clause = (f !== g) &&
       forall("l" :: intList)(l => (sizeFd(IntegerType())(l) <= E(BigInt(1))) ==> (f(l) === g(l)))
     val model = solve(clause)
-    assert(distinguishable(model(f.toVal), model(g.toVal)))
+    assert(distinguishable(model)(model.vars(f.toVal), model.vars(g.toVal)))
   }
 
   test("distinct functions next to a recursive function") {
@@ -348,7 +355,7 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     val g = ("g" :: (IntegerType() =>: IntegerType())).toVariable
     val l = ("l" :: intList).toVariable
     val model = solve((f !== g) && f(sizeFd(IntegerType())(l)) === g(E(BigInt(2))) && sizeFd(IntegerType())(l) > E(BigInt(2)))
-    assert(distinguishable(model(f.toVal), model(g.toVal)))
+    assert(distinguishable(model)(model.vars(f.toVal), model.vars(g.toVal)))
   }
 
   // Intensional equality: distinct functions needn't have a distinguishing input
@@ -359,6 +366,24 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     val id = \("x" :: IntegerType())(x => x)
     val alsoId = \("x" :: IntegerType())(x => if_ (x === E(BigInt(0))) { E(BigInt(0)) } else_ { x })
     assert(result((f !== id) && (f === alsoId)).isSAT)
+  }
+
+  test("functions that agree with a lambda of the query remain distinct from it") { ctx ?=>
+    given Context = ctx.withOpts(optFunctionEquality(FunctionEquality.Intensional))
+    // `f` may have the same results as `no` on every input, and then only a closure keeps it
+    // distinct, including from the lambda that a function of the program returns
+    val f = ("f" :: (BooleanType() =>: BooleanType())).toVariable
+    val no = \("x" :: BooleanType())(x => E(false))
+    val allFalse = f(E(true)) === E(false) && f(E(false)) === E(false)
+    val constFalse = E(constID)(E(false))
+    for (clause <- Seq(f !== no, (f !== no) && allFalse, f !== constFalse, (f !== constFalse) && allFalse)) {
+      result(clause) match {
+        case SatWithModel(model) =>
+          val res = program.getEvaluator.eval(clause, model)
+          assert(res.result == Some(E(true)), s"$res in $model")
+        case res => fail(s"Expected a model, got $res")
+      }
+    }
   }
 
   test("distinct functions equal on every input") { ctx ?=>
@@ -406,7 +431,7 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     val f = ("f" :: tpe).toVariable
     val g = ("g" :: tpe).toVariable
     result(f !== g) match {
-      case SatWithModel(model) => assert(distinguishable(model.vars(f.toVal), model.vars(g.toVal)))
+      case SatWithModel(model) => assert(distinguishable(model)(model.vars(f.toVal), model.vars(g.toVal)))
       case res => assert(!res.isUNSAT, s"Expected a model or Unknown, got $res")
     }
   }
@@ -454,13 +479,13 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
       assert(solver.check(Simple).isUNSAT)
       solver.pop()
       solver.check(Model) match {
-        case SatWithModel(model) => assert(distinguishable(model.vars(f.toVal), model.vars(g.toVal)))
+        case SatWithModel(model) => assert(distinguishable(model)(model.vars(f.toVal), model.vars(g.toVal)))
         case res => fail(s"Expected a model, got $res")
       }
       solver.push()
       solver.assertCnstr(f(E(BigInt(1))) === g(E(BigInt(1))))
       solver.check(Model) match {
-        case SatWithModel(model) => assert(distinguishable(model.vars(f.toVal), model.vars(g.toVal)))
+        case SatWithModel(model) => assert(distinguishable(model)(model.vars(f.toVal), model.vars(g.toVal)))
         case res => fail(s"Expected a model, got $res")
       }
       solver.pop()
@@ -563,7 +588,7 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
         case SatWithModel(model) =>
           assert(!model.vars.values.exists(comparesFunctions))
           val fns = Seq(f, g, h).filter(v => model.vars.contains(v.toVal)).map(v => model.vars(v.toVal))
-          for (case Seq(f1, f2) <- fns.combinations(2)) assert(distinguishable(f1, f2))
+          for (case Seq(f1, f2) <- fns.combinations(2)) assert(distinguishable(model)(f1, f2))
         case res => fail(s"Expected a model, got $res")
       }
     }
@@ -584,11 +609,11 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
       resultWith(FunctionEquality.Extensional)(clause) match {
         case SatWithModel(model) =>
           val subst = model.vars.map((vd, v) => vd.toVariable -> v)
-          def value(e: Expr): Expr = program.getEvaluator.eval(exprOps.replaceFromSymbols(subst, e)) match {
+          def value(e: Expr): Expr = program.getEvaluator.eval(exprOps.replaceFromSymbols(subst, e), model) match {
             case EvaluationResults.Successful(v) => v
             case res => fail(s"Can't evaluate ${e.asString(using PrinterOptions())}: $res")
           }
-          for ((e1, e2) <- pairs) assert(distinguishable(value(e1), value(e2)))
+          for ((e1, e2) <- pairs) assert(distinguishable(model)(value(e1), value(e2)))
         case res => fail(s"Expected a model, got $res")
       }
     }
@@ -643,11 +668,11 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
   }
 
   // The models below are checked by the evaluator, which can't compare functions under `none`
-  private def solveWithoutEquality(clause: Expr)(using Context): Map[ValDef, Expr] =
+  private def solveWithoutEquality(clause: Expr)(using Context): program.Model =
     resultWith(FunctionEquality.None)(clause) match {
       case SatWithModel(model) =>
         assert(!model.vars.values.exists(comparesFunctions))
-        model.vars
+        model
       case res => fail(s"Expected a model, got $res")
     }
 
@@ -657,11 +682,11 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     val b1 = ("b1" :: T(boxID)()).toVariable
     val b2 = ("b2" :: T(boxID)()).toVariable
     val model = solveWithoutEquality(k(b1) !== k(b2))
-    def fnOf(b: Variable) = model(b.toVal) match {
+    def fnOf(b: Variable) = model.vars(b.toVal) match {
       case ADT(_, _, Seq(f)) => f
       case v => fail(s"Unexpected box $v")
     }
-    assert(distinguishable(fnOf(b1), fnOf(b2)))
+    assert(distinguishable(model)(fnOf(b1), fnOf(b2)))
 
     // tuples, where the functions must be told apart although the other components are equal
     val t = ("t" :: (TupleType(Seq(fnT, IntegerType())) =>: IntegerType())).toVariable
@@ -669,7 +694,7 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     val g = ("g" :: fnT).toVariable
     val zero = E(BigInt(0))
     val model2 = solveWithoutEquality(t(Tuple(Seq(f, zero))) !== t(Tuple(Seq(g, zero))))
-    assert(distinguishable(model2(f.toVal), model2(g.toVal)))
+    assert(distinguishable(model2)(model2.vars(f.toVal), model2.vars(g.toVal)))
   }
 
   test("functions applied to functions returning datatypes without function equality", hasHigherOrderModels) { ctx ?=>

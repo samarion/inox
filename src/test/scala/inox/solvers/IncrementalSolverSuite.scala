@@ -16,7 +16,9 @@ class IncrementalSolverSuite extends SolverTestSuite {
 
   override protected def solverInfos: Seq[SolverInfo] = {
     val nonIncremental = Set("unrollz3", "smt-z3", "smt-cvc4", "smt-cvc5")
-    solvers ++ solvers.filter(info => nonIncremental(info.name)).map(info => info.copy(name = "no-inc:" + info.name))
+    // The wrappers replay the assertions in a fresh solver, so they can reset
+    solvers ++ solvers.filter(info => nonIncremental(info.name))
+      .map(info => info.copy(name = "no-inc:" + info.name, unsupported = info.unsupported - Feature.Reset))
   }
 
   val incID = FreshIdentifier("inc")
@@ -127,35 +129,76 @@ class IncrementalSolverSuite extends SolverTestSuite {
     }
   }
 
-  test("Reset") { ctx =>
+  test("Reset", Feature.Reset) { ctx =>
     withSolver(ctx) { s =>
       s.assertCnstr(x > E(0))
       s.assertCnstr(x < E(0))
       assert(s.check(Simple).isUNSAT)
-      try {
-        s.reset()
-      } catch {
-        // solvers may refuse to reset, but must otherwise forget the previous constraints
-        case _: CantResetException => cancel(s"${s.name} can't be reset")
-      }
+      s.reset()
       s.assertCnstr(Equals(x, E(3)))
       assert(valueOf(s, x) == Some(Int32Literal(3)))
     }
   }
 
-  test("Branches and function calls after a reset", Feature.Integers) { ctx =>
+  testWithout("Solvers that can't reset say so", Feature.Reset) { ctx =>
+    withSolver(ctx) { s =>
+      s.assertCnstr(x > E(0))
+      assertThrows[CantResetException](s.reset())
+    }
+  }
+
+  test("Branches and function calls after a reset", Feature.Integers, Feature.Reset) { ctx =>
     withSolver(ctx) { s =>
       val y = Variable.fresh("y", IntegerType())
       s.assertCnstr(Equals(inc(y), IntegerLiteral(5)))
       assert(valueOf(s, y) == Some(IntegerLiteral(4)))
-      try {
-        s.reset()
-      } catch {
-        case _: CantResetException => cancel(s"${s.name} can't be reset")
-      }
+      s.reset()
       s.assertCnstr(if_ (x > E(0)) { Equals(inc(y), IntegerLiteral(7)) } else_ { Equals(inc(inc(y)), IntegerLiteral(7)) })
       s.assertCnstr(x < E(0))
       assert(valueOf(s, y) == Some(IntegerLiteral(5)))
+    }
+  }
+
+  // The SMT solvers leave their processes for the next solvers (see [[smtlib.ProcessPool]])
+  test("Solvers after a freed one start from scratch") { ctx =>
+    for (_ <- 1 to 3) {
+      withSolver(ctx) { s =>
+        s.assertCnstr(x > E(0))
+        s.assertCnstr(x < E(0))
+        assert(s.check(Simple).isUNSAT)
+      }
+      withSolver(ctx) { s =>
+        s.assertCnstr(x === E(1))
+        assert(valueOf(s, x) == Some(E(1)))
+      }
+    }
+  }
+
+  test("Solvers after one freed twice don't share its process") { ctx =>
+    withSolver(ctx) { s =>
+      s.assertCnstr(x === E(0))
+      assert(valueOf(s, x) == Some(E(0)))
+      s.free()
+    }
+    withSolver(ctx) { s1 =>
+      withSolver(ctx) { s2 =>
+        s1.assertCnstr(x === E(1))
+        s2.assertCnstr(x === E(2))
+        assert(valueOf(s1, x) == Some(E(1)))
+        assert(valueOf(s2, x) == Some(E(2)))
+      }
+    }
+  }
+
+  test("Solvers after an interrupted one start from scratch") { ctx =>
+    withSolver(ctx) { s =>
+      s.assertCnstr(x > E(0))
+      s.assertCnstr(x < E(0))
+      s.interrupt()
+    }
+    withSolver(ctx) { s =>
+      s.assertCnstr(x === E(2))
+      assert(valueOf(s, x) == Some(E(2)))
     }
   }
 }

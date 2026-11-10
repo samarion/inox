@@ -519,9 +519,15 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
     case _ => unhandled
   }
 
-  protected[z3] def fromZ3Formula(model: Z3Model, tree: Z3AST, tpe: Type): (Expr, Map[Choose, Expr]) = {
+  // The uninterpreted functions of the closures of models, by function value (see `uniquateClosure`)
+  private val closureIds: MutableMap[(Int, FunctionType), Identifier] = MutableMap.empty
+
+  /** The value of `tree`, the values of the chooses it contains, and the uninterpreted functions
+    * that its closures call (see [[SymbolOps.uniquateClosure]]). */
+  protected[z3] def fromZ3Formula(model: Z3Model, tree: Z3AST, tpe: Type): (Expr, Map[Choose, Expr], Map[Identifier, Lambda]) = {
     val z3ToChooses: MutableMap[Z3AST, Choose] = MutableMap.empty
     val z3ToLambdas: MutableMap[Z3AST, Lambda] = MutableMap.empty
+    val closures: MutableMap[Identifier, Lambda] = MutableMap.empty
 
     def rec(t: Z3AST, tpe: Type, seen: Set[Z3AST]): Expr = {
       val kind = z3.getASTKind(t)
@@ -592,7 +598,7 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
               case ft @ FunctionType(fts, tt) => z3ToLambdas.getOrElse(t, {
                 val n = t.toString.split("!").last.init.toInt
                 val args = fts.map(tpe => ValDef.fresh("x", tpe, true))
-                val res = uniquateClosure(n, lambdas.getB(ft)
+                val lambda = (lambdas.getB(ft)
                   .flatMap(decl => model.getFuncInterpretations.find(_._1 == decl))
                   .map { case (_, mapping, elseValue) =>
                     val body = mapping.foldLeft(rec(elseValue, tt, seen + t)) { case (elze, (z3Args, z3Result)) =>
@@ -615,6 +621,9 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
                       Lambda(args, Choose(ValDef.fresh("res", tt), BooleanLiteral(true)))
                   }))
 
+                val id = closureIds.getOrElseUpdate(n -> ft, FreshIdentifier("f", true))
+                val res = uniquateClosure(id, lambda)
+                closures(id) = lambda
                 z3ToLambdas(t) = res
                 res
               })
@@ -689,7 +698,7 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
     val res = rec(tree, tpe, Set.empty)
     val chooses = z3ToChooses.toMap.map { case (ast, c) => c -> z3ToLambdas(ast) }
 
-    (res, chooses)
+    (res, chooses, closures.toMap)
   }
 
   // Tries to convert a Z3AST into a *ground* Expr. Doesn't try very hard, because
@@ -773,7 +782,7 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
     }
   }
 
-  protected[z3] def softFromZ3Formula(model: Z3Model, tree: Z3AST, tpe: Type) : Option[(Expr, Map[Choose, Expr])] = {
+  protected[z3] def softFromZ3Formula(model: Z3Model, tree: Z3AST, tpe: Type) : Option[(Expr, Map[Choose, Expr], Map[Identifier, Lambda])] = {
     try {
       Some(fromZ3Formula(model, tree, tpe))
     } catch {
@@ -797,20 +806,26 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
 
   private[z3] class ModelExtractor(model: Z3Model) {
     private val innerChooses: MutableMap[Identifier, Expr] = MutableMap.empty
+    private val innerClosures: MutableMap[Identifier, Lambda] = MutableMap.empty
 
     def apply(z3ast: Z3AST, tpe: Type): Expr = {
-      val (e, cs) = fromZ3Formula(model, z3ast, tpe)
+      val (e, cs, fs) = fromZ3Formula(model, z3ast, tpe)
       innerChooses ++= cs.map(p => p._1.res.id -> p._2)
+      innerClosures ++= fs
       e
     }
 
     def get(z3ast: Z3AST, tpe: Type): Option[Expr] =
-      softFromZ3Formula(model, z3ast, tpe).map { case (e, cs) =>
+      softFromZ3Formula(model, z3ast, tpe).map { case (e, cs, fs) =>
         innerChooses ++= cs.map(p => p._1.res.id -> p._2)
+        innerClosures ++= fs
         e
       }
 
     def chooses = innerChooses.toMap
+
+    /** The uninterpreted functions that the extracted closures call, at no type arguments. */
+    def closures = innerClosures.toMap
   }
 
   def extractModel(model: Z3Model): program.Model = {
@@ -843,6 +858,7 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
 
     val chooses: MutableMap[(Identifier, Seq[Type]), Expr] = MutableMap.empty
     chooses ++= ex.chooses.map(p => (p._1, Seq.empty[Type]) -> p._2)
+    chooses ++= ex.closures.map(p => (p._1, Seq.empty[Type]) -> p._2)
 
     chooses ++= tryZ3(model.getFuncInterpretations.flatMap { case (decl, mapping, defaultValue) =>
       functions.getA(decl).flatMap(tfd => tfd.fullBody match {
@@ -854,6 +870,7 @@ trait Z3Native extends ADTManagers with Interruptible { self: AbstractSolver =>
             }), ex(res, tfd.getType), elze)
           }
           chooses ++= ex.chooses.map(p => (p._1, tfd.tps) -> p._2)
+          chooses ++= ex.closures.map(p => (p._1, Seq.empty[Type]) -> p._2)
           Some((c.res.id, tfd.tps) -> body)
         case _ => None
       })
@@ -880,19 +897,25 @@ object Z3Native {
   /** A native Z3 solver that needs a string alphabet that another solver of the same thread is using. */
   class EncodingConflictException(msg: String) extends Exception(msg)
 
+  /** The monitor under which the native solvers create and delete their Z3 contexts (see
+    * [[NativeZ3Solver]]). The string alphabet below is guarded by the same monitor, which a solver
+    * that waits for the alphabet releases (`wait`): the solvers that use the current alphabet can
+    * then be freed, which they couldn't under a monitor of their own.
+    */
+  private[z3] val lock = new Object
+
   // Z3's string alphabet is a global parameter (`encoding`), which all the native Z3 solvers of the
   // process share. A solver sets it when it is created, and it can't change while a solver uses it:
   // a solver that needs the other alphabet waits until the solvers that use the current one are
   // freed. The solvers that wait for a change go first, so that they aren't starved. A thread that
   // holds a solver with the other alphabet would wait for itself, so it gets an exception instead.
-  private val encodingLock = new Object
   private var encoding: String = "unicode"
   private var encodingUsers: Int = 0
   private val encodingWaiters = MutableMap.empty[String, Int].withDefaultValue(0)
   private val encodingHolders = MutableMap.empty[(Thread, String), Int].withDefaultValue(0)
 
   /** Sets Z3's string alphabet to `enc` for a new solver, and returns the thread that holds it. */
-  private[z3] def acquireEncoding(enc: String): Thread = encodingLock.synchronized {
+  private[z3] def acquireEncoding(enc: String): Thread = lock.synchronized {
     val thread = Thread.currentThread
     if (encodingHolders.exists { case ((t, e), n) => t == thread && e != enc && n > 0 }) {
       throw new EncodingConflictException(
@@ -903,7 +926,7 @@ object Z3Native {
       def othersWaiting = encodingWaiters.exists { case (e, n) => e != enc && n > 0 }
       encodingWaiters(enc) += 1
       try {
-        while (!(encodingUsers == 0 || (encoding == enc && !othersWaiting))) encodingLock.wait()
+        while (!(encodingUsers == 0 || (encoding == enc && !othersWaiting))) lock.wait()
       } finally {
         encodingWaiters(enc) -= 1
       }
@@ -918,11 +941,11 @@ object Z3Native {
   }
 
   /** Releases the alphabet that `acquireEncoding` gave to `thread`. */
-  private[z3] def releaseEncoding(enc: String, thread: Thread): Unit = encodingLock.synchronized {
+  private[z3] def releaseEncoding(enc: String, thread: Thread): Unit = lock.synchronized {
     encodingUsers -= 1
     encodingHolders((thread, enc)) -= 1
     if (encodingHolders((thread, enc)) == 0) encodingHolders -= ((thread, enc))
-    encodingLock.notifyAll()
+    lock.notifyAll()
   }
 
   def tryZ3[T](res: => T): Option[T] =

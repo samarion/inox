@@ -123,9 +123,13 @@ abstract class RecursiveEvaluator(override val program: Program,
     * The cases are split by theory into the `eCore`, `eArithmetic`, ... methods below, which are
     * tried in order (see [[utils.CaseSplit]]). Subclasses can override `e` itself, or a single family.
     */
-  protected[evaluators] def e(expr: Expr)(using rctx: RC, gctx: GC): Expr =
+  protected[evaluators] def e(expr: Expr)(using rctx: RC, gctx: GC): Expr = {
+    // The solvers evaluate the values of their models, which can be huge, with evaluators whose
+    // context is interrupted along with them (see `Z3Solver` and `AbstractUnrollingSolver`)
+    if (interruptManager.isInterrupted) throw RuntimeError("Evaluation interrupted")
     eCore(expr) otherwise eArithmetic(expr) otherwise eStrings(expr) otherwise eBitVectors(expr) otherwise
       eFloatingPoint(expr) otherwise eCollections(expr) otherwise unexpected(expr)
+  }
 
   protected def unexpected(expr: Expr): Nothing =
     throw EvalError("Unhandled case in Evaluator : [" + expr.getClass + "] " + expr.asString)
@@ -267,8 +271,13 @@ abstract class RecursiveEvaluator(override val program: Program,
       }
 
       // We start by normalizing the structure of the lambda as in the solver to
-      // evaluate all normalizable ground expressions within its body.
-      val ground = normalizeLambda(l)
+      // evaluate all normalizable ground expressions within its body. The values of its free
+      // variables are substituted first, so that the result doesn't depend on whether the lambda
+      // refers to a value through a variable or directly: `x => l.head.f(x)` with `l` bound to
+      // `Cons(g, Nil())` must give the same lambda as `x => Cons(g, Nil()).head.f(x)`, in which
+      // the selection is ground and therefore evaluated.
+      val closed = replaceFromSymbols(variablesOf(l).flatMap(v => rctx.mappings.get(v.toVal).map(v -> _)).toMap, l)
+      val ground = normalizeLambda(closed.asInstanceOf[Lambda])
 
       // Then, in order for nested lambdas to have fresh variables in their argument
       // lists and let bindings, we re-normalize the identifiers by passing
@@ -277,19 +286,27 @@ abstract class RecursiveEvaluator(override val program: Program,
       val normalized = normalizeLambda(ground, onlySimple = true)
       simplifyTrivialApps(normalized)
 
-    case f: Forall => onForallInvocation {
-      replaceFromSymbols(variablesOf(f).map(v => v -> e(v)).toMap, f).asInstanceOf[Forall]
-    }
+    case f: Forall => onForallInvocation(
+      replaceFromSymbols(variablesOf(f).map(v => v -> e(v)).toMap, f).asInstanceOf[Forall], rctx.chooses)
 
     case Error(_, msg) =>
       throw RuntimeError("Error reached in evaluation: " + msg)
 
+    // The model gives uninterpreted functions as functions of their arguments
+    case UninterpretedCall(id, tps, args, _) =>
+      val evArgs = args map e
+      rctx.chooses.get(id -> tps) match {
+        case Some(l: Lambda) if l.params.size == evArgs.size =>
+          e(l.body)(using rctx.withNewVars(l.paramSubst(evArgs)), gctx)
+        case _ =>
+          throw EvalError(s"Cannot call uninterpreted function ${id.asString} that the model doesn't define")
+      }
+
     case c: Choose =>
       rctx.getChoose(c.res.id) match {
         case Some(expr) => e(expr)
-        case None => onChooseInvocation {
-          replaceFromSymbols(variablesOf(c).map(v => v -> e(v)).toMap, c).asInstanceOf[Choose]
-        }
+        case None => onChooseInvocation(
+          replaceFromSymbols(variablesOf(c).map(v => v -> e(v)).toMap, c).asInstanceOf[Choose], rctx.chooses)
       }
 
     case gl: GenericValue => gl
