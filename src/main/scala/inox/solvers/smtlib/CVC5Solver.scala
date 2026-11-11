@@ -13,11 +13,18 @@ object optCVC5Options extends SetOptionDef[String] {
   val usageRhs = "<cvc5-opt>"
 }
 
+object optCVC5Rlimit extends LongOptionDef("cvc5-rlimit", 0L, "<N>")
+
 trait CVC5Solver extends CVCSolver with CVC5Target {
+  import context.{given, _}
+
   override def optCVCOptions: SetOptionDef[String] = optCVC5Options
 
   // Under `--strings-bmp`, restrict the string alphabet to the BMP (by default, cvc5 uses all
   // 0x30000 SMT-LIB characters).
-  override protected def targetOpts: Seq[String] =
-    if (maxStringChar == 0xFFFF) Seq("--strings-alpha-card=65536") else Seq.empty
+  override protected def targetOpts: Seq[String] = {
+    val rlimit = options.findOptionOrDefault(optCVC5Rlimit)
+    (if (maxStringChar == 0xFFFF) Seq("--strings-alpha-card=65536") else Seq.empty) ++
+      (if (rlimit > 0) Seq(s"--rlimit=$rlimit") else Seq.empty)
+  }
 }

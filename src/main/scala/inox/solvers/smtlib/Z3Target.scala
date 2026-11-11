@@ -19,6 +19,8 @@ import _root_.smtlib.theories._
 import utils._
 import utils.CaseSplit.*
 
+object optZ3Rlimit extends LongOptionDef("z3-rlimit", 0L, "<N>")
+
 trait Z3Target extends SMTLIBTarget with SMTLIBDebugger {
   import context.{given, _}
   import program._
@@ -27,10 +29,13 @@ trait Z3Target extends SMTLIBTarget with SMTLIBDebugger {
 
   def targetName = "z3"
 
-  protected def interpreterOpts = Seq(
-    "-in",
-    "-smt2"
-  )
+  protected def interpreterOpts = {
+    val rlimit = options.findOptionOrDefault(optZ3Rlimit)
+    Seq(
+      "-in",
+      "-smt2"
+    ) ++ (if (rlimit > 0) Seq(s"rlimit=$rlimit") else Seq())
+  }
 
   // the parser doesn't refer to the target, so that the processes left for other solvers don't
   // keep it alive
