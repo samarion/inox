@@ -1,0 +1,186 @@
+name: Stainless Bolts downstream
+
+# Runs the Bolts projects of the Stainless nightly CI (epfl-lara/bolts, tctests.txt) with a
+# Stainless built against this Inox. The nightly runs them one after the other on a self-hosted
+# runner; here each project gets its own GitHub-hosted runner.
+
+on:
+  workflow_dispatch:
+    inputs:
+      prs:
+        description: 'Space-separated Inox PR numbers to merge and test together (empty tests this branch)'
+        required: false
+        default: ''
+      stainless_repo:
+        description: 'Stainless repository to test'
+        required: false
+        default: 'epfl-lara/stainless'
+      stainless_ref:
+        description: 'Stainless branch, tag or commit (empty for the default branch)'
+        required: false
+        default: ''
+      bolts_ref:
+        description: 'epfl-lara/bolts branch, tag or commit'
+        required: false
+        default: 'main'
+      projects:
+        description: 'Space-separated Bolts projects to run (empty runs the list)'
+        required: false
+        default: ''
+      lite:
+        description: 'Only run the lite subset (tctests_lite.txt)'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  JAVA_OPTS_TMP_DIR: /tmp/tmp_${{ github.run_id }}_${{ github.run_attempt }}
+
+jobs:
+  build:
+    name: Build Stainless
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      projects: ${{ steps.projects.outputs.projects }}
+    env:
+      JAVA_OPTS: -Dsbt.io.implicit.relative.glob.conversion=allow -Xss512M -Xms1024M -Xmx10G -XX:MaxMetaspaceSize=2G -XX:+UseCodeCacheFlushing -XX:ReservedCodeCacheSize=768M
+      JVM_OPTS: -Dsbt.io.implicit.relative.glob.conversion=allow -Xss512M -Xms1024M -Xmx10G -XX:MaxMetaspaceSize=2G -XX:+UseCodeCacheFlushing -XX:ReservedCodeCacheSize=768M
+      INOX_DIR: ${{ github.workspace }}/inox
+      STAINLESS_DIR: ${{ github.workspace }}/stainless
+    steps:
+    - name: Checkout Inox
+      uses: actions/checkout@v4
+      with:
+        path: inox
+        fetch-depth: 0
+    - name: Merge requested Inox PRs
+      if: inputs.prs != ''
+      working-directory: ${{ env.INOX_DIR }}
+      run: |
+        git config user.name "CI" && git config user.email "ci@localhost"
+        for pr in ${{ inputs.prs }}; do
+          git fetch origin "pull/$pr/head:pr-$pr"
+          # PR branches based on epfl-lara main differ from this fork in CI files: keep ours
+          git merge --no-edit "pr-$pr" || { git checkout --ours .github && git add .github && git -c core.editor=true merge --continue; }
+        done
+        git log --oneline -n 10
+    - name: Checkout Stainless
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ inputs.stainless_repo || 'epfl-lara/stainless' }}
+        ref: ${{ inputs.stainless_ref }}
+        path: stainless
+        submodules: recursive
+    - name: Update Stainless Inox checkout
+      run: |
+        rm -rf "$STAINLESS_DIR/inox"
+        mkdir -p "$STAINLESS_DIR/inox"
+        rsync -a --delete --exclude='.git' "$INOX_DIR/" "$STAINLESS_DIR/inox/"
+    - name: Checkout Bolts
+      uses: actions/checkout@v4
+      with:
+        repository: epfl-lara/bolts
+        ref: ${{ inputs.bolts_ref }}
+        path: bolts
+    - name: List the Bolts projects
+      id: projects
+      working-directory: bolts
+      run: |
+        list=${{ inputs.lite && 'tctests_lite.txt' || 'tctests.txt' }}
+        if [ -n "$PROJECTS" ]; then echo "$PROJECTS" > selected.txt; list=selected.txt; fi
+        echo "projects=$(tr -s ' \n' '\n' < "$list" | sed '/^$/d' | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+      env:
+        PROJECTS: ${{ inputs.projects }}
+    - name: Setup JDK
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: 17
+        cache: sbt
+    - name: Setup java options
+      run: |
+          echo "JAVA_OPTS=$JAVA_OPTS -Djava.io.tmpdir=$JAVA_OPTS_TMP_DIR" >> "$GITHUB_ENV" && \
+          echo "JVM_OPTS=$JVM_OPTS -Djava.io.tmpdir=$JAVA_OPTS_TMP_DIR" >> "$GITHUB_ENV" && \
+          echo "SBT_OPTS=-Djava.io.tmpdir=$JAVA_OPTS_TMP_DIR --sbt-dir $JAVA_OPTS_TMP_DIR" >> "$GITHUB_ENV"
+    - name: Creating temp folder
+      run: rm -rf "$JAVA_OPTS_TMP_DIR" && mkdir -p "$JAVA_OPTS_TMP_DIR" && chmod 777 "$JAVA_OPTS_TMP_DIR"
+    - name: Install and unpack sbt
+      working-directory: ${{ env.STAINLESS_DIR }}
+      run: |
+        wget -q https://github.com/sbt/sbt/releases/download/v1.10.1/sbt-1.10.1.tgz
+        tar xfz sbt-1.10.1.tgz
+        echo "PATH=$STAINLESS_DIR/sbt/bin:$PATH" >> "$GITHUB_ENV"
+    - name: Build and Package
+      working-directory: ${{ env.STAINLESS_DIR }}
+      run: ./stainless-ci.sh --build-only
+    - name: Archive the staged Stainless
+      # A tarball keeps the launcher scripts executable
+      run: tar czf stainless-stage.tgz -C "$STAINLESS_DIR/frontends/dotty/target/universal" stage
+    - uses: actions/upload-artifact@v4
+      with:
+        name: stainless-stage
+        path: stainless-stage.tgz
+        retention-days: 3
+
+  bolts:
+    name: ${{ matrix.project }}
+    needs: build
+    runs-on: ubuntu-latest
+    # GitHub-hosted runners stop jobs at 6 hours
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        project: ${{ fromJSON(needs.build.outputs.projects) }}
+    env:
+      # Same as the nightly, with a heap that leaves room for the solvers on a 16 GB runner
+      JAVA_OPTS: -Dsbt.io.implicit.relative.glob.conversion=allow -Xss512M -Xms1024M -Xmx10G -XX:MaxMetaspaceSize=2G -XX:+UseCodeCacheFlushing -XX:ReservedCodeCacheSize=768M
+    steps:
+    - name: Checkout Bolts
+      uses: actions/checkout@v4
+      with:
+        repository: epfl-lara/bolts
+        ref: ${{ inputs.bolts_ref }}
+        path: bolts
+    - uses: actions/download-artifact@v4
+      with:
+        name: stainless-stage
+    - name: Unpack Stainless
+      run: |
+        mkdir -p "$RUNNER_TEMP/stainless"
+        tar xzf stainless-stage.tgz -C "$RUNNER_TEMP/stainless"
+        echo "$RUNNER_TEMP/stainless/stage/bin" >> "$GITHUB_PATH"
+    - name: Setup JDK
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: 17
+    - name: Setup java options
+      run: |
+          echo "JAVA_OPTS=$JAVA_OPTS -Djava.io.tmpdir=$JAVA_OPTS_TMP_DIR" >> "$GITHUB_ENV"
+          rm -rf "$JAVA_OPTS_TMP_DIR" && mkdir -p "$JAVA_OPTS_TMP_DIR" && chmod 777 "$JAVA_OPTS_TMP_DIR"
+    - name: Install solvers
+      # Same versions as the Stainless downstream CI
+      run: |
+        set -e
+        BIN="$GITHUB_WORKSPACE/.local/bin"
+        TMP="$RUNNER_TEMP/solvers"
+        mkdir -p "$BIN" "$TMP"
+        curl -fsSL https://github.com/cvc5/cvc5/releases/download/cvc5-1.3.4/cvc5-Linux-x86_64-static.zip -o "$TMP/cvc5.zip"
+        unzip -q "$TMP/cvc5.zip" -d "$TMP/cvc5"
+        mv "$TMP"/cvc5/*/bin/cvc5 "$BIN/cvc5"
+        curl -fsSL https://github.com/CVC4/CVC4-archived/releases/download/1.8/cvc4-1.8-x86_64-linux-opt -o "$BIN/cvc4"
+        curl -fsSL https://github.com/Z3Prover/z3/releases/download/z3-5.0.0/z3-5.0.0-x64-glibc-2.39.zip -o "$TMP/z3.zip"
+        unzip -q "$TMP/z3.zip" -d "$TMP/z3"
+        mv "$TMP"/z3/*/bin/z3 "$BIN/z3"
+        chmod +x "$BIN/cvc5" "$BIN/cvc4" "$BIN/z3"
+        echo "$BIN" >> "$GITHUB_PATH"
+    - name: Check the tools
+      run: which stainless-dotty && z3 --version && cvc5 --version
+    - name: Verify ${{ matrix.project }}
+      working-directory: bolts
+      run: ./run-one-test.sh stainless-dotty "${{ matrix.project }}"
