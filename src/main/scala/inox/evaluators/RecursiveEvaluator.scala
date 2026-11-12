@@ -87,6 +87,24 @@ abstract class RecursiveEvaluator(override val program: Program,
     *   input. They are told apart by their results on the closed subexpressions of the right type
     *   that they contain (for extracted models, the inputs that tell them apart), and their equality
     *   is undecidable otherwise. */
+  private val auditWeakOf = new java.util.IdentityHashMap[Expr, Expr]
+
+  /** Audit: reports the lambdas that `v1 == v2` equates and that would differ if their ground values
+    * had been normalized as variables. */
+  private def auditEqual(v1: Expr, v2: Expr): Unit = if (v1 == v2) {
+    val ls1 = exprOps.collectPreorder[Expr] { case l: Lambda => Seq(l) case _ => Seq() } (v1)
+    val ls2 = exprOps.collectPreorder[Expr] { case l: Lambda => Seq(l) case _ => Seq() } (v2)
+    for ((l1, l2) <- ls1 zip ls2) {
+      val (w1, w2) = auditWeakOf.synchronized((auditWeakOf.get(l1), auditWeakOf.get(l2)))
+      if (w1 == null || w2 == null) utils.LambdaEqualityAudit.check("evaluator-equality.untracked")
+      else {
+        utils.LambdaEqualityAudit.check("evaluator-equality")
+        if (w1 != w2) utils.LambdaEqualityAudit.report("evaluator-equality",
+          s"  lambda @ ${l1.getPos} / ${l2.getPos}: $l1\n  weaker1: $w1\n  weaker2: $w2")
+      }
+    }
+  }
+
   protected def valuesEqual(v1: Expr, v2: Expr)(using rctx: RC, gctx: GC): Boolean = (v1, v2) match {
     case _ if functionEquality == solvers.unrolling.FunctionEquality.Intensional => v1 == v2
     case (ADT(id1, _, args1), ADT(id2, _, args2)) =>
@@ -225,7 +243,9 @@ abstract class RecursiveEvaluator(override val program: Program,
       }
 
     case Equals(le,re) =>
-      BooleanLiteral(valuesEqual(e(le), e(re)))
+      val (lv, rv) = (e(le), e(re))
+      auditEqual(lv, rv)
+      BooleanLiteral(valuesEqual(lv, rv))
 
     case ADT(id, tps, args) =>
       val cc = ADT(id, tps.map(_.getType), args.map(e))
@@ -260,8 +280,8 @@ abstract class RecursiveEvaluator(override val program: Program,
       }
 
     case l @ Lambda(_, _) =>
-      def normalizeLambda(l: Lambda, onlySimple: Boolean = false): Lambda = {
-        val (nl, deps) = normalizeStructure(l, onlySimple = onlySimple)
+      def normalizeLambda(l: Lambda, onlySimple: Boolean = false, abstractValues: Boolean = false): Lambda = {
+        val (nl, deps) = normalizeStructure(l, onlySimple = onlySimple, abstractValues = abstractValues)
         // The subexpressions lifted out of the body are evaluated when their conditions hold. Otherwise,
         // or when their evaluation fails, they are put back unevaluated: the solvers leave them
         // unconstrained when their conditions don't hold, and they may only be pure under assumptions
@@ -297,7 +317,16 @@ abstract class RecursiveEvaluator(override val program: Program,
       // `onlySimple = true` to the call to `normalizeStructure` (this avoids lifting
       // ground lambdas out in the deps).
       val normalized = normalizeLambda(ground, onlySimple = true)
-      simplifyTrivialApps(normalized)
+      val result = simplifyTrivialApps(normalized)
+      try {
+        // Audit: the lambda that normalizing ground values as variables would give
+        val weak = normalizeLambda(normalizeLambda(closed.asInstanceOf[Lambda], abstractValues = true),
+          onlySimple = true, abstractValues = true)
+        auditWeakOf.synchronized(auditWeakOf.put(result, weak))
+      } catch {
+        case scala.util.control.NonFatal(ex) => utils.LambdaEqualityAudit.report("audit-error", s"  $ex")
+      }
+      result
 
     case f: Forall => onForallInvocation(
       replaceFromSymbols(variablesOf(f).map(v => v -> e(v)).toMap, f).asInstanceOf[Forall], rctx.interpretations)

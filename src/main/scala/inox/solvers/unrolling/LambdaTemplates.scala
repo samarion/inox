@@ -355,12 +355,31 @@ trait LambdaTemplates { self: Templates =>
       false
   }
 
+  private val auditWeakCache = MutableMap.empty[Lambda, Expr]
+  private def auditWeak(l: Lambda): Expr = auditWeakCache.getOrElseUpdate(l,
+    typeOps.simplify(normalizeStructure(l, abstractValues = true)._1))
+
+  /** Reports the pairs of lambdas that the current normalization equates (or makes equal when their
+    * closures are) and that normalizing ground values as variables would tell apart. */
+  private def auditPair(kind: String, t1: LambdaTemplate, t2: LambdaTemplate): Unit = try {
+    LambdaEqualityAudit.check(kind)
+    val (w1, w2) = (auditWeak(t1.lambda), auditWeak(t2.lambda))
+    if (w1 != w2) LambdaEqualityAudit.report(kind,
+      s"  lambda1 @ ${t1.lambda.getPos}: ${t1.lambda}\n" +
+      s"  lambda2 @ ${t2.lambda.getPos}: ${t2.lambda}\n" +
+      s"  current: ${t1.structure.body}\n" +
+      s"  weaker1: $w1\n" +
+      s"  weaker2: $w2")
+  } catch {
+    case scala.util.control.NonFatal(e) => LambdaEqualityAudit.report("audit-error", s"  $e")
+  }
+
   def instantiateLambda(template: LambdaTemplate): (Encoded, Clauses) = {
     byType(template.tpe).get(template.structure).map {
-      t => (t.ids._2, Seq.empty)
+      t => auditPair("solver-merged", template, t); (t.ids._2, Seq.empty)
     }.orElse {
       byType(template.tpe).collectFirst {
-        case (s, t) if s `subsumes` template.structure => (t.ids._2, Seq.empty)
+        case (s, t) if s `subsumes` template.structure => auditPair("solver-merged", template, t); (t.ids._2, Seq.empty)
       }
     }.getOrElse {
       val idT = encodeSymbol(template.ids._1)
@@ -552,6 +571,7 @@ trait LambdaTemplates { self: Templates =>
 
       val sameBody = typeOps.simplify(template.structure.body) == typeOps.simplify(that.structure.body)
       val differingLocals = (template.structure.locals zip that.structure.locals).filter(p => p._1 != p._2)
+      if (sameBody) auditPair("solver-closure-equality", template, that)
       val closuresEqual: Option[Encoded] =
         if (sameBody && differingLocals.isEmpty) {
           Some(trueT)

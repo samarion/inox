@@ -579,8 +579,25 @@ trait SymbolOps extends TypeOps { self =>
     * [[normalizeStructure(args:Seq[SymbolOps\.this\.trees\.ValDef],expr:SymbolOps\.this\.trees\.Expr,preserveApps:Boolean,onlySimple:Boolean,inFunction:Boolean,preserveArgTypes:Boolean)* normalizeStructure]]
     * that is tailored for structural equality of [[Expressions.Lambda Lambda]] and [[Expressions.Forall Forall]] instances.
     */
-  def normalizeStructure(e: Expr, onlySimple: Boolean = false)
+  def normalizeStructure(e: Expr, onlySimple: Boolean = false, abstractValues: Boolean = false)
                         (using PurityOptions): (Expr, Seq[(Variable, Expr, Seq[Expr])]) = freshenLocals(e) match {
+    case lambda: Lambda if abstractValues =>
+      // Ground values are normalized as if they were variables, so that normalization commutes with
+      // substituting values for the free variables of the lambda
+      val values = MutableMap.empty[Variable, Expr]
+      val abstracted = preMap {
+        case v if !v.isInstanceOf[Variable] && variablesOf(v).isEmpty && isValue(v) =>
+          val w = Variable.fresh("w", v.getType)
+          values(w) = v
+          Some(w)
+        case _ => None
+      } (lambda.body)
+      val (args, body, subst) = normalizeStructure(lambda.params, abstracted, false, onlySimple, true, false)
+      val vs = values.toMap
+      (Lambda(args, body), subst.map { case (v, e, conds) =>
+        (v, replaceFromSymbols(vs, e), conds.map(replaceFromSymbols(vs, _)))
+      })
+
     case lambda: Lambda =>
       val (args, body, subst) = normalizeStructure(lambda.params, lambda.body, false, onlySimple, true, false)
       (Lambda(args, body), subst)
