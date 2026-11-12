@@ -23,6 +23,10 @@ on:
         description: 'epfl-lara/bolts branch, tag or commit'
         required: false
         default: 'main'
+      projects:
+        description: 'Space-separated Bolts projects to run (empty runs the list)'
+        required: false
+        default: ''
       lite:
         description: 'Only run the lite subset (tctests_lite.txt)'
         type: boolean
@@ -87,7 +91,10 @@ jobs:
       working-directory: bolts
       run: |
         list=${{ inputs.lite && 'tctests_lite.txt' || 'tctests.txt' }}
+        if [ -n "$PROJECTS" ]; then echo "$PROJECTS" > selected.txt; list=selected.txt; fi
         echo "projects=$(tr -s ' \n' '\n' < "$list" | sed '/^$/d' | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+      env:
+        PROJECTS: ${{ inputs.projects }}
     - name: Setup JDK
       uses: actions/setup-java@v4
       with:
