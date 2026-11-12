@@ -5,8 +5,10 @@ package inox
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.concurrent._
 import org.scalatest.matchers.should.Matchers
-import org.scalatest.{CancelAfterFailure, Tag, exceptions}
+import org.scalatest.{Args, CancelAfterFailure, Status, Tag, exceptions}
 import utils._
+
+import scala.collection.mutable
 
 trait TestSuite extends AnyFunSuite with Matchers with TimeLimits {
 
@@ -26,6 +28,24 @@ trait TestSuite extends AnyFunSuite with Matchers with TimeLimits {
 
   protected def test(name: String, tags: Tag*)(body: Context ?=> Unit): Unit =
     test(name, _ => Test, tags*)(body)
+
+  // Whether this instance defers the registration of its tests, see [[TestSuite.deferringRegistration]]
+  private val deferRegistration = TestSuite.deferring.get
+  // The registrations that this instance deferred, by test name (which scalatest trims)
+  private val deferredRegistrations = mutable.Map[String, () => Unit]()
+
+  private def register(testName: String)(registration: => Unit): Unit =
+    if (deferRegistration) deferredRegistrations(testName.trim) = () => registration
+    else registration
+
+  override def run(testName: Option[String], args: Args): Status = {
+    if (deferRegistration) {
+      // The instance only runs `testName`, if any, so it only registers that test
+      testName.flatMap(deferredRegistrations.remove).foreach(_())
+      deferredRegistrations.clear()
+    }
+    super.run(testName, args)
+  }
 
   sealed abstract class FilterStatus
   case object Test extends FilterStatus
@@ -58,10 +78,12 @@ trait TestSuite extends AnyFunSuite with Matchers with TimeLimits {
             (sname == "smt-z3" || sname == "smt-z3-opt") && !solvers.SolverFactory.hasZ3 ||
             sname == "smt-cvc4" && !solvers.SolverFactory.hasCVC4
           }) {
-            superIgnore(this, f"$index%3d: $name ${optionsString(newCtx.options)}")(())
+            val testName = f"$index%3d: $name ${optionsString(newCtx.options)}"
+            register(testName)(superIgnore(this, testName)(()))
           } else {
+            val testName = f"$index%3d: $name ${optionsString(newCtx.options)}"
             try {
-              superTest(this, f"$index%3d: $name ${optionsString(newCtx.options)}")(body(using newCtx))
+              register(testName)(superTest(this, testName)(body(using newCtx)))
             } catch {
               case err: FatalError =>
                 reporter.error(err.msg)
@@ -84,4 +106,26 @@ trait TestSuite extends AnyFunSuite with Matchers with TimeLimits {
       case Skip => Skip
       case _ => Ignore
     }, tags*)(body)
+}
+
+object TestSuite {
+  private val deferring = new ThreadLocal[Boolean] {
+    override def initialValue(): Boolean = false
+  }
+
+  /** Creates a suite that only registers the test that it runs.
+    *
+    * Scalatest's `ParallelTestExecution` runs each test of a suite in an instance of its own, which
+    * it creates with `newInstance`, and each instance registers all the tests of the suite. As
+    * scalatest appends each test it registers to a list, a suite of `n` tests spends a time
+    * quadratic in `n` in each instance, and cubic in all: for Stainless's verification suites,
+    * with thousands of tests, this took more time than some of the solving. Suites can override
+    * `newInstance` to create their instances with this method, which only register the test they
+    * run, when they run it.
+    */
+  def deferringRegistration[T](create: => T): T = {
+    val previous = deferring.get
+    deferring.set(true)
+    try create finally deferring.set(previous)
+  }
 }
