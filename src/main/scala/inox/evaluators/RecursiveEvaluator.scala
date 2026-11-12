@@ -260,11 +260,22 @@ abstract class RecursiveEvaluator(override val program: Program,
     case l @ Lambda(_, _) =>
       def normalizeLambda(l: Lambda, onlySimple: Boolean = false): Lambda = {
         val (nl, deps) = normalizeStructure(l, onlySimple = onlySimple)
+        // The subexpressions lifted out of the body are evaluated when their conditions hold. Otherwise,
+        // or when their evaluation fails, they are put back unevaluated: the solvers leave them
+        // unconstrained when their conditions don't hold, and they may only be pure under assumptions
+        // (with `--assume-checked`, e.g. `10 / k` in `if (k > 0) x + 10 / k else x`), so evaluating
+        // the lambda must not fail on them, only applying it may.
         val newCtx = deps.foldLeft(rctx) {
           case (rctx, (v, dep, conds)) =>
-            if (conds.forall(e(_)(using rctx, gctx) == BooleanLiteral(true)))
-              rctx.withNewVar(v.toVal, e(dep)(using rctx, gctx))
-            else rctx
+            def unevaluated = replaceFromSymbols(
+              variablesOf(dep).flatMap(u => rctx.mappings.get(u.toVal).map(u -> _)).toMap, dep)
+            val value = try {
+              if (conds.forall(e(_)(using rctx, gctx) == BooleanLiteral(true))) e(dep)(using rctx, gctx)
+              else unevaluated
+            } catch {
+              case _: RuntimeError | _: EvalError => unevaluated
+            }
+            rctx.withNewVar(v.toVal, value)
         }
         val mapping = variablesOf(nl).map(v => v -> newCtx.mappings(v.toVal)).toMap
         replaceFromSymbols(mapping, nl).asInstanceOf[Lambda]
