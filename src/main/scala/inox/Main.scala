@@ -107,6 +107,7 @@ trait MainHelpers {
       "Choose input format (if 'binary' also choose method to use as expression). " +
       "Files ending in .smt3 are read as SMT-LIB 3 unless another format is given"),
     optPrintProgram -> Description(Printing, "Print the entire program"),
+    ast.optQuantifiers -> Description(Solvers, "Whether quantifiers are booleans, which can be used as values and are evaluated by solvers, or propositions, which can only state specifications"),
     optModelFormat -> Description(Printing,
       "Answer format: 'inox' (default, human readable) or 'smtlib' (one of sat/unsat/unknown on its own line, " +
       "followed for sat by the model as ((x v) ...) with SMT-LIB values)"),
@@ -129,6 +130,8 @@ trait MainHelpers {
     solvers.unrolling.optFunctionEquality -> Description(Solvers, "Semantics of equality between first-class functions: none (functions can't be compared), intensional or extensional"),
     solvers.smtlib.optCVC4Options -> Description(Solvers, "Pass extra options to CVC4"),
     solvers.smtlib.optCVC5Options -> Description(Solvers, "Pass extra options to CVC5"),
+    solvers.smtlib.optZ3Rlimit -> Description(Solvers, "Set z3's resource limit, in millions of resource units (deterministic alternative to a wall clock timeout, 0 = no limit).\nAt most 4294, larger values are capped.\nThe limit applies to each solver query separately, not to a whole verification condition,\nwhich may take many queries.\nOnly applies to the smt-z3 solvers"),
+    solvers.smtlib.optCVC5Rlimit -> Description(Solvers, "Set cvc5's resource limit, in millions of resource units (deterministic alternative to a wall clock timeout, 0 = no limit).\nThe limit applies to each solver query separately, not to a whole verification condition,\nwhich may take many queries.\nOnly applies to the smt-cvc5 solver"),
     solvers.smtlib.cvcSimplesModelOpt -> Description(Solvers, "Use --model-cores=simple with cvc family solvers to produce simpler models when queries are sat"),
     evaluators.optMaxCalls -> Description(Evaluators, "Maximum function invocations allowed during evaluation"),
     evaluators.optIgnoreContracts -> Description(Evaluators, "Don't fail on invalid contracts during evaluation")
@@ -346,7 +349,17 @@ class InoxMain extends MainHelpers {
     exit(error)
   }
 
-  protected def parse(ctx: Context, file: File): Seq[(InoxProgram, Option[Expr])] =
+  protected def parse(ctx: Context, file: File): Seq[(InoxProgram, Option[Expr])] = {
+    val quantifiers = ctx.options.findOptionOrDefault(ast.optQuantifiers)
+    // the input formats only have booleans, so the propositions are inferred
+    parseFile(ctx, file).map { case (p, e) =>
+      val inference = transformers.PropositionInference(inox.trees)
+      val symbols = inference.transform(p.symbols.withQuantifiers(quantifiers))
+      (InoxProgram(symbols), e.map(inference.transform(_)(using symbols)))
+    }
+  }
+
+  private def parseFile(ctx: Context, file: File): Seq[(InoxProgram, Option[Expr])] =
     ctx.options.findOption(optFormat).getOrElse(if (file.getName.endsWith(".smt3")) SMTLIB3 else Tip) match {
       case SMTLIB3 =>
         smtlib3.Parser(file).parseScript.map{ case (p, e) => (p, Some(e)) }

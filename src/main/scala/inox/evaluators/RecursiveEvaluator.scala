@@ -259,23 +259,26 @@ abstract class RecursiveEvaluator(override val program: Program,
 
     case l @ Lambda(_, _) =>
       def normalizeLambda(l: Lambda, onlySimple: Boolean = false): Lambda = {
-        val (nl, deps) = normalizeStructure(l, onlySimple = onlySimple)
+        val liftPartial = !onlySimple && functionEquality != solvers.unrolling.FunctionEquality.Intensional
+        val (nl, deps) = normalizeStructure(l, onlySimple = onlySimple, liftPartial = liftPartial)
         val newCtx = deps.foldLeft(rctx) {
           case (rctx, (v, dep, conds)) =>
-            if (conds.forall(e(_)(using rctx, gctx) == BooleanLiteral(true)))
-              rctx.withNewVar(v.toVal, e(dep)(using rctx, gctx))
-            else rctx
+            if (conds.forall(e(_)(using rctx, gctx) == BooleanLiteral(true))) {
+              // Expressions that may fail are lifted unless equality is intensional, and stay
+              // in the body when they do fail (eg. `x => if (x > 0) 1 / 0 else x`)
+              val value = try e(dep)(using rctx, gctx) catch {
+                case _: (EvalError | RuntimeError) if liftPartial => replaceFromSymbols(rctx.mappings.map((vd, e) => vd.toVariable -> e), dep)
+              }
+              rctx.withNewVar(v.toVal, value)
+            } else rctx
         }
         val mapping = variablesOf(nl).map(v => v -> newCtx.mappings(v.toVal)).toMap
         replaceFromSymbols(mapping, nl).asInstanceOf[Lambda]
       }
 
       // We start by normalizing the structure of the lambda as in the solver to
-      // evaluate all normalizable ground expressions within its body. The values of its free
-      // variables are substituted first, so that the result doesn't depend on whether the lambda
-      // refers to a value through a variable or directly: `x => l.head.f(x)` with `l` bound to
-      // `Cons(g, Nil())` must give the same lambda as `x => Cons(g, Nil()).head.f(x)`, in which
-      // the selection is ground and therefore evaluated.
+      // evaluate the subexpressions that it lifts out of the body. The values of its free variables
+      // are substituted first, so that `x => l.head.f(x)` and `x => Cons(g, Nil()).head.f(x)` agree.
       val closed = replaceFromSymbols(variablesOf(l).flatMap(v => rctx.mappings.get(v.toVal).map(v -> _)).toMap, l)
       val ground = normalizeLambda(closed.asInstanceOf[Lambda])
 
@@ -283,8 +286,7 @@ abstract class RecursiveEvaluator(override val program: Program,
       // lists and let bindings, we re-normalize the identifiers by passing
       // `onlySimple = true` to the call to `normalizeStructure` (this avoids lifting
       // ground lambdas out in the deps).
-      val normalized = normalizeLambda(ground, onlySimple = true)
-      simplifyTrivialApps(normalized)
+      normalizeLambda(ground, onlySimple = true)
 
     case f: Forall => onForallInvocation(
       replaceFromSymbols(variablesOf(f).map(v => v -> e(v)).toMap, f).asInstanceOf[Forall], rctx.interpretations)
@@ -949,27 +951,6 @@ abstract class RecursiveEvaluator(override val program: Program,
     *   is simplified into:
     *     (x: BigInt) => 0
     */
-  private def simplifyTrivialApps(expr: Expr)(using rctx: RC, gctx: GC): Expr = {
-    def isLambdaTrivial(l: Lambda): Boolean =
-      l.params.forall(vd => !occursIn(vd, l.body))
-
-    val transformer = new ConcreteSelfTreeTransformer {
-      override def transform(expr: Expr): Expr = expr match {
-        case Application(l@Lambda(_, body), _) if isLambdaTrivial(l) =>
-          body
-        case Application(v: Variable, _) =>
-          rctx.mappings.get(v.toVal) match {
-            case Some(l@Lambda(_, body)) if isLambdaTrivial(l) =>
-              body
-            case _ =>
-              // Fallback to recursive transformation of the *original* expression
-              super.transform(expr)
-          }
-        case _ => super.transform(expr)
-      }
-    }
-    transformer.transform(expr)
-  }
 }
 
 object RecursiveEvaluator {

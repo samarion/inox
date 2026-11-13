@@ -11,6 +11,14 @@ trait Z3Solver extends SMTLIBSolver with Z3Target { self =>
   import program.trees._
   import SolverResponses._
 
+  // When interrupted by its resource limit, z3 answers "canceled" for
+  // check-sat with assumptions (and "max. resource limit exceeded" for plain
+  // check-sat), so we only interpret it as a resource-out when a resource
+  // limit was actually configured.
+  override protected def isResourceOutReason(reason: String): Boolean =
+    super.isResourceOutReason(reason) ||
+    (context.options.findOptionOrDefault(optZ3Rlimit) >= 0 && reason.toLowerCase.contains("canceled"))
+
   // Completes the solver's models, in which function values are compared as such. The evaluation
   // of a huge model stops when the solver is interrupted (see `RecursiveEvaluator.e`).
   protected lazy val evalContext: inox.Context =
@@ -21,6 +29,12 @@ trait Z3Solver extends SMTLIBSolver with Z3Target { self =>
   override def interrupt(): Unit = {
     super.interrupt()
     if (!evalContext.interruptManager.isInterrupted) evalContext.interruptManager.interrupt()
+  }
+
+  // Define the set sort outside of any scope, since `pop` would drop a definition made inside one
+  override def push(): Unit = {
+    setSort
+    super.push()
   }
 
   override def reset(): Unit = {
@@ -55,6 +69,7 @@ trait Z3Solver extends SMTLIBSolver with Z3Target { self =>
     * send the command to the underlying smtlib solver.
     */
   override def checkAssumptions(config: Configuration)(assumptions: Set[Expr]) = {
+    clearResourceOut()
     // make sure assumptions are well-formed and contain only declared variables
     assumptions.foreach {
       case Not(v: Variable) => declareVariable(v)
