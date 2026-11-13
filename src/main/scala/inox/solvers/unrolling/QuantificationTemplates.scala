@@ -177,6 +177,12 @@ trait QuantificationTemplates { self: Templates =>
     private[QuantificationTemplates] val matcherBlockers = new IncrementalMap[Matcher, Encoded]
     private[QuantificationTemplates] val substBlockers   = new IncrementalMap[(Axiom, Map[Encoded, Arg]), Encoded]
 
+    /** The blockers under which each matcher was seen while there were no axioms. Matcher blockers
+      * only enable the instantiations of axioms, so the clauses `blockers ==> matcherBlocker` are
+      * useless until then. They are held back here and emitted with the first axiom
+      * (@see [[pendingMatcherClauses]]), which most queries never reach. */
+    private[QuantificationTemplates] val pendingMatchers = new IncrementalSeq[(Set[Encoded], Encoded)]
+
     private[QuantificationTemplates] val ignoredMatchers = new IncrementalSeq[(Int, Set[Encoded], Matcher)]
     private[QuantificationTemplates] val ignoredSubsts   = new IncrementalMap[Axiom, Set[(Int, Set[Encoded], Map[Encoded,Arg])]]
     private[QuantificationTemplates] val ignoredGrounds  = new IncrementalMap[Int, Set[Axiom]]
@@ -185,7 +191,7 @@ trait QuantificationTemplates { self: Templates =>
     private[QuantificationTemplates] val templates       = new IncrementalMap[TemplateStructure, (QuantificationTemplate, Encoded)]
 
     val incrementals: Seq[IncrementalState] = Seq(axioms, lambdaAxioms, templates,
-      matcherBlockers, substBlockers, ignoredMatchers, ignoredSubsts, ignoredGrounds)
+      matcherBlockers, substBlockers, pendingMatchers, ignoredMatchers, ignoredSubsts, ignoredGrounds)
 
     override def push(): Unit  = { super.push();  for (q <- axioms) q.push()  }
     override def pop(): Unit   = { super.pop();   for (q <- axioms) q.pop()   }
@@ -294,14 +300,25 @@ trait QuantificationTemplates { self: Templates =>
       }
 
       if (blockers != Set(matcherBlocker)) {
-        val (blocker, blockerClauses) = encodeBlockers(blockers)
-        registerImplication(blocker, matcherBlocker)
-        clauses ++= blockerClauses
-        clauses += mkImplies(blocker, matcherBlocker)
+        if (axioms.isEmpty) pendingMatchers += ((blockers, matcherBlocker))
+        else clauses ++= matcherClauses(blockers, matcherBlocker)
       }
 
       clauses.toSeq
     }
+  }
+
+  private def matcherClauses(blockers: Set[Encoded], matcherBlocker: Encoded): Clauses = {
+    val (blocker, blockerClauses) = encodeBlockers(blockers)
+    registerImplication(blocker, matcherBlocker)
+    blockerClauses :+ mkImplies(blocker, matcherBlocker)
+  }
+
+  /** The clauses of the matchers that were seen before the first axiom. */
+  private def pendingMatcherClauses: Clauses = {
+    val pending = pendingMatchers.toList
+    for (p <- pending) pendingMatchers -= p
+    pending.flatMap { case (blockers, matcherBlocker) => matcherClauses(blockers, matcherBlocker) }
   }
 
   def hasAxioms: Boolean = axioms.nonEmpty
@@ -714,6 +731,7 @@ trait QuantificationTemplates { self: Templates =>
       val subst: (Encoded, Map[Encoded, Encoded]) = (newTemplate.polarity match {
         case Positive(subst) =>
           val axiom = new Axiom(newTemplate.contents, subst, newTemplate.body, newTemplate.isDeferred)
+          if (axioms.isEmpty) clauses ++= pendingMatcherClauses
           axioms += axiom
 
           for ((m,b) <- matcherBlockers.toList) {
@@ -884,13 +902,21 @@ trait QuantificationTemplates { self: Templates =>
   }
 
   def getGroundInstantiations(e: Encoded, tpe: Type): Seq[(Encoded, Seq[Encoded])] = {
+    // The blockers of the matchers whose clauses are held back are unconstrained in the model,
+    // so the blockers that would imply them stand for them.
+    lazy val pending: Map[Encoded, Encoded] = pendingMatchers.toList.groupMap(_._2)(_._1).map {
+      case (matcherBlocker, blockerSets) =>
+        val enablers = blockerSets.map(_.toSeq.filter(_ != trueT))
+        matcherBlocker -> (if (enablers.exists(_.isEmpty)) trueT else mkOr(enablers.map(bs => mkAnd(bs*))*))
+    }
+
     matcherBlockers.toList.flatMap { case (m, b) =>
       val optArgs = matcherKey(m) match {
         case tp: TypedKey if tpe == tp.tpe => Some(m.args.map(_.encoded))
         case _ => None
       }
 
-      optArgs.map(args => b -> args)
+      optArgs.map(args => (if (axioms.isEmpty) pending.getOrElse(b, b) else b) -> args)
     }
   }
 }
