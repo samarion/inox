@@ -4,6 +4,7 @@ package inox
 package evaluators
 
 import inox.ast.Trees
+import inox.ast.SymbolOps.NormalizationLifting
 import inox.transformers.TreeTransformer
 
 import inox.utils.CaseSplit.*
@@ -258,19 +259,23 @@ abstract class RecursiveEvaluator(override val program: Program,
       }
 
     case l @ Lambda(_, _) =>
-      def normalizeLambda(l: Lambda, onlySimple: Boolean = false): Lambda = {
-        val liftPartial = !onlySimple && functionEquality != solvers.unrolling.FunctionEquality.Intensional
-        val (nl, deps) = normalizeStructure(l, onlySimple = onlySimple, liftPartial = liftPartial)
+      def normalizeLambda(l: Lambda, lifting: NormalizationLifting): Lambda = {
+        val (nl, deps) = normalizeStructure(l, lifting)
+        // The lifted subexpressions are evaluated when their conditions hold. Otherwise, or when their
+        // evaluation fails, they are put back unevaluated: they may only be pure under assumptions
+        // (eg. `10 / k` under `--assume-checked`) or be partial operations (see `NormalizationLifting`),
+        // and only applying the lambda may fail on them.
         val newCtx = deps.foldLeft(rctx) {
           case (rctx, (v, dep, conds)) =>
-            if (conds.forall(e(_)(using rctx, gctx) == BooleanLiteral(true))) {
-              // Expressions that may fail are lifted unless equality is intensional, and stay
-              // in the body when they do fail (eg. `x => if (x > 0) 1 / 0 else x`)
-              val value = try e(dep)(using rctx, gctx) catch {
-                case _: (EvalError | RuntimeError) if liftPartial => replaceFromSymbols(rctx.mappings.map((vd, e) => vd.toVariable -> e), dep)
-              }
-              rctx.withNewVar(v.toVal, value)
-            } else rctx
+            def unevaluated = replaceFromSymbols(
+              variablesOf(dep).flatMap(u => rctx.mappings.get(u.toVal).map(u -> _)).toMap, dep)
+            val value = try {
+              if (conds.forall(e(_)(using rctx, gctx) == BooleanLiteral(true))) e(dep)(using rctx, gctx)
+              else unevaluated
+            } catch {
+              case _: RuntimeError | _: EvalError => unevaluated
+            }
+            rctx.withNewVar(v.toVal, value)
         }
         val mapping = variablesOf(nl).map(v => v -> newCtx.mappings(v.toVal)).toMap
         replaceFromSymbols(mapping, nl).asInstanceOf[Lambda]
@@ -280,13 +285,13 @@ abstract class RecursiveEvaluator(override val program: Program,
       // evaluate the subexpressions that it lifts out of the body. The values of its free variables
       // are substituted first, so that `x => l.head.f(x)` and `x => Cons(g, Nil()).head.f(x)` agree.
       val closed = replaceFromSymbols(variablesOf(l).flatMap(v => rctx.mappings.get(v.toVal).map(v -> _)).toMap, l)
-      val ground = normalizeLambda(closed.asInstanceOf[Lambda])
+      val ground = normalizeLambda(closed.asInstanceOf[Lambda],
+        if (functionEquality == solvers.unrolling.FunctionEquality.Intensional) NormalizationLifting.Pure else NormalizationLifting.Partial)
 
       // Then, in order for nested lambdas to have fresh variables in their argument
-      // lists and let bindings, we re-normalize the identifiers by passing
-      // `onlySimple = true` to the call to `normalizeStructure` (this avoids lifting
-      // ground lambdas out in the deps).
-      normalizeLambda(ground, onlySimple = true)
+      // lists and let bindings, we re-normalize the identifiers with `NormalizationLifting.Simple`
+      // (this avoids lifting ground lambdas out in the deps).
+      normalizeLambda(ground, NormalizationLifting.Simple)
 
     case f: Forall => onForallInvocation(
       replaceFromSymbols(variablesOf(f).map(v => v -> e(v)).toMap, f).asInstanceOf[Forall], rctx.interpretations)
