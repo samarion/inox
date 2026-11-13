@@ -19,6 +19,10 @@ import _root_.smtlib.theories._
 import utils._
 import utils.CaseSplit.*
 
+// In millions of z3 resource units
+// An Int, so that the limit in resource units can't overflow the Long it is computed in
+object optZ3Rlimit extends IntOptionDef("z3-rlimit", -1, "<N>")
+
 trait Z3Target extends SMTLIBTarget with SMTLIBDebugger {
   import context.{given, _}
   import program._
@@ -27,10 +31,14 @@ trait Z3Target extends SMTLIBTarget with SMTLIBDebugger {
 
   def targetName = "z3"
 
-  protected def interpreterOpts = Seq(
-    "-in",
-    "-smt2"
-  )
+  protected def interpreterOpts = {
+    // z3 takes the limit as an unsigned 32-bit integer
+    val rlimit = options.findOptionOrDefault(optZ3Rlimit).toLong * 1000000L min 0xFFFFFFFFL
+    Seq(
+      "-in",
+      "-smt2"
+    ) ++ (if (rlimit >= 0) Seq(s"rlimit=$rlimit") else Seq())
+  }
 
   // the parser doesn't refer to the target, so that the processes left for other solvers don't
   // keep it alive
@@ -43,21 +51,26 @@ trait Z3Target extends SMTLIBTarget with SMTLIBDebugger {
 
   protected val interpreter = {
     val opts = interpreterOpts
-    ProcessPool.take(processKey).getOrElse {
+    takeIdle().getOrElse {
       reporter.debug("Invoking solver "+targetName+" with "+opts.mkString(" "))
       new PipelinedZ3Interpreter(targetName, opts.toArray, out => new Z3Parser(new Lexer(out)))
     }
   }
 
+  // an idle process whose reset succeeded, the others are freed
+  @scala.annotation.tailrec
+  private def takeIdle(): Option[PipelinedZ3Interpreter] = ProcessPool.take(processKey) match {
+    case Some(z3: PipelinedZ3Interpreter) if z3.awaitReset() => Some(z3)
+    case Some(process) => process.free(); takeIdle()
+    case None => None
+  }
+
   override protected def recycle(): Boolean = interpreter match {
-    // the interpreter is used directly, as the reset isn't part of the solver's session (it also
-    // reads the answers of the commands that were sent last, see [[PipelinedInterpreter]])
-    case z3: Z3Interpreter => z3.eval(Reset()) match {
-      case Success =>
-        ProcessPool.give(processKey, z3)
-        true
-      case _ => false
-    }
+    // the process resets while it is idle, and the next solver to take it waits for that
+    case z3: PipelinedZ3Interpreter =>
+      z3.resetLater()
+      ProcessPool.give(processKey, z3)
+      true
     case _ => false
   }
 

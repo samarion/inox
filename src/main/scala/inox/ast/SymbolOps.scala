@@ -18,6 +18,12 @@ object SymbolOps {
     */
   private object optSimplestValueSolver extends FlagOptionDef("simplest-value-solver", true)
 
+  /** How many times the solver of `simplestValue` may unroll. Without a bound, it never ends for a
+    * sort whose invariant only holds for infinite values, and the solvers of model extraction don't
+    * have a timeout.
+    */
+  private object optSimplestValueUnrollBound extends IntOptionDef("simplest-value-unroll-bound", 10, "<Int> | -1 (unbounded)")
+
   private val identifiers = new scala.collection.mutable.ArrayBuffer[Identifier]
   def getId(index: Int): Identifier = synchronized {
     for (i <- identifiers.size to index) identifiers += FreshIdentifier("x", true)
@@ -411,12 +417,15 @@ trait SymbolOps extends TypeOps { self =>
       }
 
       // Uninterpreted calls are never lifted, so that closures that call distinct uninterpreted
-      // functions remain distinct. Lifting a lambda doesn't evaluate its body, so the calls and
-      // errors in it don't prevent lifting (e.g. a lambda of a model, `x => f(x)`).
-      def containsUninterpreted(e: Expr): Boolean = e match {
-        case _: UninterpretedCall | _: Error => true
+      // functions remain distinct. Neither are errors and assumptions, whose purity depends on the
+      // values of their closures: `() => assume(y > 0, y)` evaluates to `() => assume(true, 1)` when
+      // `y` is 1, which must keep the structure of the former and not become `() => 1` when it is
+      // evaluated again. Lifting a lambda doesn't evaluate its body, so the calls, errors and
+      // assumptions in it don't prevent lifting (e.g. a lambda of a model, `x => f(x)`).
+      def containsUnliftable(e: Expr): Boolean = e match {
+        case _: UninterpretedCall | _: Error | _: Assume => true
         case _: Lambda => false
-        case Operator(es, _) => es.exists(containsUninterpreted)
+        case Operator(es, _) => es.exists(containsUnliftable)
       }
 
       def containsRecursive(e: Expr): Boolean =
@@ -427,7 +436,7 @@ trait SymbolOps extends TypeOps { self =>
           // The set of minimal conditions that must be met for an expression to be liftable
           val minimal =
             (isSimple(e) || !onlySimple)           && // check whether we want only simple expression
-            !containsUninterpreted(e)              && // expressions containing uninterpreted calls or errors can't be lifted
+            !containsUnliftable(e)                 && // expressions containing uninterpreted calls, errors or assumptions can't be lifted
             (!inFunction || !containsRecursive(e))    // recursive functions can't be lifted from lambdas
 
           // Whether the expression is guaranteed to be called, typically in foralls
@@ -571,18 +580,34 @@ trait SymbolOps extends TypeOps { self =>
     * that is tailored for structural equality of [[Expressions.Lambda Lambda]] and [[Expressions.Forall Forall]] instances.
     */
   def normalizeStructure(e: Expr, onlySimple: Boolean = false)
-                        (using PurityOptions): (Expr, Seq[(Variable, Expr, Seq[Expr])]) = freshenLocals(e) match {
+                        (using PurityOptions): (Expr, Seq[(Variable, Expr, Seq[Expr])]) = e match {
     case lambda: Lambda =>
-      val (args, body, subst) = normalizeStructure(lambda.params, lambda.body, false, onlySimple, true, false)
-      (Lambda(args, body), subst)
+      // Ground values are normalized as variables, so that the solver (closures are variables) and
+      // the evaluator (closures are values) agree on lambda equality. With `onlySimple`, values
+      // containing lambdas stay in the body, so their locals get normalized with it.
+      val values = MutableMap.empty[Variable, Expr]
+      val abstracted = preMap {
+        case v if !v.isInstanceOf[Variable] && isGround(v) && (!onlySimple || isSimple(v)) && isValue(v) =>
+          val w = Variable.fresh("w", v.getType)
+          values(w) = v
+          Some(w)
+        case _ => None
+      } (lambda.body)
+      val fresh = freshenLocals(Lambda(lambda.params, abstracted).copiedFrom(lambda)).asInstanceOf[Lambda]
+      val (args, body, subst) = normalizeStructure(fresh.params, fresh.body, false, onlySimple, true, false)
+      val vs = values.toMap
+      (Lambda(args, body), subst.map { case (v, e, conds) =>
+        (v, replaceFromSymbols(vs, e), conds.map(replaceFromSymbols(vs, _)))
+      })
 
-    case forall: Forall =>
+    case f: Forall =>
+      val forall = freshenLocals(f).asInstanceOf[Forall]
       val isInstantiated = forall.params.forall(vd => hasInstance(vd.tpe) == Some(true))
       val (args, body, subst) = normalizeStructure(forall.params, forall.body, true, onlySimple, !isInstantiated, true)
       (Forall(args, body), subst)
 
     case _ =>
-      val (_, body, subst) = normalizeStructure(Seq(), e, false, onlySimple, false, false)
+      val (_, body, subst) = normalizeStructure(Seq(), freshenLocals(e), false, onlySimple, false, false)
       (body, subst)
   }
 
@@ -1063,8 +1088,11 @@ trait SymbolOps extends TypeOps { self =>
         import SolverResponses._
 
         // Extracting this solver's model may need simplest values, which must not start
-        // another solver, and so on without end.
-        val solverCtx = ctx.withOpts(SymbolOps.optSimplestValueSolver(false))
+        // another solver, and so on without end. The unroll bound makes the search end when
+        // no value is small enough, e.g. when the invariant only holds for infinite values.
+        val solverCtx = ctx.withOpts(
+          SymbolOps.optSimplestValueSolver(false),
+          unrolling.optUnrollBound(ctx.options.findOptionOrDefault(SymbolOps.optSimplestValueUnrollBound)))
         SimpleSolverAPI(sem.getSolver(using solverCtx)).solveSAT(Application(p, Seq(res))) match {
           case SatWithModel(model) => model.vars.getOrElse(res.toVal, throw NoSimpleValue(adt))
           case _ => throw NoSimpleValue(adt)
