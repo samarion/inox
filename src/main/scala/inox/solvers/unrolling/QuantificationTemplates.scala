@@ -130,7 +130,7 @@ trait QuantificationTemplates { self: Templates =>
       defer: Boolean = false
     ): (Expr, QuantificationTemplate) = {
       val (Forall(args, body), structure, depSubst) =
-        mkExprStructure(pathVar._1, forall, substMap, onlySimple = !simpOpts.simplify): @unchecked
+        mkExprStructure(pathVar._1, forall, substMap): @unchecked
 
       val quantifiers = args.map(_.toVariable).toSet
       val idQuantifiers: Seq[Variable] = args.map(_.toVariable)
@@ -308,6 +308,7 @@ trait QuantificationTemplates { self: Templates =>
   def getAxioms: Seq[Axiom] = axioms.toSeq
 
   def getInstantiationsWithBlockers = axioms.toSeq.flatMap(_.instantiations.toSeq)
+  def hasInstantiationsWithBlockers = axioms.exists(_.instantiations.nonEmpty)
 
   protected sealed trait MatcherKey
   private case class FunctionKey(tfd: TypedFunDef) extends MatcherKey
