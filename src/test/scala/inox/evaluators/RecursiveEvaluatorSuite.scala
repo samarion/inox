@@ -194,4 +194,133 @@ class RecursiveEvaluatorSuite extends AnyFunSuite {
       case res => fail(s"Unexpected result $res")
     }
   }
+
+  test("Lambdas whose lifted subexpressions don't hold or fail evaluate, and only fail when applied") {
+    val x = ValDef.fresh("x", IntegerType())
+    val k = ValDef.fresh("k", IntegerType())
+    val (zero, one, two, ten) = (IntegerLiteral(0), IntegerLiteral(1), IntegerLiteral(2), IntegerLiteral(10))
+    // `10 / k` is lifted out of the body under `k > 0`, or unconditionally under `--assume-checked`
+    def guarded(kv: Expr) = Let(k, kv,
+      Lambda(Seq(x), IfExpr(GreaterThan(k.toVariable, zero), Plus(x.toVariable, Division(ten, k.toVariable)), x.toVariable)))
+    val unguarded = Lambda(Seq(x), Plus(x.toVariable, Division(one, zero)))
+
+    for (assumeChecked <- Seq(false, true)) {
+      val ev = RecursiveEvaluator(program, ctx.withOpts(solvers.optAssumeChecked(assumeChecked)))
+      def evalOk(expr: Expr): Expr = ev.eval(expr) match {
+        case EvaluationResults.Successful(res) => res
+        case other => fail(s"Evaluation of '$expr' failed with $other under assume-checked=$assumeChecked")
+      }
+      evalOk(guarded(zero))
+      evalOk(unguarded)
+      assert(evalOk(Application(guarded(zero), Seq(IntegerLiteral(7)))) == IntegerLiteral(7))
+      assert(evalOk(Application(guarded(two), Seq(IntegerLiteral(7)))) == IntegerLiteral(12))
+      assert(evalOk(Equals(guarded(zero), guarded(zero))) == BooleanLiteral(true))
+      assert(ev.eval(Application(unguarded, Seq(one))) == EvaluationResults.RuntimeError("Division by 0."))
+    }
+  }
+
+  def evalIn(vars: Map[ValDef, Expr], ev: DeterministicEvaluator { val program: RecursiveEvaluatorSuite.this.program.type } = evaluator)(expr: Expr): Expr =
+    ev.eval(expr, Model(program)(vars, Map.empty)) match {
+      case EvaluationResults.Successful(res) => res
+      case other => fail(s"Evaluation of '$expr' failed with $other")
+    }
+
+  test("Model values compare equal whatever the refinements of their types") {
+    val vd = ValDef.fresh("v", IntegerType())
+    val pos = RefinementType(vd, GreaterThan(vd.toVariable, IntegerLiteral(0)))
+
+
+    val (zero, one) = (IntegerLiteral(0), IntegerLiteral(1))
+    val values = Seq(
+      FiniteSet(Seq(one), IntegerType()) -> FiniteSet(Seq(one), pos),
+      FiniteBag(Seq(one -> one), IntegerType()) -> FiniteBag(Seq(one -> one), pos),
+      FiniteMap(Seq(one -> one), zero, IntegerType(), IntegerType()) -> FiniteMap(Seq(one -> one), zero, pos, IntegerType()),
+      FiniteSet(Seq(FiniteSet(Seq(one), IntegerType())), SetType(IntegerType())) ->
+        FiniteSet(Seq(FiniteSet(Seq(one), pos)), SetType(pos)),
+    )
+
+    for ((erased, refined) <- values) {
+      val x = ValDef.fresh("x", erased.getType(using program.symbols))
+      val y = ValDef.fresh("y", refined.getType(using program.symbols))
+      val eval = evalIn(Map(x -> erased, y -> refined))
+      assert(eval(Equals(x.toVariable, y.toVariable)) == BooleanLiteral(true), s"$erased == $refined")
+      assert(eval(Equals(y.toVariable, refined)) == BooleanLiteral(true), s"$refined == $refined")
+    }
+
+    // Also inside tuples, which aren't erased themselves
+    val t = ValDef.fresh("t", TupleType(Seq(SetType(pos), IntegerType())))
+    val s = ValDef.fresh("s", SetType(IntegerType()))
+    val eval = evalIn(Map(t -> Tuple(Seq(FiniteSet(Seq(one), pos), one)), s -> FiniteSet(Seq(one), IntegerType())))
+    assert(eval(ElementOfSet(TupleSelect(t.toVariable, 1), FiniteSet(Seq(s.toVariable), SetType(IntegerType())))) ==
+      BooleanLiteral(true))
+  }
+
+  test("Model lambdas compare equal to the lambdas the evaluator builds") {
+    val vd = ValDef.fresh("v", IntegerType())
+    val pos = RefinementType(vd, GreaterThan(vd.toVariable, IntegerLiteral(0)))
+    def lambda(name: String, tpe: Type)(body: Variable => Expr): Lambda = {
+      val p = ValDef.fresh(name, tpe)
+      Lambda(Seq(p), body(p.toVariable))
+    }
+    val one = IntegerLiteral(1)
+    val ft = FunctionType(Seq(pos), IntegerType())
+
+    for (fe <- Seq(solvers.unrolling.FunctionEquality.Intensional, solvers.unrolling.FunctionEquality.Extensional)) {
+      val ev = RecursiveEvaluator(program, ctx.withOpts(solvers.unrolling.optFunctionEquality(fe)))
+      // Hand-built, with other parameter names and types, and a ground subexpression the evaluator simplifies
+      val f = ValDef.fresh("f", ft)
+      val s = ValDef.fresh("s", SetType(ft))
+      val g = ValDef.fresh("g", ft)
+      val eval = evalIn(Map(
+        f -> lambda("y", pos)(y => Plus(y, one)),
+        s -> FiniteSet(Seq(lambda("z", pos)(z => Plus(z, one))), ft),
+        g -> lambda("y", pos)(y => Plus(y, Plus(one, IntegerLiteral(0)))),
+      ), ev)
+      val lit = lambda("x", IntegerType())(x => Plus(x, one))
+      assert(eval(Equals(f.toVariable, lit)) == BooleanLiteral(true), s"f == lit under $fe")
+      assert(eval(Equals(g.toVariable, lit)) == BooleanLiteral(true), s"g == lit under $fe")
+      assert(eval(ElementOfSet(lit, s.toVariable)) == BooleanLiteral(true), s"lit in s under $fe")
+      assert(eval(ElementOfSet(f.toVariable, s.toVariable)) == BooleanLiteral(true), s"f in s under $fe")
+      assert(eval(Equals(s.toVariable, FiniteSet(Seq(lit), ft))) == BooleanLiteral(true), s"s == Set(lit) under $fe")
+    }
+
+    // A lambda whose body fails only fails the evaluations that apply it
+    val h = ValDef.fresh("h", FunctionType(Seq(IntegerType()), IntegerType()))
+    val model = Model(program)(Map(h -> lambda("y", IntegerType())(y => Plus(y, Division(one, IntegerLiteral(0))))), Map.empty)
+    assert(evaluator.eval(Equals(one, one), model).result == Some(BooleanLiteral(true)))
+    assert(evaluator.eval(Application(h.toVariable, Seq(one)), model).result.isEmpty)
+  }
+
+  test("Uninterpreted calls at refined type arguments use the interpretation at these types") {
+    import dsl._
+    val listID = FreshIdentifier("List")
+    val consID = FreshIdentifier("Cons")
+    val nilID = FreshIdentifier("Nil")
+    val list = mkSort(listID)("A") {
+      case Seq(aT) => Seq(
+        (consID, Seq(ValDef(FreshIdentifier("head"), aT), ValDef(FreshIdentifier("tail"), T(listID)(aT)))),
+        (nilID, Seq()))
+    }
+    val p = InoxProgram(NoSymbols.withSorts(Seq(list)))
+    val ev = RecursiveEvaluator(p, ctx)
+
+    def pos = {
+      val vd = ValDef.fresh("v", IntegerType())
+      RefinementType(vd, GreaterThan(vd.toVariable, IntegerLiteral(0)))
+    }
+    def cons(tpe: Type) = ADT(consID, Seq(tpe), Seq(IntegerLiteral(1), ADT(nilID, Seq(tpe), Seq())))
+    val u = FreshIdentifier("u")
+    def call(tpe: Type) = UninterpretedCall(u, Seq(T(listID)(tpe)), Seq(), T(listID)(tpe))
+    val model = Model(p)(Map.empty, Map((u, Seq(T(listID)(pos))) -> Lambda(Seq(), cons(pos))))
+
+    // The interpretation is found whatever the name of the refinement's binder, and its body is
+    // evaluated, so its result is erased like the values the evaluator builds
+    assert(ev.eval(call(pos), model).result == Some(cons(IntegerType())))
+    assert(ev.eval(Equals(call(pos), cons(pos)), model).result == Some(BooleanLiteral(true)))
+    assert(ev.eval(Equals(call(pos), cons(IntegerType())), model).result == Some(BooleanLiteral(true)))
+
+    // The solvers keep a distinct function for each instantiation, so the calls at the erased type
+    // arguments aren't interpreted by the interpretation at the refined ones
+    assert(ev.eval(call(IntegerType()), model).result.isEmpty)
+  }
 }
