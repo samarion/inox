@@ -47,8 +47,19 @@ trait FunctionTemplates { self: Templates =>
       val arguments = (fdArgs ++ tpVars).map(v => v -> encodeSymbol(v))
       val substMap = arguments.toMap + pathVar
 
+      // The calls that evaluating the body reaches, with the blockers of their paths (see `rankClauses`)
+      var bodySites: Seq[(Variable, FunctionInvocation)] = Seq.empty
+
       val tmplClauses: TemplateClauses = {
         val (p, tmplClauses0) = mkExprClauses(start, body, substMap)
+        if (callRanks) {
+          def invocations(e: Expr): Seq[FunctionInvocation] = exprOps.collect[FunctionInvocation] {
+            case fi: FunctionInvocation => Set(fi)
+            case _ => Set.empty
+          } (e).toSeq
+          bodySites = (tmplClauses0._4.toSeq.flatMap { case (b, es) => es.flatMap(invocations).map(b -> _) } ++
+            invocations(p).map(start -> _)).distinct
+        }
         // A call of the function on its own parameters, reached while evaluating its body, never
         // returns: evaluation is deterministic, so it would reach the same call again. The path that
         // reaches it is infeasible. Otherwise, the call would be dropped from the template (see
@@ -96,8 +107,9 @@ trait FunctionTemplates { self: Templates =>
         }
       }
 
-      val (contents, str) = Template.contents(
+      val (contents0, str) = Template.contents(
         pathVar, arguments, tmplClauses, optCall = Some(Defined(tfd)))
+      val contents = contents0.copy(clauses = contents0.clauses ++ rankClauses(tfd, contents0, bodySites))
 
       val funString : () => String = () => {
         "Template for def " + tfd.signature +
@@ -109,6 +121,50 @@ trait FunctionTemplates { self: Templates =>
       cache(tfd) = res
       res
     })
+  }
+
+  /** Whether calls are ranked by the depth of their evaluation (see `rankClauses`). */
+  private lazy val callRanks = !sys.env.get("INOX_CALL_RANKS").contains("false")
+
+  private val rankCache: MutableMap[TypedFunDef, Variable] = MutableMap.empty
+  private val rankSymbols: MutableMap[Variable, Encoded] = MutableMap.empty
+
+  /** The rank of the call `tfd(args)`: an uninterpreted integer function of the arguments. */
+  private def rank(tfd: TypedFunDef, args: Seq[Expr]): Expr = {
+    val r = rankCache.getOrElseUpdate(tfd, {
+      val r = Variable.fresh("rank_" + tfd.id.name,
+        if (tfd.params.isEmpty) IntegerType() else FunctionType(tfd.params.map(_.getType), IntegerType()), true)
+      rankSymbols(r) = encodeSymbol(r)
+      r
+    })
+    if (tfd.params.isEmpty) r else Application(r, args)
+  }
+
+  /** Clauses stating that a call ranks higher than the calls that evaluating its body reaches, on the
+    * paths that reach them.
+    *
+    * A call that returns a value has a finite evaluation, so ranking each call by the depth of its
+    * evaluation satisfies these clauses. A call that reaches itself, possibly through other calls,
+    * on the same arguments never returns, as evaluation is deterministic: the ranks along the cycle
+    * can't decrease, so the paths that close the cycle are infeasible. Without these clauses, the
+    * equations of the calls on such a cycle, e.g. `f(x) = g(x)` and `g(x) = f(x)`, would be
+    * satisfied by any value once every call on it is unfolded.
+    *
+    * Only the calls of the body are ranked: the evaluator doesn't evaluate the calls in type checks,
+    * and those in lambdas and quantifiers belong to their own templates. */
+  private def rankClauses(tfd: TypedFunDef, contents: TemplateContents,
+                          sites: Seq[(Variable, FunctionInvocation)]): Clauses = if (sites.isEmpty) Seq.empty else {
+    val self = rank(tfd, tfd.params.map(_.toVariable))
+    val ranked = sites.map { case (b, fi) => (b, fi, rank(fi.tfd, fi.args)) }
+    val allSymbols = Map(contents.pathVar) ++ contents.arguments ++ contents.condVars ++ contents.exprVars ++
+      contents.lambdas.map(_.ids) ++ contents.quantifications.flatMap(_.mapping) ++ rankSymbols ++
+      typesManager.tpSubst ++ uninterpretedSubst
+    val encoder = mkEncoder(allSymbols)
+    ranked.flatMap { case (b, fi, callee) =>
+      // Calls whose arguments mention symbols that the template doesn't bind aren't ranked
+      if (!exprOps.variablesOf(callee).forall(allSymbols.contains)) Seq.empty
+      else Seq(encoder(Implies(b, GreaterThan(self, callee))))
+    }
   }
 
   /** The templates of the interpretations of uninterpreted functions, whose calls are the
