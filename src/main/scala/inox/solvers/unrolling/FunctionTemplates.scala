@@ -48,7 +48,19 @@ trait FunctionTemplates { self: Templates =>
       val substMap = arguments.toMap + pathVar
 
       val tmplClauses: TemplateClauses = {
-        val (p, tmplClauses) = mkExprClauses(start, body, substMap)
+        val (p, tmplClauses0) = mkExprClauses(start, body, substMap)
+        // A call of the function on its own parameters, reached while evaluating its body, never
+        // returns: evaluation is deterministic, so it would reach the same call again. The path that
+        // reaches it is infeasible. Otherwise, the call would be dropped from the template (see
+        // `Template.extractCalls`) and `f(x) = body` would hold for any value that solves it,
+        // e.g. any value for `def loop(x) = loop(x)`, whereas evaluation diverges.
+        val tmplClauses = {
+          val guarded = tmplClauses0._4
+          val selfCalling = (guarded.toSeq.collect {
+            case (b, es) if es.exists(exprOps.exists(_ == call)) => b
+          } ++ (if (exprOps.exists(_ == call)(p)) Seq(start) else Seq.empty)).distinct
+          selfCalling.foldLeft(tmplClauses0)((cls, b) => cls + (b -> BooleanLiteral(false)))
+        }
         val clauses = tmplClauses + (start -> Equals(call, p))
 
         // Register the function's return as a contract typing to enable
