@@ -89,25 +89,21 @@ also make its path infeasible.
 
 ## 4. Limits
 
-**Other non-terminating definitions keep a fixpoint semantics.** The rule of §3 only catches a
-function calling itself on syntactically equal arguments within its own body. These cases aren't
-caught:
+**Loops through other functions keep a fixpoint semantics.** The rule of §3 only catches a function
+that calls itself on its own parameters within its own body. A loop through other functions on the
+same arguments, such as `f(x)` calling `g(x)`, which calls `f(x)`, closes the same way the self-call
+used to: unfolding `g(x)` reaches the call `f(x)`, which is already unfolded, so no call is left
+pending. The equations `f(x) = g(x)` and `g(x) = f(x)` are then satisfied by any value, and the solver
+may return a model that relies on one, say `f(2) = 0`, which only `--check-models` rejects. Proofs stay
+sound, since a successful evaluation satisfies every equation it reaches. Following the chain of
+blockers from a call back to its own definition would catch these loops as well.
 
-- Loops through other functions, such as `f(x)` calling `g(x)`, which calls `f(x)`.
-- Calls on equal but syntactically different arguments, such as `f(x + 0)`.
-- Loops whose arguments change forever, such as `f(x + 1)`.
-
-The first two cases could be caught by following call chains with the same encoded arguments. The
-last one needs a non-termination prover.
-
-For these, the unfolded equations are satisfied by any fixpoint, not only the least one.
-
-- Proofs stay sound, since a successful evaluation satisfies every equation it reaches.
-- Counterexamples may rely on a value that a diverging call never returns. `--check-models` reports
-  them as unknown.
-- Proofs that need a call to diverge are out of reach. For `def f(x: BigInt): BigInt = f(x + 1)`,
-  `x => if (x > 0) x else f(x)` lies in `BigInt => {v: BigInt | v > 0}`, but showing it means showing
-  that `f(x)` never returns a value, which needs induction. Unrolling doesn't do induction.
+**Loops on changing arguments stay blocked.** A loop such as `def f(x: BigInt): BigInt = f(x + 1)`
+reaches a new call at each unfolding, so some call is always pending. `ModelCheck` blocks the
+pending calls, so no model relies on a value that `f` never returns. The solver doesn't terminate on
+such a query instead. Proofs that need the call to diverge are out of reach, though:
+`x => if (x > 0) x else f(x)` lies in `BigInt => {v: BigInt | v > 0}`, but showing it means showing
+that `f(x)` never returns a value, which needs induction. Unrolling doesn't do induction.
 
 **Partial operations are total in the solvers.** The evaluator fails on a division, remainder or
 modulo by zero, while the solvers encode these operations as total SMT terms. A model that divides by
