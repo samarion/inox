@@ -857,11 +857,17 @@ trait TemplateGenerator { self: Templates =>
       case adt: ADTType =>
         val sort = adt.getSort
 
+        // a value built with a constructor that may be empty exists only if the constructor has values
+        val consFlags = if (generator != FreeGenerator) Seq() else sort.constructors
+          .filter(cons => sort.definition.allowEmpty(cons.id))
+          .map(cons => implies(isCons(expr, cons.id), typesManager.storeConstructor(cons.id, adt.tps)))
+
         and(
           sort.invariant
             .filter(_ => generator == FreeGenerator)
             .map(_.applied(Seq(expr)))
             .getOrElse(BooleanLiteral(true)),
+          andJoin(consFlags),
           if (sort.definition.isInductive && !state.recurseAdt) {
             storeType(pathVar, tpe, expr, inDomain, ground)
           } else {

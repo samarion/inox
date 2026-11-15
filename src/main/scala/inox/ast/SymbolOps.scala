@@ -1066,7 +1066,8 @@ trait SymbolOps extends TypeOps { self =>
       if (seen(adt)) None
       else if (sort.hasInvariant) None
       else if (!sort.definition.isWellFormed) Some(false)
-      else if (sort.constructors.sortBy(_.fields.size).exists(cons =>
+      // a constructor that may have no values doesn't make the sort inhabited
+      else if (sort.constructors.sortBy(_.fields.size).exists(cons => !sort.definition.allowEmpty(cons.id) &&
                 cons.fields.forall(vd => hasInstance(vd.tpe, seen + adt) contains true)))
         Some(true)
       else None
@@ -1130,7 +1131,8 @@ trait SymbolOps extends TypeOps { self =>
           case _ => throw NoSimpleValue(adt)
         }
       } else {
-        sort.constructors.sortBy(_.fields.size).view
+        // constructors that may have no values come last
+        sort.constructors.sortBy(cons => (sort.definition.allowEmpty(cons.id), cons.fields.size)).view
           .flatMap { cons =>
             try {
               Some(ADT(

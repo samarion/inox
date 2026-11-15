@@ -29,16 +29,24 @@ trait TypeTemplates { self: Templates =>
   import typesManager._
 
   /** Determines whether a given type should be unrolled, depending on the kind of type unrolling,
-    * namely free variable type unrolling (dependent types and ADT invariants), contract
-    * type unrolling (dependent types), read unrolling (dependent types and ADT invariants, but not
-    * what only free values need, see [[Collection]]) and capture unrolling (function closure ordering). */
+    * namely free variable type unrolling (dependent types, ADT invariants, type parameters and
+    * constructors that may be empty), contract type unrolling (dependent types), read unrolling
+    * (dependent types and ADT invariants, but not what only free values need, see [[Collection]])
+    * and capture unrolling (function closure ordering).
+    *
+    * Two more kinds tell why free values are unrolled (@see [[typesManager.isParameterTyping]]):
+    * [[FlaglessUnrolling]] is free variable type unrolling without type parameters and constructors
+    * that may be empty, and [[EmptinessUnrolling]] only unrolls down to these. */
   protected sealed abstract class TypeUnrolling {
     private val unrollCache: MutableMap[TypedADTSort, Boolean] = MutableMap.empty
+
+    private def free: Boolean = this == FreeUnrolling || this == FlaglessUnrolling
 
     def unroll(tpe: Type): Boolean = tpe match {
       case adt: ADTType =>
         val sort = adt.getSort
-        ((this == FreeUnrolling || this == ReadUnrolling) && sort.invariant.nonEmpty) ||
+        ((free || this == ReadUnrolling) && sort.invariant.nonEmpty) ||
+        ((this == FreeUnrolling || this == EmptinessUnrolling) && sort.definition.allowEmpty.nonEmpty) ||
         (unrollCache.get(sort) match {
           case Some(b) => b
           case None =>
@@ -48,16 +56,18 @@ trait TypeTemplates { self: Templates =>
             res
         })
 
-      case (_: BagType | _: SetType) if this == FreeUnrolling || this == CaptureUnrolling => true
-      case FunctionType(_, to) => this == FreeUnrolling || this == CaptureUnrolling || unroll(to)
-      case PiType(_, to) => this == FreeUnrolling || this == CaptureUnrolling || unroll(to)
-      case RefinementType(vd, _) => this != CaptureUnrolling || unroll(vd.tpe)
+      case (_: BagType | _: SetType) if free || this == CaptureUnrolling => true
+      case FunctionType(_, to) => free || this == CaptureUnrolling || unroll(to)
+      case PiType(_, to) => free || this == CaptureUnrolling || unroll(to)
+      case RefinementType(vd, _) => (this != CaptureUnrolling && this != EmptinessUnrolling) || unroll(vd.tpe)
       case SigmaType(params, to) => params.exists(vd => unroll(vd.tpe)) || unroll(to)
-      case tp: TypeParameter => this == FreeUnrolling
+      case tp: TypeParameter => this == FreeUnrolling || this == EmptinessUnrolling
       case NAryType(tpes, _) => tpes.exists(unroll)
     }
   }
 
+  protected case object FlaglessUnrolling extends TypeUnrolling
+  protected case object EmptinessUnrolling extends TypeUnrolling
   protected case object FreeUnrolling extends TypeUnrolling
   protected case object ContractUnrolling extends TypeUnrolling
   protected case object CaptureUnrolling extends TypeUnrolling
@@ -498,11 +508,10 @@ trait TypeTemplates { self: Templates =>
     /** The typings that were assumed to hold, under the blocker they were instantiated with. */
     private[TypeTemplates] val deferredTypings = new IncrementalSeq[(Encoded, Typing)]
 
-    /** Whether values of type `tpe` are only unfolded to reach their values of type parameters. */
-    private[unrolling] def isParameterTyping(tpe: Type): Boolean = !unfoldingTypeParameters && {
-      val tparams = typeOps.typeParamsOf(tpe)
-      tparams.nonEmpty && !FreeUnrolling.unroll(typeOps.instantiateType(tpe, tparams.map(_ -> UnitType()).toMap))
-    }
+    /** Whether values of type `tpe` are only unfolded to reach their values of type parameters, or
+      * their values built with constructors that may be empty. */
+    private[unrolling] def isParameterTyping(tpe: Type): Boolean =
+      !unfoldingTypeParameters && EmptinessUnrolling.unroll(tpe) && !FlaglessUnrolling.unroll(tpe)
 
     private[TypeTemplates] def deferTyping(typing: Typing): Boolean = typing.instantiator match {
       case Constraint(_, _, free, inDomain, _) => free && !inDomain && isParameterTyping(typing.tpe)
@@ -510,10 +519,10 @@ trait TypeTemplates { self: Templates =>
     }
 
     /** Unfolds free values down to their values of type parameters from now on, if `tpe` mentions
-      * a type parameter. This is called when the typing of a bound variable of type `tpe` is a
-      * guard, which gives the solver a use for the type parameters of `tpe` being empty. */
+      * a type parameter or a constructor that may be empty. This is called when the typing of a
+      * bound variable of type `tpe` is a guard, which gives the solver a use for these being empty. */
     private[unrolling] def unfoldTypeParameters(tpe: Type): Unit =
-      if (!unfoldingTypeParameters && typeOps.typeParamsOf(tpe).nonEmpty) {
+      if (!unfoldingTypeParameters && (typeOps.typeParamsOf(tpe).nonEmpty || EmptinessUnrolling.unroll(tpe))) {
         unfoldingTypeParameters = true
         unfoldDeferredTypings()
       }
@@ -541,6 +550,20 @@ trait TypeTemplates { self: Templates =>
       super.pop()
       if (unfoldingTypeParameters) unfoldDeferredTypings()
     }
+
+    /* The flags of constructors that may be empty (@see [[AllowEmpty]]) are those of type parameters:
+     * the typing of a value built with the constructor `C` of an ADT `A[tps]` is the flag of `C` at
+     * `tps` (@see [[storeConstructor]]), which holds iff `C` has values at `tps`. The flags are keyed by
+     * the syntactic type arguments, as values of type parameters are: `C` may have values at `T`
+     * and none at `BigInt`, or the other way around, although `T` may stand for `BigInt`. */
+    private val consSyms: MutableMap[(Identifier, Seq[Type]), Variable] = MutableMap.empty
+    private[unrolling] def storeConstructor(id: Identifier, tps: Seq[Type]): Variable =
+      consSyms.getOrElse(id -> tps, {
+        val v = Variable.fresh("cons_has_values", BooleanType(), true)
+        tpSubst(v) = encodeSymbol(v)
+        consSyms(id -> tps) = v
+        v
+      })
 
     private val tpSyms: MutableMap[TypeParameter, Variable] = MutableMap.empty
     private[unrolling] val tpSubst: MutableMap[Variable, Encoded] = MutableMap.empty

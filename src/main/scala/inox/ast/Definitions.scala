@@ -259,6 +259,8 @@ trait Definitions { self: Trees =>
       if (sort.constructors exists (_.fields exists (_.getType == PropType())))
         throw NotWellFormedException(sort, Some("Propositions can't be fields"))
       if (sort.constructors.flatMap(_.fields).groupBy(_.id).exists(_._2.size > 1)) throw NotWellFormedException(sort)
+      if (!(sort.allowEmpty subsetOf sort.constructors.map(_.id).toSet))
+        throw NotWellFormedException(sort, Some("Only the constructors of a sort may be empty"))
     }
 
     override def equals(that: Any): Boolean = that match {
@@ -322,6 +324,14 @@ trait Definitions { self: Trees =>
   /** Denotes that this adt is refined by invariant ''id'' */
   sealed case class HasADTInvariant(id: Identifier) extends Flag("invariant", Seq(id))
 
+  /** Denotes that the constructor ''id'' of this adt may have no values, for each instantiation of
+    * the type parameters of the sort. A value built with it exists only if some value of it does.
+    *
+    * Front ends use it for constructors that stand for values the program doesn't show, such as
+    * the implementations of an open class, whose contracts may be unsatisfiable: values of the
+    * constructor are then assumed to meet them only when it has values. */
+  sealed case class AllowEmpty(id: Identifier) extends Flag("allowEmpty", Seq(id))
+
   /** Denotes that this adt has an overriden equality relation given by ''id'' */
   sealed case class HasADTEquality(id: Identifier) extends Flag("equality", Seq(id))
 
@@ -377,6 +387,9 @@ trait Definitions { self: Trees =>
       flags.collectFirst { case HasADTInvariant(id) => s.getFunction(id) }
 
     def hasInvariant(using Symbols): Boolean = invariant.isDefined
+
+    /** The constructors of this [[ADTSort]] that may have no values (@see [[AllowEmpty]]) */
+    def allowEmpty: Set[Identifier] = flags.collect { case AllowEmpty(id) => id }.toSet
 
     /** An equality relation defined on this [[ADTSort]] */
     def equality(using s: Symbols): Option[FunDef] =

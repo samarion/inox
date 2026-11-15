@@ -492,7 +492,7 @@ class InoxSerializer(val trees: ast.Trees, serializeProducts: Boolean = false) e
     * The `Serializer[_]` identifiers in this mapping range from 10 to 105
     * (ignoring special identifiers that are smaller than 10).
     *
-    * NEXT ID: 145
+    * NEXT ID: 146
     */
   protected def classSerializers: Map[Class[?], Serializer[?]] = Map.from(
     coreSerializers ++ literalSerializers ++ operatorSerializers ++ bitVectorSerializers ++
@@ -677,6 +677,7 @@ class InoxSerializer(val trees: ast.Trees, serializeProducts: Boolean = false) e
     classSerializer[HasADTInvariant](91),
     classSerializer[HasADTEquality] (92),
     classSerializer[Annotation]     (93),
+    classSerializer[AllowEmpty]     (145),
 
     // Inox Definitions
     mappingSerializer[ValDef](94)(_.toVariable)(_.toVal),
