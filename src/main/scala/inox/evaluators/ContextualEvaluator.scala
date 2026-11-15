@@ -60,7 +60,10 @@ trait ContextualEvaluator extends Evaluator {
 
   def eval(ex: Expr, model: program.Model) = timers.evaluators.recursive.runtime.run {
     try {
-      EvaluationResults.Successful(e(ex)(using initRC(model), initGC))
+      given gctx: GC = initGC
+      val rctx = initRC(model)
+      val modelRctx = rctx.newVars(Map.empty)
+      EvaluationResults.Successful(e(ex)(using rctx.newVars(rctx.mappings.view.mapValues(modelValue(_)(using modelRctx)).toMap)))
     } catch {
       case EvalError(msg) =>
         EvaluationResults.EvaluatorError(msg)
@@ -74,6 +77,9 @@ trait ContextualEvaluator extends Evaluator {
   }
 
   protected def e(expr: Expr)(using rctx: RC, gctx: GC): Value
+
+  /** The model value `v` in the form the evaluator gives to the values it builds. */
+  protected def modelValue(v: Expr)(using rctx: RC, gctx: GC): Expr = v
 
   protected def ignoreContractsOn(expr: Expr)(using rctx: RC, gctx: GC): Boolean =
     globallyIgnoreContracts || rctx.locallyIgnoreContracts

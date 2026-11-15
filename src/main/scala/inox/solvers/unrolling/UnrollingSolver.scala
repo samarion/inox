@@ -429,7 +429,7 @@ abstract class AbstractUnrollingSolver private
     }
 
     def normal(l: Lambda): Expr = {
-      val (nl, subst) = normalizeStructure(l, onlySimple = true)
+      val (nl, subst) = normalizeStructure(l, ast.SymbolOps.NormalizationLifting.Simple)
       exprOps.replaceFromSymbols(subst.map { case (v, e, _) => v -> e }.toMap, nl)
     }
 
@@ -830,7 +830,7 @@ abstract class AbstractUnrollingSolver private
         }.toMap
 
         val res = exprOps.replaceFromSymbols(localsSubst, tmpl.structure.body)
-        val (nl, subst) = normalizeStructure(res, onlySimple = true)
+        val (nl, subst) = normalizeStructure(res.asInstanceOf[Lambda], ast.SymbolOps.NormalizationLifting.Simple)
         exprOps.replaceFromSymbols(subst.map { case (v, e, _) => v -> e }.toMap, nl).asInstanceOf[Lambda]
       }
 
@@ -840,7 +840,7 @@ abstract class AbstractUnrollingSolver private
       // closures, as with the lambdas of the query).
       def distinctFromOthers(lambda: Lambda): Lambda = {
         def normal(l: Lambda): Expr = {
-          val (nl, subst) = normalizeStructure(l, onlySimple = true)
+          val (nl, subst) = normalizeStructure(l, ast.SymbolOps.NormalizationLifting.Simple)
           exprOps.replaceFromSymbols(subst.map { case (v, e, _) => v -> e }.toMap, nl)
         }
 
@@ -1445,7 +1445,9 @@ abstract class AbstractUnrollingSolver private
             Unroll
           }
 
-        case ProofCheck if ignoreModels =>
+        // The model of a proof check only serves to test whether we got lucky and to
+        // prioritize blockers during unrolling, so we don't request it when neither applies.
+        case ProofCheck if ignoreModels || !(feelingLucky || modelFinding || templates.hasInstantiationsWithBlockers) =>
           // check without additional model-guidance for unrolling
           reporter.debug(" - Running search without blocked literals (w/o lucky test)")
 
