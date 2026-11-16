@@ -16,7 +16,7 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
   import dsl._
 
   override protected def optionMatrix = UnrollingTestSuite.combinations(
-    // Most tests compare functions, which `none` rejects. Distinct functions always
+    // Most tests compare functions, which the default semantics rejects. Distinct functions always
     // have a distinguishing input under extensional equality, but not under intensional equality.
     Seq(optFunctionEquality(FunctionEquality.Extensional)),
     Seq(optCheckModels(true)),
@@ -231,7 +231,8 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
   test("many pairwise distinct functions") {
     // More pairs than any fixed budget of distinguishing inputs would cover. All functions agree
     // on `true`, so the solver has to pick a different result on `false` for each of them.
-    val fs = (1 to 16).map(i => (s"f$i" :: (BooleanType() =>: IntegerType())).toVariable)
+    // Solving time grows quickly with their number: 9 s for 12 functions, 36 s for 16.
+    val fs = (1 to 12).map(i => (s"f$i" :: (BooleanType() =>: IntegerType())).toVariable)
     val pairs = for (f1 <- fs; f2 <- fs if f1.id.globalId < f2.id.globalId) yield (f1, f2)
     val clause = andJoin(fs.map(f => f(E(true)) === E(BigInt(0))) ++ pairs.map((f1, f2) => f1 !== f2))
     val model = solve(clause)
@@ -542,6 +543,36 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     assert(resultWith(FunctionEquality.None)(E(sameViaID)(IntegerType())(x, E(BigInt(1)))).isSAT)
   }
 
+  test("sets, bags and maps with function keys are rejected without function equality") { ctx ?=>
+    val fnT = IntegerType() =>: IntegerType()
+    val f = ("f" :: fnT).toVariable
+    val g = ("g" :: fnT).toVariable
+    val x = ("x" :: IntegerType()).toVariable
+    val s = ("s" :: SetType(fnT)).toVariable
+    val m = ("m" :: MapType(fnT, IntegerType())).toVariable
+    val b = ("b" :: BagType(TupleType(Seq(IntegerType(), fnT)))).toVariable
+    val nested = ("n" :: SetType(SetType(fnT))).toVariable
+    // membership compares f with the elements of the set, as `f == g` would
+    for (clause <- Seq(
+      ElementOfSet(f, FiniteSet(Seq(g), fnT)),
+      ElementOfSet(f, s),
+      MapApply(m, f) === E(BigInt(0)),
+      MultiplicityInBag(Tuple(Seq(E(BigInt(1)), f)), b) === E(BigInt(1)),
+      ElementOfSet(FiniteSet(Seq(), fnT), nested)
+    )) {
+      val e = intercept[Exception](resultWith(FunctionEquality.None)(clause))
+      assert(e.getMessage.contains("can't be compared"), e.getMessage)
+    }
+    def collections(e: Expr) = FunctionEquality.functionKeyedCollections(program)(e)
+    assert(collections(ElementOfSet(f, s)) == Seq(s))
+    // functions as the values of a map compare nothing, and sets of other values are accepted
+    val fm = ("fm" :: MapType(IntegerType(), fnT)).toVariable
+    assert(resultWith(FunctionEquality.None)(Application(MapApply(fm, x), Seq(x)) === x).isSAT)
+    assert(resultWith(FunctionEquality.None)(ElementOfSet(x, FiniteSet(Seq(E(BigInt(1))), IntegerType()))).isSAT)
+    // the other semantics accept these collections
+    assert(resultWith(FunctionEquality.Intensional)(ElementOfSet(f, s)).isSAT)
+  }
+
   test("comparisons with constructors without functions are accepted") { ctx ?=>
     // `Num(n)` holds no function, so comparing an `Obj` with it is a constructor test
     val o = ("o" :: T(objID)()).toVariable
@@ -555,7 +586,7 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     assert(optFunctionEquality.parser("extensional") == Some(FunctionEquality.Extensional))
     assert(optFunctionEquality.parser("Intensional") == Some(FunctionEquality.Intensional))
     assert(optFunctionEquality.parser("structural").isEmpty)
-    assert(optFunctionEquality.default == FunctionEquality.Intensional)
+    assert(optFunctionEquality.default == FunctionEquality.None)
   }
 
   test("functions applied to functions without function equality", hasHigherOrderModels) { ctx ?=>
