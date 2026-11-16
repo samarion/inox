@@ -492,7 +492,10 @@ abstract class AbstractUnrollingSolver private
   private def emit(silenceErrors: Boolean)(msg: String) =
     if (silenceErrors) reporter.debug(msg) else reporter.warning(msg)
 
-  private def validateModel(model: program.Model, assumptions: Seq[Expr], silenceErrors: Boolean): Boolean = {
+  /** Validates `model`, in which the type parameters `emptyTypes` have no values (see the
+    * [[UnrollingSolver]] state `Unroll`). */
+  private def validateModel(model: program.Model, assumptions: Seq[Expr], silenceErrors: Boolean,
+                            emptyTypes: Set[TypeParameter] = Set.empty): Boolean = {
     val expr = andJoin(assumptions ++ constraints)
 
     // The uninterpreted functions whose models the typing conditions are being expanded through
@@ -586,9 +589,14 @@ abstract class AbstractUnrollingSolver private
     val typingCond = andJoin(model.vars.toSeq.map { case (v, value) => typing(value, v.tpe) } ++ callTypings)
 
     // we have to check case class constructors in model for ADT invariants
-    val newExpr = model.vars.toSeq.foldRight(and(typingCond, expr)) {
+    val modelExpr = model.vars.toSeq.foldRight(and(typingCond, expr)) {
       case ((v, value), e) => Let(v, value, e)
     }
+
+    // The evaluator only knows that a type parameter is empty when it is instantiated with an empty
+    // type. The model has no values of these type parameters, as their values would inhabit them.
+    val newExpr = if (emptyTypes.isEmpty) modelExpr else typeOps.instantiateType(modelExpr,
+      emptyTypes.map(tp => tp -> (RefinementType(ValDef.fresh("empty", UnitType()), BooleanLiteral(false)): Type)).toMap)
 
     val evaluator = semantics.getEvaluator(using context.copy(interruptManager = evaluatorInterrupts).withOpts(
       optSilentErrors(silenceErrors),
@@ -1160,6 +1168,10 @@ abstract class AbstractUnrollingSolver private
     // The depth up to which distinguishing inputs are instantiated: 0 until the first model is found,
     // then one more level with each unrolling (see [[LambdaTemplates.witnessEqualities]])
     var witnessLevel: Int = 0
+
+    // The type parameters that the model being validated leaves empty, once a model can only be
+    // found with some type parameters empty (see the state `Unroll`)
+    var emptyTypeParameters: Set[TypeParameter] = Set.empty
     def witnessEqualities: Map[Encoded, Int] =
       if (witnessLevel > 0) templates.witnessEqualities else Map.empty
 
@@ -1365,7 +1377,11 @@ abstract class AbstractUnrollingSolver private
             lazy val sat = CheckResult(config `cast` (if (config.withModel) SatWithModel(model) else Sat))
             lazy val unknown = CheckResult `cast` Unknown
 
-            lazy val valid = !checkModels || validateModel(model, assumptionsSeq, silenceErrors = silentErrors)
+            // A model with empty type parameters is always validated, as only the evaluation of the
+            // formula shows that the quantifiers over these types hold
+            val mustValidate = checkModels || emptyTypeParameters.nonEmpty
+            lazy val valid = !mustValidate ||
+              validateModel(model, assumptionsSeq, silenceErrors = silentErrors, emptyTypeParameters)
 
             // the extracted functions need these distinguishing inputs to tell their arguments apart,
             // and they are unfolded fairly, like the others (see [[LambdaTemplates.witnessEqualities]])
@@ -1388,11 +1404,11 @@ abstract class AbstractUnrollingSolver private
                 underlying.assertCnstr(cl)
               }
               ModelCheck
-            } else if (checkModels && valid) {
+            } else if (mustValidate && valid) {
               sat
             } else if (abort || pause) {
               unknown
-            } else if (checkModels && !valid) {
+            } else if (mustValidate && !valid) {
               if (!silentErrors) {
                 reporter.error("Something went wrong. The model should have been valid, yet we got this:")
                 reporter.error("  " + model.asString.replaceAll("\n", "\n  "))
@@ -1414,7 +1430,7 @@ abstract class AbstractUnrollingSolver private
                 // a quantifier over an empty type, which holds vacuously). Evaluating quantifiers over
                 // function calls or lambdas unfolds them, which may not terminate, so these are left out.
                 case Some(_) if !axioms.exists(_.hasComplexMatchers(modelEq)) &&
-                    validateModel(model, assumptionsSeq, silenceErrors = true) =>
+                    validateModel(model, assumptionsSeq, silenceErrors = true, emptyTypeParameters) =>
                   sat
                 case Some((expr, err)) =>
                   if (!silentErrors) {
@@ -1533,10 +1549,41 @@ abstract class AbstractUnrollingSolver private
           CheckResult.cast(Unknown)
 
         case Unroll if !templates.canUnroll =>
-          // Only satisfaction assumptions that unrolling cannot discharge are left,
-          // e.g. a model exists only if some type parameter is empty.
-          reporter.debug("- We need to keep going, but nothing is left to unroll")
-          CheckResult.cast(Unknown)
+          // Only satisfaction assumptions that unrolling cannot discharge are left, e.g. a model
+          // exists only if some type parameter is empty. The search then drops the assumptions
+          // that type parameters have values, and validates the model it finds with the type
+          // parameters that it leaves empty.
+          val typeParameters = templates.typesManager.typeParameterFlags
+          val flags = typeParameters.map(_._2).toSet
+          if (emptyTypeParameters.nonEmpty || typeParameters.isEmpty) {
+            reporter.debug("- We need to keep going, but nothing is left to unroll")
+            CheckResult.cast(Unknown)
+          } else {
+            reporter.debug(" - Running search with empty type parameters")
+            val res = context.timers.solvers.unrolling.check.run {
+              underlying.checkAssumptions(Configuration(model = true, unsatAssumptions = false))(
+                encodedAssumptions.toSet ++ templates.satisfactionAssumptions.filterNot(flags)
+              )
+            }
+            res match {
+              case SatWithModel(model) =>
+                val wrapped = wrapModel(model)
+                emptyTypeParameters = typeParameters.collect {
+                  case (tp, flag) if wrapped.modelEval(flag, t.BooleanType()) == Some(t.BooleanLiteral(false)) =>
+                    decode(tp.asInstanceOf[t.Type])
+                }.collect { case tp: TypeParameter => tp }.toSet
+                if (emptyTypeParameters.isEmpty) {
+                  reporter.debug("- We need to keep going, but nothing is left to unroll")
+                  CheckResult.cast(Unknown)
+                } else {
+                  reporter.debug(" - Empty type parameters: " + emptyTypeParameters.map(_.asString).mkString(", "))
+                  Validate(model)
+                }
+              case _ =>
+                reporter.debug("- We need to keep going, but nothing is left to unroll")
+                CheckResult.cast(Unknown)
+            }
+          }
 
         case Unroll => context.timers.solvers.unrolling.unroll.run {
           reporter.debug("- We need to keep going")

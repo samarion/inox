@@ -546,6 +546,10 @@ trait TypeTemplates { self: Templates =>
         v
       })
 
+    /** The type parameters of the query, with their flags (@see [[storeTypeParameter]]) */
+    private[unrolling] def typeParameterFlags: Seq[(TypeParameter, Encoded)] =
+      tpSyms.toSeq.map { case (tp, v) => tp -> tpSubst(v) }
+
     def canBeEqual(f1: Encoded, f2: Encoded): Boolean = {
       def transitiveLess(l: Encoded, r: Encoded): Boolean = {
         val fs = fixpoint((fs: Set[Encoded]) => fs ++ fs.flatMap(lessOrder))(lessOrder(l))
