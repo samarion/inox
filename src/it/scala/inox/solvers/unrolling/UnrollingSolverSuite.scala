@@ -15,9 +15,11 @@ class UnrollingSolverSuite extends TestSuite with DatastructureUtils {
   import inox.trees.dsl._
   import SolverResponses._
 
+  // Several tests compare functions, which needs a function equality other than the default
   override def configurations = Seq(Seq(
     optSelectedSolvers(Set(UnrollingTestSuite.solverName)),
     optTimeout(300),
+    optFunctionEquality(FunctionEquality.Intensional),
   ))
 
   override protected def optionsString(options: Options): String =
@@ -121,6 +123,17 @@ class UnrollingSolverSuite extends TestSuite with DatastructureUtils {
   test("unlucky models keep unrolling") {
     val l = Variable.fresh("l", T(listID)(I))
     check(E(lengthID)(I)(l) === int(3), Model, optFeelingLucky(true), optCheckModels(true)) match {
+      case SatWithModel(model) =>
+        val evaluated = program.getEvaluator.eval(E(lengthID)(I)(value(model, l)), model)
+        assert(evaluated.result == Some(int(3)))
+      case res => fail(s"Expected a model, got $res")
+    }
+  }
+
+  test("lucky models whose validation times out leave the counterexample to the search") {
+    // The validation of every lucky model is given up at once, so the model comes from the search
+    val l = Variable.fresh("l", T(listID)(I))
+    check(E(lengthID)(I)(l) === int(3), Model, optFeelingLucky(true), optLuckyTimeout(0), optCheckModels(true)) match {
       case SatWithModel(model) =>
         val evaluated = program.getEvaluator.eval(E(lengthID)(I)(value(model, l)), model)
         assert(evaluated.result == Some(int(3)))
