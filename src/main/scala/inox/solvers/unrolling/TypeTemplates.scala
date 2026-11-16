@@ -156,6 +156,20 @@ trait TypeTemplates { self: Templates =>
     CaptureTemplate(arg._2, container._2).instantiate(start, container._1, arg._1)
   }
 
+  /** Orders the functions that the lambda `container` captures before it, without the clauses that
+    * make them distinct (see [[canBeEqual]]).
+    *
+    * Without function equality, a lambda can be equal to a function that it captures: `() => f()`
+    * agrees with `f` on every input, so their distinguishing input makes them equal. The solver
+    * then still doesn't apply the lambda to the applications of the function, nor relate their
+    * typings and congruences. Leaving these clauses out only weakens the query, so refutations
+    * remain sound, and models are validated. Otherwise, each function would be considered equal to
+    * the lambdas that capture it, such as Stainless's type predicates
+    * `x => x.isInstanceOf[(A, B)] && A(x._1) && B(x._2)`, which can make some queries time out. */
+  def registerCapturedFunctions(container: Encoded, functions: Seq[Encoded]): Unit = {
+    if (functions.nonEmpty) lessOrder += container -> (lessOrder(container) ++ functions)
+  }
+
   private def instantiateTyping(blocker: Encoded, typing: Typing): Clauses = {
     // The clauses of a typing are guarded by the blocker it is instantiated under, so its result
     // is only shared under the same blocker: it would be unconstrained elsewhere, and could then be

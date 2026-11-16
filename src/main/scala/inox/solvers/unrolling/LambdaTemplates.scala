@@ -372,9 +372,15 @@ trait LambdaTemplates { self: Templates =>
       // contain itself), so captured functions are ordered before the lambdas that capture them.
       // Equality is only that of values under intensional equality: otherwise, `() => f()` captures
       // `f` and agrees with it on every input, so it is equal to `f`.
+      //
+      // Without function equality, the solver still doesn't look for models where a lambda is equal
+      // to a function it captures, but doesn't exclude them either (see [[registerCapturedFunctions]]).
       val orderingClauses = if (functionWitnesses) Seq.empty else newTemplate.closures.flatMap {
         case (v, dep) => registerClosure(newTemplate.start, idT -> newTemplate.tpe, dep -> v.getType)
       }
+      if (unobservableEquality) registerCapturedFunctions(idT, newTemplate.closures.collect {
+        case (v, dep) if v.getType.isInstanceOf[FunctionType] => dep
+      })
 
       // make sure we introduce sound equality constraints between closures that take no arguments
       val arglessEqClauses: Clauses = if (newTemplate.tpe.from.nonEmpty || !isPureTemplate(newTemplate)) {
@@ -678,6 +684,10 @@ trait LambdaTemplates { self: Templates =>
     * structurally instead. */
   protected lazy val functionWitnesses: Boolean =
     options.findOptionOrDefault(optFunctionEquality) != FunctionEquality.Intensional
+
+  /** Whether function equality can't be observed, see [[optFunctionEquality]]. */
+  private lazy val unobservableEquality: Boolean =
+    options.findOptionOrDefault(optFunctionEquality) == FunctionEquality.None
 
   /** Whether `e` is the argument of a distinguishing input (see [[Templates.instantiateWitness]]). */
   def isWitnessArgument(e: Encoded): Boolean = witnessArguments(e)
