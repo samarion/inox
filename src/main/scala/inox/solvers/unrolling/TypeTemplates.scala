@@ -546,6 +546,10 @@ trait TypeTemplates { self: Templates =>
         v
       })
 
+    /** Whether a guard has appeared that gives the solver a use for empty type parameters
+      * (@see [[unfoldTypeParameters]]) */
+    private[unrolling] def unfoldsTypeParameters: Boolean = unfoldingTypeParameters
+
     /** The type parameters of the query, with their flags (@see [[storeTypeParameter]]) */
     private[unrolling] def typeParameterFlags: Seq[(TypeParameter, Encoded)] =
       tpSyms.toSeq.map { case (tp, v) => tp -> tpSubst(v) }

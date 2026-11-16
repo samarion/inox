@@ -61,8 +61,9 @@ class EmptyTypeParameterSuite extends SolverTestSuite {
 
   test("free values without values of an empty type parameter remain", TypeParameters, Quantifiers) { ctx =>
     val s = solver(ctx)
+    // `xs` is Nil in a model where T is empty, while its typing can be unfolded without end
     val res = s.solveSAT(IsConstructor(xs, nilID) && empty)
-    assert(!res.isUNSAT, s"expected SAT or unknown, got $res")
+    assert(res.isSAT, s"expected SAT, got $res")
   }
 
   test("free values are checked once their type parameter may be empty", TypeParameters, Quantifiers) { ctx =>

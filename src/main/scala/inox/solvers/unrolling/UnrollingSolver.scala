@@ -1172,6 +1172,37 @@ abstract class AbstractUnrollingSolver private
     // The type parameters that the model being validated leaves empty, once a model can only be
     // found with some type parameters empty (see the state `Unroll`)
     var emptyTypeParameters: Set[TypeParameter] = Set.empty
+
+    // Whether the search with empty type parameters ran since the last unrolling
+    var searchedEmptyTypeParameters: Boolean = false
+
+    /* Searches for a model without assuming that type parameters have values, and validates the
+     * model it finds with the type parameters that it leaves empty. Returns None when there is no
+     * such model, or when the model it finds gives every type parameter values. */
+    def searchWithEmptyTypeParameters(): Option[CheckState] = {
+      searchedEmptyTypeParameters = true
+      val typeParameters = templates.typesManager.typeParameterFlags
+      val flags = typeParameters.map(_._2).toSet
+      reporter.debug(" - Running search with empty type parameters")
+      val res = context.timers.solvers.unrolling.check.run {
+        underlying.checkAssumptions(Configuration(model = true, unsatAssumptions = false))(
+          encodedAssumptions.toSet ++ templates.satisfactionAssumptions.filterNot(flags)
+        )
+      }
+      res match {
+        case SatWithModel(model) =>
+          val wrapped = wrapModel(model)
+          emptyTypeParameters = typeParameters.collect {
+            case (tp, flag) if wrapped.modelEval(flag, t.BooleanType()) == Some(t.BooleanLiteral(false)) =>
+              decode(tp.asInstanceOf[t.Type])
+          }.collect { case tp: TypeParameter => tp }.toSet
+          if (emptyTypeParameters.isEmpty) None else {
+            reporter.debug(" - Empty type parameters: " + emptyTypeParameters.map(_.asString).mkString(", "))
+            Some(Validate(model))
+          }
+        case _ => None
+      }
+    }
     def witnessEqualities: Map[Encoded, Int] =
       if (witnessLevel > 0) templates.witnessEqualities else Map.empty
 
@@ -1240,6 +1271,8 @@ abstract class AbstractUnrollingSolver private
       currentState = currentState match {
         case ModelCheck =>
           reporter.debug(" - Running search...")
+          // this search assumes that type parameters have values
+          emptyTypeParameters = Set.empty
 
           val equalities = witnessEqualities
           val getModel = !templates.requiresFiniteRangeCheck || checkModels || templates.hasAxioms || config.withModel
@@ -1408,6 +1441,11 @@ abstract class AbstractUnrollingSolver private
               sat
             } else if (abort || pause) {
               unknown
+            } else if (emptyTypeParameters.nonEmpty && !valid && templates.canUnroll) {
+              // the type parameters may need values after all, which further unrolling may give
+              reporter.debug(" - The model with empty type parameters is invalid")
+              emptyTypeParameters = Set.empty
+              Unroll
             } else if (mustValidate && !valid) {
               if (!silentErrors) {
                 reporter.error("Something went wrong. The model should have been valid, yet we got this:")
@@ -1551,39 +1589,22 @@ abstract class AbstractUnrollingSolver private
         case Unroll if !templates.canUnroll =>
           // Only satisfaction assumptions that unrolling cannot discharge are left, e.g. a model
           // exists only if some type parameter is empty. The search then drops the assumptions
-          // that type parameters have values, and validates the model it finds with the type
-          // parameters that it leaves empty.
-          val typeParameters = templates.typesManager.typeParameterFlags
-          val flags = typeParameters.map(_._2).toSet
-          if (emptyTypeParameters.nonEmpty || typeParameters.isEmpty) {
+          // that type parameters have values.
+          lazy val found =
+            if (searchedEmptyTypeParameters || templates.typesManager.typeParameterFlags.isEmpty) None
+            else searchWithEmptyTypeParameters()
+          found.getOrElse {
             reporter.debug("- We need to keep going, but nothing is left to unroll")
             CheckResult.cast(Unknown)
-          } else {
-            reporter.debug(" - Running search with empty type parameters")
-            val res = context.timers.solvers.unrolling.check.run {
-              underlying.checkAssumptions(Configuration(model = true, unsatAssumptions = false))(
-                encodedAssumptions.toSet ++ templates.satisfactionAssumptions.filterNot(flags)
-              )
-            }
-            res match {
-              case SatWithModel(model) =>
-                val wrapped = wrapModel(model)
-                emptyTypeParameters = typeParameters.collect {
-                  case (tp, flag) if wrapped.modelEval(flag, t.BooleanType()) == Some(t.BooleanLiteral(false)) =>
-                    decode(tp.asInstanceOf[t.Type])
-                }.collect { case tp: TypeParameter => tp }.toSet
-                if (emptyTypeParameters.isEmpty) {
-                  reporter.debug("- We need to keep going, but nothing is left to unroll")
-                  CheckResult.cast(Unknown)
-                } else {
-                  reporter.debug(" - Empty type parameters: " + emptyTypeParameters.map(_.asString).mkString(", "))
-                  Validate(model)
-                }
-              case _ =>
-                reporter.debug("- We need to keep going, but nothing is left to unroll")
-                CheckResult.cast(Unknown)
-            }
           }
+
+        // A model may also need empty type parameters while unrolling continues, e.g. when a free
+        // value of a recursive type mentions an empty type parameter, as its typing can be unfolded
+        // without end. The search runs once per unrolling, once a bound variable of a type parameter
+        // gives the solver a use for empty type parameters.
+        case Unroll if !searchedEmptyTypeParameters && templates.typesManager.unfoldsTypeParameters &&
+            templates.typesManager.typeParameterFlags.nonEmpty =>
+          searchWithEmptyTypeParameters().getOrElse(Unroll)
 
         case Unroll => context.timers.solvers.unrolling.unroll.run {
           reporter.debug("- We need to keep going")
@@ -1598,6 +1619,7 @@ abstract class AbstractUnrollingSolver private
 
           unrollCount += 1
           if (witnessLevel > 0) witnessLevel += 1
+          searchedEmptyTypeParameters = false
 
           reporter.debug(" - Finished unrolling")
           ModelCheck
