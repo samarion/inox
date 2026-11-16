@@ -60,7 +60,9 @@ class EmptyTypeParameterSuite extends SolverTestSuite {
   }
 
   test("free values without values of an empty type parameter remain", TypeParameters, Quantifiers) { ctx =>
-    val s = solver(ctx)
+    // The solvers unroll `xs` without end here, so the answer is Unknown once the timeout is reached:
+    // a short timeout spares the default two minutes of each solver.
+    val s = SimpleSolverAPI(program.getSolver(ctx).withTimeout(scala.concurrent.duration.Duration(5, "s")))
     val res = s.solveSAT(IsConstructor(xs, nilID) && empty)
     assert(!res.isUNSAT, s"expected SAT or unknown, got $res")
   }
