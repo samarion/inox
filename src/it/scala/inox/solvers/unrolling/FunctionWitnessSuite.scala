@@ -16,7 +16,7 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
   import dsl._
 
   override protected def optionMatrix = UnrollingTestSuite.combinations(
-    // Most tests compare functions, which `none` rejects. Distinct functions always
+    // Most tests compare functions, which the default semantics rejects. Distinct functions always
     // have a distinguishing input under extensional equality, but not under intensional equality.
     Seq(optFunctionEquality(FunctionEquality.Extensional)),
     Seq(optCheckModels(true)),
@@ -231,7 +231,8 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
   test("many pairwise distinct functions") {
     // More pairs than any fixed budget of distinguishing inputs would cover. All functions agree
     // on `true`, so the solver has to pick a different result on `false` for each of them.
-    val fs = (1 to 16).map(i => (s"f$i" :: (BooleanType() =>: IntegerType())).toVariable)
+    // Solving time grows quickly with their number: 9 s for 12 functions, 36 s for 16.
+    val fs = (1 to 12).map(i => (s"f$i" :: (BooleanType() =>: IntegerType())).toVariable)
     val pairs = for (f1 <- fs; f2 <- fs if f1.id.globalId < f2.id.globalId) yield (f1, f2)
     val clause = andJoin(fs.map(f => f(E(true)) === E(BigInt(0))) ++ pairs.map((f1, f2) => f1 !== f2))
     val model = solve(clause)
@@ -555,7 +556,7 @@ class FunctionWitnessSuite extends UnrollingTestSuite {
     assert(optFunctionEquality.parser("extensional") == Some(FunctionEquality.Extensional))
     assert(optFunctionEquality.parser("Intensional") == Some(FunctionEquality.Intensional))
     assert(optFunctionEquality.parser("structural").isEmpty)
-    assert(optFunctionEquality.default == FunctionEquality.Intensional)
+    assert(optFunctionEquality.default == FunctionEquality.None)
   }
 
   test("functions applied to functions without function equality", hasHigherOrderModels) { ctx ?=>
