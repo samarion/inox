@@ -287,6 +287,8 @@ trait FunctionTemplates { self: Templates =>
               case interpreted: Interpreted =>
                 newCls ++= InterpretedTemplate(interpreted).instantiate(defBlocker, args)
               case Defined(tfd) =>
+                // Ground calls are evaluated rather than unfolded, and unfolded when evaluation fails. A call is
+                // blocked if a ground argument that runs no functions gets stuck (e.g. `nil.tail`).
                 val (inlining, skip) = context.timers.solvers.`eval-call`.run {
                   val groundArgs = (args zip tfd.params).map { p =>
                     decodePartial(p._1.encoded, p._2.getType)
@@ -302,38 +304,45 @@ trait FunctionTemplates { self: Templates =>
                     if (groundArgs.forall(_.isDefined)) Some(tfd.applied(groundArgs.map(_.get)))
                     else None
 
-                  val inlining = groundCall.filter(e => !callsUninterpreted(tfd) && isPure(e)).map(e => evaluator.eval(e))
-                  val skip = (groundArgs.flatten.map(evaluator.eval) ++ inlining).exists {
-                    case evaluators.EvaluationResults.EvaluatorError(_) => true
+                  def runsFunctions(arg: Expr): Boolean = exprOps.exists {
+                    case (_: FunctionInvocation) | (_: Application) => true
+                    case adt: ADT => adt.getConstructor.sort.definition.hasInvariant
                     case _ => false
+                  } (arg)
+
+                  val stuck = groundArgs.flatten.exists { arg =>
+                    !runsFunctions(arg) && (evaluator.eval(arg) match {
+                      case evaluators.EvaluationResults.RuntimeError(_) => !interruptManager.isInterrupted
+                      case _ => false
+                    })
                   }
-                  (inlining, skip)
+
+                  val inlining = if (stuck) None
+                    else groundCall.filter(e => !callsUninterpreted(tfd) && isPure(e)).map(e => evaluator.eval(e))
+                  (inlining, stuck)
                 }
 
-                if (skip) {
-                  newCls += mkNot(defBlocker)
-                } else {
-                  newCls ++= inlining.flatMap(_.result).map { body =>
-                    val start = Variable.fresh("cs", BooleanType())
-                    val (p, cls) = mkExprClauses(start, body, Map(start -> defBlocker))
-                    val tmplClauses = cls + (start -> Equals(tfd.applied, p))
+                if (skip) newCls += mkNot(defBlocker)
+                else newCls ++= inlining.flatMap(_.result).map { body =>
+                  val start = Variable.fresh("cs", BooleanType())
+                  val (p, cls) = mkExprClauses(start, body, Map(start -> defBlocker))
+                  val tmplClauses = cls + (start -> Equals(tfd.applied, p))
 
-                    val encoding: (Clauses, Calls, Apps, Matchers, Reads, Pointers, () => String) = Template.encode(
-                      start -> defBlocker,
-                      tfd.params.map(_.toVariable) zip args.map(_.encoded),
-                      tmplClauses,
-                      optCall = Some(Defined(tfd))
-                    )
+                  val encoding: (Clauses, Calls, Apps, Matchers, Reads, Pointers, () => String) = Template.encode(
+                    start -> defBlocker,
+                    tfd.params.map(_.toVariable) zip args.map(_.encoded),
+                    tmplClauses,
+                    optCall = Some(Defined(tfd))
+                  )
 
-                    val (clauses, calls, apps, matchers, reads, pointers, _) = encoding
-                    val (condVars, exprVars, condTree, types, equalities, lambdas, quants) = tmplClauses.proj
-                    val (substClauses, substMap) = Template.substitution(
-                      condVars, exprVars, condTree, types, lambdas, quants, pointers, Map.empty, defBlocker)
-                    val templateClauses = Template.instantiate(clauses, calls, apps, matchers, reads, equalities, substMap)
-                    substClauses ++ templateClauses
-                  } getOrElse {
-                    FunctionTemplate(tfd).instantiate(defBlocker, args ++ tpSubst)
-                  }
+                  val (clauses, calls, apps, matchers, reads, pointers, _) = encoding
+                  val (condVars, exprVars, condTree, types, equalities, lambdas, quants) = tmplClauses.proj
+                  val (substClauses, substMap) = Template.substitution(
+                    condVars, exprVars, condTree, types, lambdas, quants, pointers, Map.empty, defBlocker)
+                  val templateClauses = Template.instantiate(clauses, calls, apps, matchers, reads, equalities, substMap)
+                  substClauses ++ templateClauses
+                } getOrElse {
+                  FunctionTemplate(tfd).instantiate(defBlocker, args ++ tpSubst)
                 }
             }
 
