@@ -61,6 +61,9 @@ trait TypeOps {
       case (adt1: ADTType, adt2: ADTType) if adt1.id == adt2.id && adt1.tps.size == adt2.tps.size =>
         val underlying = (adt1.tps zip adt2.tps).map { case (tp1, tp2) => bound(tp1, tp2, lower) }
         if (underlying.exists(_ == Untyped)) Untyped else ADTType(adt1.id, underlying)
+      case (TupleType(tps1), TupleType(tps2)) if tps1.size == tps2.size =>
+        val underlying = (tps1 zip tps2).map { case (tp1, tp2) => bound(tp1, tp2, lower) }
+        if (underlying.exists(_ == Untyped)) Untyped else TupleType(underlying)
       case (SetType(base1), SetType(base2)) => 
         val underlying = bound(base1, base2, lower)
         if (underlying == Untyped) Untyped else SetType(underlying)
@@ -86,7 +89,41 @@ trait TypeOps {
   def isSubtypeOf(t1: Type, t2: Type): Boolean =
     t1.getType != Untyped && t2.getType != Untyped && (
       t1.getType == t2.getType ||
-      (t1.getType == BooleanType() && t2.getType == PropType()))
+      // booleans are propositions, also in the types that hold propositions
+      (containsProposition(t2.getType) && leastUpperBound(t1.getType, t2.getType) == t2.getType))
+
+  /** Whether the values of `tpe` are propositions, or functions that return such values (see
+    * [[Types.PropType]]): a term can choose between two of these with a proposition. */
+  def carriesProposition(tpe: Type): Boolean = tpe match {
+    case PropType() => true
+    case FunctionType(_, to) => carriesProposition(to)
+    case PiType(_, to) => carriesProposition(to)
+    case RefinementType(vd, _) => carriesProposition(vd.tpe)
+    case _ => false
+  }
+
+  /** Whether the values of `tpe` hold a proposition (see [[Types.PropType]]): a proposition, a function
+    * that returns one, or data with one in a field, a tuple or the values of a map. Their
+    * equality would observe the proposition, so it is a proposition itself, and these values
+    * can't be the elements of a set or a bag, the keys of a map, or instantiate a type parameter.
+    */
+  def containsProposition(tpe: Type): Boolean = {
+    // the sorts already looked into: a recursive field adds nothing to the others
+    val seen = scala.collection.mutable.Set.empty[Identifier]
+    def rec(tpe: Type): Boolean = tpe match {
+      case PropType() => true
+      // a function can't depend on the propositions it takes
+      case FunctionType(_, to) => rec(to)
+      case PiType(_, to) => rec(to)
+      case MapType(_, to) => rec(to)
+      case RefinementType(vd, _) => rec(vd.tpe)
+      case SigmaType(params, to) => params.exists(vd => rec(vd.tpe)) || rec(to)
+      case ADTType(id, tps) => tps.exists(rec) || (seen.add(id) && lookupSort(id).exists(
+        _.constructors.exists(_.fields.exists(vd => rec(vd.tpe)))))
+      case NAryType(tps, _) => tps.exists(rec)
+    }
+    rec(tpe)
+  }
 
   private type Instantiation = Map[TypeParameter, Type]
   def instantiation(from: Type, to: Type): Option[Instantiation] = {

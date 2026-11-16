@@ -739,6 +739,15 @@ class EvaluatorSuite extends AnyFunSuite {
     // functions that agree on every candidate input can't be told apart
     eval(extensional, Equals(succ, succ2)).failed
     eval(extensional, Equals(id, alsoId)).failed
+    // a lambda that applies a function is equal to it
+    val appliesSucc2 = lambda(x => Application(succ2, Seq(x)))
+    eval(extensional, Equals(appliesSucc2, succ2)) === BooleanLiteral(true)
+    eval(extensional, Equals(appliesSucc2, succ)).failed
+    // but a nullary lambda that applies a function to a value isn't that function
+    eval(extensional, Equals(Lambda(Seq.empty, Application(succ, Seq(int(1)))), Lambda(Seq.empty, int(2)))) === BooleanLiteral(true)
+    // nullary functions are equal when their only results are
+    eval(extensional, Equals(Lambda(Seq.empty, Plus(int(1), int(1))), Lambda(Seq.empty, int(2)))) === BooleanLiteral(true)
+    eval(extensional, Equals(Lambda(Seq.empty, int(1)), Lambda(Seq.empty, int(2)))) === BooleanLiteral(false)
 
     // without function equality, functions can't be compared at all
     val none = recursive(FunctionEquality.None)
@@ -748,6 +757,19 @@ class EvaluatorSuite extends AnyFunSuite {
     // but values that hold functions can differ elsewhere
     eval(none, Equals(Tuple(Seq(int(1), succ)), Tuple(Seq(int(2), succ)))) === BooleanLiteral(false)
     eval(none, Equals(Tuple(Seq(int(1), int(2))), Tuple(Seq(int(1), int(2))))) === BooleanLiteral(true)
+
+    // sets, bags and maps compare their elements and keys, so they can't hold functions under `none`
+    val fnT = FunctionType(Seq(IntegerType()), IntegerType())
+    val fnSet = FiniteSet(Seq(succ), fnT)
+    eval(none, fnSet).failed
+    eval(none, ElementOfSet(id, FiniteSet(Seq(alsoId), fnT))).failed
+    eval(none, Equals(FiniteSet(Seq(id), fnT), FiniteSet(Seq(alsoId), fnT))).failed
+    eval(none, FiniteBag(Seq(succ -> int(1)), fnT)).failed
+    eval(none, FiniteMap(Seq(succ -> int(1)), int(0), fnT, IntegerType())).failed
+    eval(none, FiniteSet(Seq(Tuple(Seq(int(1), succ))), TupleType(Seq(IntegerType(), fnT)))).failed
+    // functions are fine as the values of a map, and the other semantics accept function sets
+    eval(none, Application(MapApply(FiniteMap(Seq(int(1) -> succ), pred, IntegerType(), fnT), int(2)), Seq(int(5)))) === int(4)
+    eval(intensional, ElementOfSet(id, FiniteSet(Seq(id), fnT))) === BooleanLiteral(true)
   }
 
   abstract class EvalDSL {
