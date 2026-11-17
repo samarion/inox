@@ -41,14 +41,17 @@ object PropEncoder {
 
   private def erase(p: Program)(eraser: p.trees.ConcreteSelfTreeTransformer): Program { val trees: p.trees.type } = {
     import p.trees._
-    import p.symbols.given
-    // the propositions of a program are its results and its let-bound variables, refined or not
-    val hasProps = p.symbols.functions.values.exists { fd =>
-      fd.returnType.getType == PropType() || exprOps.exists {
-        case Let(vd, _, _) => vd.getType == PropType()
-        case _ => false
-      } (fd.fullBody)
+    // propositions appear in the types of results, parameters, fields and variables
+    var hasProps = false
+    object finder extends ConcreteSelfTreeTraverser {
+      override def traverse(tpe: Type): Unit = tpe match {
+        case PropType() => hasProps = true
+        case _ => if (!hasProps) super.traverse(tpe)
+      }
+      override def traverse(e: Expr): Unit = if (!hasProps) super.traverse(e)
     }
+    for (fd <- p.symbols.functions.values if !hasProps) finder.traverse(fd)
+    for (sort <- p.symbols.sorts.values if !hasProps) finder.traverse(sort)
     if (!hasProps && p.symbols.modes.quantifiers == QuantifierMode.Boolean) {
       p.asInstanceOf[Program { val trees: p.trees.type }]
     } else {

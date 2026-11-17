@@ -32,10 +32,18 @@ trait Types { self: Trees =>
     protected def computeTpe(stripRefinements: Boolean)(using Symbols): Type
   }
 
-  protected def unveilUntyped(tpe: Type): Type = {
+  protected def unveilUntyped(tpe: Type)(using s: Symbols): Type = {
     val NAryType(tps, _) = tpe: @unchecked
-    // propositions are not data: `PropType` can't appear inside of another type
-    if (tps exists (tp => tp == Untyped || tp == PropType())) Untyped else tpe
+    if (tps contains Untyped) Untyped
+    else tpe match {
+      // sets, bags and maps compute with the equality of their elements and keys, and generic
+      // code with the equality of its type parameters, which would observe a proposition
+      case SetType(base) if s.containsProposition(base) => Untyped
+      case BagType(base) if s.containsProposition(base) => Untyped
+      case MapType(from, _) if s.containsProposition(from) => Untyped
+      case ADTType(_, tps) if tps exists s.containsProposition => Untyped
+      case _ => tpe
+    }
   }
 
   abstract class Type extends Tree with Typed {
@@ -69,12 +77,17 @@ trait Types { self: Trees =>
 
   /** The type of propositions, of which [[BooleanType]] is a subtype.
     *
-    * A proposition has a truth value in every model but no evaluation rule, so the value of a
-    * term can't depend on it: nothing takes a proposition back to a boolean. Propositions are not
-    * data either. `PropType` is the type of an expression, of a variable that a `Let` binds to a
-    * proposition (a name for it), or the return type of a function (a predicate definition). It
-    * can't be the type of a parameter or a field, or appear inside of another type, other than
-    * as the type that a [[RefinementType]] refines: a refined proposition is still a proposition.
+    * A proposition has a truth value in every model but no evaluation rule, so its truth value
+    * can't be observed: nothing takes a proposition back to a boolean. A term can't branch on
+    * one, unless its branches are propositions themselves, and an equality between values that
+    * hold propositions is a proposition (see [[TypeOps.containsProposition]]).
+    *
+    * A proposition is otherwise a value: it can be bound by a `Let` (a name for it), passed as
+    * an argument, returned by a function (a predicate definition) or by a lambda (a predicate),
+    * and held by a tuple, the field of an ADT or the values of a map. It can be refined by a
+    * [[RefinementType]]. Since sets, bags and maps compute with the equality of their elements
+    * and keys, and generic code with the equality of its type parameters, a proposition can't be
+    * an element, a key or a type argument. One can't quantify over propositions.
     *
     * Propositions are accepted where a specification is stated: in the predicate of a
     * [[RefinementType]] or of an `Assume`, and in the constraints of solvers. Quantifiers are
@@ -158,9 +171,23 @@ trait Types { self: Trees =>
   /* Dependent Types */
 
   private object TypeNormalization {
-    private class TypeNormalizer extends ConcreteSelfTreeTransformer {
+    /** Renames the binders of a type to the identifiers of `SymbolOps.getId`, in order, as
+      * `normalizeStructure` does for lambdas. The free variables of a type keep their names, and may
+      * themselves be such identifiers (eg. in the body of a normalized lambda), so these are skipped.
+      */
+    private class TypeNormalizer(free: Set[Identifier]) extends ConcreteSelfTreeTransformer {
       private val subst: MutableMap[Variable, Variable] = MutableMap.empty
       private var counter: Int = 0
+
+      private def nextId(): Identifier = {
+        var id = SymbolOps.getId(counter)
+        counter += 1
+        while (free(id)) {
+          id = SymbolOps.getId(counter)
+          counter += 1
+        }
+        id
+      }
 
       override def transform(expr: Expr): Expr = expr match {
         case v: Variable => subst.getOrElse(v, v)
@@ -168,8 +195,7 @@ trait Types { self: Trees =>
       }
 
       override def transform(vd: ValDef): ValDef = {
-        val nid = new Identifier("x", counter, counter, false)
-        counter += 1
+        val nid = nextId()
 
         val newVd = ValDef(nid, transform(vd.tpe), vd.flags map transform).copiedFrom(vd)
         subst(vd.toVariable) = newVd.toVariable
@@ -177,7 +203,8 @@ trait Types { self: Trees =>
       }
     }
 
-    def apply[T <: Type](tpe: T): T = (new TypeNormalizer).transform(tpe).asInstanceOf[T]
+    def apply[T <: Type](tpe: T): T =
+      (new TypeNormalizer(typeOps.variablesOf(tpe).map(_.id))).transform(tpe).asInstanceOf[T]
   }
 
   protected sealed trait TypeNormalization { self: Type & Product =>

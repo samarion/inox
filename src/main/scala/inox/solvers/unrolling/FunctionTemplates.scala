@@ -47,9 +47,20 @@ trait FunctionTemplates { self: Templates =>
       val arguments = (fdArgs ++ tpVars).map(v => v -> encodeSymbol(v))
       val substMap = arguments.toMap + pathVar
 
+      val (p, bodyClauses) = mkExprClauses(start, body, substMap)
+
+      // The calls that evaluating the body reaches, with the blockers of their paths (see `rankClauses`)
+      val bodySites: Seq[(Variable, FunctionInvocation)] = {
+        def invocations(e: Expr): Seq[FunctionInvocation] = exprOps.collect[FunctionInvocation] {
+          case fi: FunctionInvocation => Set(fi)
+          case _ => Set.empty
+        } (e).toSeq
+        (bodyClauses._4.toSeq.flatMap { case (b, es) => es.flatMap(invocations).map(b -> _) } ++
+          invocations(p).map(start -> _)).distinct
+      }
+
       val tmplClauses: TemplateClauses = {
-        val (p, tmplClauses) = mkExprClauses(start, body, substMap)
-        val clauses = tmplClauses + (start -> Equals(call, p))
+        val clauses = bodyClauses + (start -> Equals(call, p))
 
         // Register the function's return as a contract typing to enable
         // induction with refinement types
@@ -84,8 +95,9 @@ trait FunctionTemplates { self: Templates =>
         }
       }
 
-      val (contents, str) = Template.contents(
+      val (contents0, str) = Template.contents(
         pathVar, arguments, tmplClauses, optCall = Some(Defined(tfd)))
+      val contents = contents0.copy(clauses = contents0.clauses ++ rankClauses(tfd, contents0, bodySites))
 
       val funString : () => String = () => {
         "Template for def " + tfd.signature +
@@ -97,6 +109,48 @@ trait FunctionTemplates { self: Templates =>
       cache(tfd) = res
       res
     })
+  }
+
+  private val rankCache: MutableMap[TypedFunDef, Variable] = MutableMap.empty
+  private val rankSymbols: MutableMap[Variable, Encoded] = MutableMap.empty
+
+  /** The rank of the call `tfd(args)`: an uninterpreted integer function of the arguments. */
+  private def rank(tfd: TypedFunDef, args: Seq[Expr]): Expr = {
+    val r = rankCache.getOrElseUpdate(tfd, {
+      val r = Variable.fresh("rank_" + tfd.id.name,
+        if (tfd.params.isEmpty) IntegerType() else FunctionType(tfd.params.map(_.getType), IntegerType()), true)
+      rankSymbols(r) = encodeSymbol(r)
+      r
+    })
+    if (tfd.params.isEmpty) r else Application(r, args)
+  }
+
+  /** Clauses stating that a call ranks higher than the calls that evaluating its body reaches, on the
+    * paths that reach them.
+    *
+    * A call that returns a value has a finite evaluation, so ranking each call by the depth of its
+    * evaluation satisfies these clauses. A call that reaches itself, possibly through other calls,
+    * on the same arguments never returns, as evaluation is deterministic: the ranks along the cycle
+    * can't decrease, so the paths that close the cycle are infeasible. Without these clauses, the
+    * equations of the calls on such a cycle, e.g. `f(x) = g(x)` and `g(x) = f(x)`, would be
+    * satisfied by any value once every call on it is unfolded. This includes `f(x) = f(x)` for
+    * `def f(x) = f(x)`, whose body call is dropped from the template (see `Template.extractCalls`).
+    *
+    * Only the calls of the body are ranked: the evaluator doesn't evaluate the calls in type checks,
+    * and those in lambdas and quantifiers belong to their own templates. */
+  private def rankClauses(tfd: TypedFunDef, contents: TemplateContents,
+                          sites: Seq[(Variable, FunctionInvocation)]): Clauses = if (sites.isEmpty) Seq.empty else {
+    val self = rank(tfd, tfd.params.map(_.toVariable))
+    val ranked = sites.map { case (b, fi) => (b, fi, rank(fi.tfd, fi.args)) }
+    val allSymbols = Map(contents.pathVar) ++ contents.arguments ++ contents.condVars ++ contents.exprVars ++
+      contents.lambdas.map(_.ids) ++ contents.quantifications.flatMap(_.mapping) ++ rankSymbols ++
+      typesManager.tpSubst ++ uninterpretedSubst
+    val encoder = mkEncoder(allSymbols)
+    ranked.flatMap { case (b, fi, callee) =>
+      // Calls whose arguments mention symbols that the template doesn't bind aren't ranked
+      if (!exprOps.variablesOf(callee).forall(allSymbols.contains)) Seq.empty
+      else Seq(encoder(Implies(b, GreaterThan(self, callee))))
+    }
   }
 
   /** The templates of the interpretations of uninterpreted functions, whose calls are the
@@ -287,6 +341,8 @@ trait FunctionTemplates { self: Templates =>
               case interpreted: Interpreted =>
                 newCls ++= InterpretedTemplate(interpreted).instantiate(defBlocker, args)
               case Defined(tfd) =>
+                // Ground calls are evaluated rather than unfolded, and unfolded when evaluation fails. A call is
+                // blocked if a ground argument that runs no functions gets stuck (e.g. `nil.tail`).
                 val (inlining, skip) = context.timers.solvers.`eval-call`.run {
                   val groundArgs = (args zip tfd.params).map { p =>
                     decodePartial(p._1.encoded, p._2.getType)
@@ -302,38 +358,45 @@ trait FunctionTemplates { self: Templates =>
                     if (groundArgs.forall(_.isDefined)) Some(tfd.applied(groundArgs.map(_.get)))
                     else None
 
-                  val inlining = groundCall.filter(e => !callsUninterpreted(tfd) && isPure(e)).map(e => evaluator.eval(e))
-                  val skip = (groundArgs.flatten.map(evaluator.eval) ++ inlining).exists {
-                    case evaluators.EvaluationResults.EvaluatorError(_) => true
+                  def runsFunctions(arg: Expr): Boolean = exprOps.exists {
+                    case (_: FunctionInvocation) | (_: Application) => true
+                    case adt: ADT => adt.getConstructor.sort.definition.hasInvariant
                     case _ => false
+                  } (arg)
+
+                  val stuck = groundArgs.flatten.exists { arg =>
+                    !runsFunctions(arg) && (evaluator.eval(arg) match {
+                      case evaluators.EvaluationResults.RuntimeError(_) => !interruptManager.isInterrupted
+                      case _ => false
+                    })
                   }
-                  (inlining, skip)
+
+                  val inlining = if (stuck) None
+                    else groundCall.filter(e => !callsUninterpreted(tfd) && isPure(e)).map(e => evaluator.eval(e))
+                  (inlining, stuck)
                 }
 
-                if (skip) {
-                  newCls += mkNot(defBlocker)
-                } else {
-                  newCls ++= inlining.flatMap(_.result).map { body =>
-                    val start = Variable.fresh("cs", BooleanType())
-                    val (p, cls) = mkExprClauses(start, body, Map(start -> defBlocker))
-                    val tmplClauses = cls + (start -> Equals(tfd.applied, p))
+                if (skip) newCls += mkNot(defBlocker)
+                else newCls ++= inlining.flatMap(_.result).map { body =>
+                  val start = Variable.fresh("cs", BooleanType())
+                  val (p, cls) = mkExprClauses(start, body, Map(start -> defBlocker))
+                  val tmplClauses = cls + (start -> Equals(tfd.applied, p))
 
-                    val encoding: (Clauses, Calls, Apps, Matchers, Reads, Pointers, () => String) = Template.encode(
-                      start -> defBlocker,
-                      tfd.params.map(_.toVariable) zip args.map(_.encoded),
-                      tmplClauses,
-                      optCall = Some(Defined(tfd))
-                    )
+                  val encoding: (Clauses, Calls, Apps, Matchers, Reads, Pointers, () => String) = Template.encode(
+                    start -> defBlocker,
+                    tfd.params.map(_.toVariable) zip args.map(_.encoded),
+                    tmplClauses,
+                    optCall = Some(Defined(tfd))
+                  )
 
-                    val (clauses, calls, apps, matchers, reads, pointers, _) = encoding
-                    val (condVars, exprVars, condTree, types, equalities, lambdas, quants) = tmplClauses.proj
-                    val (substClauses, substMap) = Template.substitution(
-                      condVars, exprVars, condTree, types, lambdas, quants, pointers, Map.empty, defBlocker)
-                    val templateClauses = Template.instantiate(clauses, calls, apps, matchers, reads, equalities, substMap)
-                    substClauses ++ templateClauses
-                  } getOrElse {
-                    FunctionTemplate(tfd).instantiate(defBlocker, args ++ tpSubst)
-                  }
+                  val (clauses, calls, apps, matchers, reads, pointers, _) = encoding
+                  val (condVars, exprVars, condTree, types, equalities, lambdas, quants) = tmplClauses.proj
+                  val (substClauses, substMap) = Template.substitution(
+                    condVars, exprVars, condTree, types, lambdas, quants, pointers, Map.empty, defBlocker)
+                  val templateClauses = Template.instantiate(clauses, calls, apps, matchers, reads, equalities, substMap)
+                  substClauses ++ templateClauses
+                } getOrElse {
+                  FunctionTemplate(tfd).instantiate(defBlocker, args ++ tpSubst)
                 }
             }
 
