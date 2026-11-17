@@ -13,6 +13,19 @@ trait TemplateGenerator { self: Templates =>
   import program.trees._
   import program.symbols.{given, _}
 
+  /** Constructor values made of literals only, with at most [[maxSubstitutedValueSize]] nodes. */
+  private def isSmallConstructorValue(e: Expr): Boolean = {
+    def rec(e: Expr): Boolean = e match {
+      case _: Literal[?] => true
+      case ADT(_, tps, args) => tps.forall(tp => typeOps.typeParamsOf(tp).isEmpty) && args.forall(rec)
+      case Tuple(es) => es.forall(rec)
+      case _ => false
+    }
+    (e.isInstanceOf[ADT] || e.isInstanceOf[Tuple]) && exprOps.formulaSize(e) <= maxSubstitutedValueSize && rec(e)
+  }
+
+  private val maxSubstitutedValueSize = 16
+
   protected type TemplateClauses = (
     Map[Variable, Encoded],
     Map[Variable, Encoded],
@@ -526,6 +539,10 @@ trait TemplateGenerator { self: Templates =>
           // The bound expression (e.g. a conditional or a nested let) already got its own
           // variable, so we use that one instead of introducing an alias for it
           case _: Variable => re
+          // Small constructor values stand for themselves, so the calls they are passed to are
+          // ground: the unrolling then evaluates these calls, and blocks those whose arguments
+          // select fields of other constructors, rather than unfolding every branch of their bodies
+          case _ if isSmallConstructorValue(re) => re
           case _ =>
             val newExpr: Variable = Variable.fresh("lt", i.getType, true)
             storeExpr(newExpr)
