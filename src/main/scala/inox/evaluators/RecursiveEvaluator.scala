@@ -39,12 +39,14 @@ abstract class RecursiveEvaluator(override val program: Program,
     if (unsigned >= size) size else unsigned.toInt
   }
 
-  protected def finiteSet(els: Iterable[Expr], tpe: Type): FiniteSet = {
-    FiniteSet(els.toSeq.distinct.sortBy(_.toString), tpe)
+  protected def finiteSet(els: Iterable[Expr], tpe: Type)(using RC, GC): FiniteSet = {
+    checkKeys(tpe)
+    FiniteSet(distinctKeys(tpe)(els.toSeq).sortBy(_.toString), tpe)
   }
 
-  protected def finiteBag(els: Iterable[(Expr, Expr)], tpe: Type): FiniteBag = {
-    FiniteBag(els.toMap.toSeq.filter { case (_, IntegerLiteral(i)) => i > 0 case _ => false }.sortBy(_._1.toString), tpe)
+  protected def finiteBag(els: Iterable[(Expr, Expr)], tpe: Type)(using RC, GC): FiniteBag = {
+    checkKeys(tpe)
+    FiniteBag(lastByKey(tpe)(els.toSeq).filter { case (_, IntegerLiteral(i)) => i > 0 case _ => false }.sortBy(_._1.toString), tpe)
   }
 
   // `max` and `min` follow SMT-LIB's fp.max and fp.min: a NaN operand is ignored unless both are
@@ -73,30 +75,103 @@ abstract class RecursiveEvaluator(override val program: Program,
   private def fpMax(a: Float, b: Float): Float = if (a.isNaN) b else if (b.isNaN) a else a.max(b)
   private def fpMin(a: Float, b: Float): Float = if (a.isNaN) b else if (b.isNaN) a else a.min(b)
 
-  protected def finiteMap(els: Iterable[(Expr, Expr)], default: Expr, from: Type, to: Type): FiniteMap = {
-    FiniteMap(els.toMap.toSeq.filter { case (_, value) => value != default }.sortBy(_._1.toString), default, from, to)
+  protected def finiteMap(els: Iterable[(Expr, Expr)], default: Expr, from: Type, to: Type)(using RC, GC): FiniteMap = {
+    checkKeys(from)
+    FiniteMap(lastByKey(from)(els.toSeq).filter { case (_, value) => value != default }.sortBy(_._1.toString), default, from, to)
   }
 
   private lazy val functionEquality = options.findOptionOrDefault(solvers.unrolling.optFunctionEquality)
 
+  /** Fails under `none` if `tpe`, the type of the elements of a set or a bag or of the keys of a map,
+    * can contain functions, since the collection compares its elements. The solvers reject such
+    * collections (see [[solvers.unrolling.FunctionEquality.functionKeyedCollections]]). */
+  private def checkKeys(tpe: Type): Unit =
+    if (functionEquality == solvers.unrolling.FunctionEquality.None &&
+        solvers.unrolling.FunctionEquality.containsFunctions(program)(tpe))
+      throw EvalError(s"Sets and bags of functions and maps with function keys can't be used under " +
+        s"--function-equality=none: ${tpe.asString}")
+
+  /** Whether the elements of a set or a bag, or the keys of a map, of type `tpe` are compared with
+    * [[valuesEqual]] rather than structurally: under extensional equality, when they can contain
+    * functions. Otherwise, values are equal iff they are structurally equal.
+    *
+    * Structurally equal values are equal under every semantics, so they are looked for first: an
+    * element is found without deciding its equality with the others, which may be undecidable. */
+  private def keysByValue(tpe: Type): Boolean =
+    functionEquality == solvers.unrolling.FunctionEquality.Extensional &&
+      solvers.unrolling.FunctionEquality.containsFunctions(program)(tpe)
+
+  /** The index in `keys` of a key equal to `key`, of type `tpe` (see [[keysByValue]]). */
+  private def indexOfKey(tpe: Type)(keys: Seq[Expr], key: Expr)(using RC, GC): Int = {
+    val exact = keys.indexOf(key)
+    if (exact >= 0 || !keysByValue(tpe)) exact else keys.indexWhere(valuesEqual(_, key))
+  }
+
+  private def containsKey(tpe: Type)(keys: Seq[Expr], key: Expr)(using RC, GC): Boolean =
+    indexOfKey(tpe)(keys, key) >= 0
+
+  /** The value associated with `key` in `pairs`, whose keys have type `tpe`. */
+  private def lookupKey(tpe: Type)(pairs: Seq[(Expr, Expr)], key: Expr)(using RC, GC): Option[Expr] = {
+    val i = indexOfKey(tpe)(pairs.map(_._1), key)
+    if (i >= 0) Some(pairs(i)._2) else None
+  }
+
+  /** `els` without the elements that are equal to an earlier one. */
+  private def distinctKeys(tpe: Type)(els: Seq[Expr])(using RC, GC): Seq[Expr] =
+    if (!keysByValue(tpe)) els.distinct
+    else els.foldLeft(Seq.empty[Expr])((acc, el) => if (containsKey(tpe)(acc, el)) acc else acc :+ el)
+
+  /** `pairs` where a key is associated with the value of its last pair, as in a `Map` built from them. */
+  private def lastByKey(tpe: Type)(pairs: Seq[(Expr, Expr)])(using RC, GC): Seq[(Expr, Expr)] =
+    if (!keysByValue(tpe)) pairs.toMap.toSeq
+    else pairs.foldLeft(Seq.empty[(Expr, Expr)]) { case (acc, (k, v)) =>
+      val i = indexOfKey(tpe)(acc.map(_._1), k)
+      if (i >= 0) acc.updated(i, acc(i)._1 -> v) else acc :+ (k -> v)
+    }
+
   /** Equality between the values `v1` and `v2` (see [[solvers.unrolling.optFunctionEquality]]).
     *
     * - Under `intensional` equality, functions are compared structurally.
-    * - Under `none`, comparing functions is an evaluation error. Extracted models never compare
-    *   functions, and queries that do are rejected by the solvers.
+    * - Under `none`, comparing functions is an evaluation error, and so is using a set or a bag of
+    *   values that contain functions, or a map with such keys (see [[checkKeys]]). Extracted models
+    *   never compare functions, and queries that do are rejected by the solvers.
     * - Under `extensional` equality, structurally distinct functions are equal iff they agree on every
     *   input. They are told apart by their results on the closed subexpressions of the right type
     *   that they contain (for extracted models, the inputs that tell them apart), and their equality
-    *   is undecidable otherwise. */
-  protected def valuesEqual(v1: Expr, v2: Expr)(using rctx: RC, gctx: GC): Boolean = (v1, v2) match {
+    *   is undecidable otherwise, unless they take no arguments. */
+  protected def valuesEqual(v1: Expr, v2: Expr)(using rctx: RC, gctx: GC): Boolean = {
+    v1 match {
+      case FiniteSet(_, base) => checkKeys(base)
+      case FiniteBag(_, base) => checkKeys(base)
+      case FiniteMap(_, _, from, _) => checkKeys(from)
+      case _ =>
+    }
+    structurallyEqual(v1, v2)
+  }
+
+  private def structurallyEqual(v1: Expr, v2: Expr)(using rctx: RC, gctx: GC): Boolean = (v1, v2) match {
     case _ if functionEquality == solvers.unrolling.FunctionEquality.Intensional => v1 == v2
     case (ADT(id1, _, args1), ADT(id2, _, args2)) =>
       id1 == id2 && (args1 zip args2).forall(valuesEqual)
     case (Tuple(es1), Tuple(es2)) =>
       (es1 zip es2).forall(valuesEqual)
+    // the collections built by the evaluator have no repeated keys (see `finiteSet`)
+    case (FiniteSet(els1, base), FiniteSet(els2, _)) if keysByValue(base) =>
+      els1.size == els2.size && els1.forall(containsKey(base)(els2, _))
+    case (FiniteBag(els1, base), FiniteBag(els2, _)) if keysByValue(base) =>
+      els1.size == els2.size && els1.forall((k, v) => lookupKey(base)(els2, k).contains(v))
+    case (FiniteMap(pairs1, dflt1, from, to), FiniteMap(pairs2, dflt2, _, _))
+        if keysByValue(from) || (functionEquality != solvers.unrolling.FunctionEquality.Intensional &&
+                                 solvers.unrolling.FunctionEquality.containsFunctions(program)(to)) =>
+      valuesEqual(dflt1, dflt2) && (pairs1.map(_._1) ++ pairs2.map(_._1)).forall { k =>
+        valuesEqual(lookupKey(from)(pairs1, k).getOrElse(dflt1), lookupKey(from)(pairs2, k).getOrElse(dflt2))
+      }
     case (l1: Lambda, l2: Lambda) if functionEquality == solvers.unrolling.FunctionEquality.None =>
       throw EvalError(s"Functions can't be compared under --function-equality=none: ${l1.asString} and ${l2.asString}")
     case _ if v1 == v2 => true
+    case (l1: Lambda, l2: Lambda) if etaReduced(l1).isDefined || etaReduced(l2).isDefined =>
+      // the applied function is normalized as the evaluator normalizes lambdas
+      valuesEqual(etaReduced(l1).fold(l1)(e), etaReduced(l2).fold(l2)(e))
     case (l1: Lambda, l2: Lambda) =>
       def candidates(tpe: Type): Seq[Expr] = (Seq(l1, l2).flatMap { l =>
         exprOps.collect[Expr] {
@@ -109,14 +184,23 @@ abstract class RecursiveEvaluator(override val program: Program,
         for (arg <- candidates(vd.getType); args <- rest) yield arg +: args
       }.take(100)
 
-      def differOn(args: Seq[Expr]): Boolean = scala.util.Try {
+      def agreeOn(args: Seq[Expr]): Option[Boolean] = scala.util.Try {
         val values = args.map(e)
-        !valuesEqual(e(Application(l1, values)), e(Application(l2, values)))
-      }.getOrElse(false)
+        valuesEqual(e(Application(l1, values)), e(Application(l2, values)))
+      }.toOption
 
-      if (inputs.exists(differOn)) false
+      if (inputs.exists(agreeOn(_) == Some(false))) false
+      // nullary functions have a single input
+      else if (l1.params.isEmpty && agreeOn(Seq.empty) == Some(true)) true
       else throw EvalError(s"Can't decide whether ${l1.asString} and ${l2.asString} are equal")
     case _ => false
+  }
+
+  /** The function `g` that the lambda value `x => g(x)` applies, which is extensionally equal to it. */
+  private def etaReduced(l: Lambda): Option[Lambda] = l.body match {
+    case Application(g: Lambda, args) if args.map { case v: Variable => Some(v.id); case _ => None } == l.params.map(vd => Some(vd.id)) =>
+      Some(g)
+    case _ => None
   }
 
   /** The model value `v` as the evaluator would have built it.
@@ -278,7 +362,7 @@ abstract class RecursiveEvaluator(override val program: Program,
         case adt @ ADT(id, tps, args) =>
           if (adt.getConstructor.fields.exists(_.id == sel))
             args(adt.getConstructor.definition.selectorID2Index(sel))
-          else throw EvalError(s"Constructor ${id.asString} has no field ${sel.asString}")
+          else throw RuntimeError(s"Constructor ${id.asString} has no field ${sel.asString}")
         case le =>
           throw EvalError(typeErrorMsg(le, expr.getType))
       }
@@ -288,8 +372,7 @@ abstract class RecursiveEvaluator(override val program: Program,
         val (nl, deps) = normalizeStructure(l, lifting)
         // The lifted subexpressions are evaluated when their conditions hold. Otherwise, or when their
         // evaluation fails, they are put back unevaluated: they may only be pure under assumptions
-        // (eg. `10 / k` under `--assume-checked`) or be partial operations (see `NormalizationLifting`),
-        // and only applying the lambda may fail on them.
+        // (eg. `10 / k` under `--assume-checked`), and only applying the lambda may fail on them.
         val newCtx = deps.foldLeft(rctx) {
           case (rctx, (v, dep, conds)) =>
             def unevaluated = replaceFromSymbols(
@@ -310,8 +393,7 @@ abstract class RecursiveEvaluator(override val program: Program,
       // evaluate the subexpressions that it lifts out of the body. The values of its free variables
       // are substituted first, so that `x => l.head.f(x)` and `x => Cons(g, Nil()).head.f(x)` agree.
       val closed = replaceFromSymbols(variablesOf(l).flatMap(v => rctx.mappings.get(v.toVal).map(v -> _)).toMap, l)
-      val ground = normalizeLambda(closed.asInstanceOf[Lambda],
-        if (functionEquality == solvers.unrolling.FunctionEquality.Intensional) NormalizationLifting.Pure else NormalizationLifting.Partial)
+      val ground = normalizeLambda(closed.asInstanceOf[Lambda], NormalizationLifting.Pure)
 
       // Then, in order for nested lambdas to have fresh variables in their argument
       // lists and let bindings, we re-normalize the identifiers with `NormalizationLifting.Simple`
@@ -698,13 +780,16 @@ abstract class RecursiveEvaluator(override val program: Program,
         case _ => throw EvalError("Unexpected operation: fp.to_bv(" + expr.asString + ")")
       }
       val r = roundToIntegral(d, rm)
-      // SMT-LIB leaves the conversion of NaN, infinities and out-of-range values unspecified
-      if (r.isNaN || r.isInfinite) throw RuntimeError(s"Unspecified conversion of $d to a bitvector.")
-      val i = BigDecimal(r).toBigInt
+      // SMT-LIB leaves the conversion of NaN, infinities and out-of-range values unspecified. As on
+      // the JVM, NaN converts to 0, and out-of-range values saturate.
       val (lo, hi) =
         if (signed) (-BigInt(2).pow(size - 1), BigInt(2).pow(size - 1) - 1)
         else (BigInt(0), BigInt(2).pow(size) - 1)
-      if (i < lo || i > hi) throw RuntimeError(s"Unspecified conversion of $d to a bitvector of $size bits.")
+      val i =
+        if (r.isNaN) BigInt(0)
+        else if (r == Double.PositiveInfinity) hi
+        else if (r == Double.NegativeInfinity) lo
+        else BigDecimal(r).toBigInt.max(lo).min(hi)
       BVLiteral(signed, i, size)
 
     case FPToReal(expr) =>
@@ -855,33 +940,33 @@ abstract class RecursiveEvaluator(override val program: Program,
 
     case SetIntersection(s1,s2) =>
       (e(s1), e(s2)) match {
-        case (FiniteSet(els1, tpe), FiniteSet(els2, _)) => finiteSet(els1 intersect els2, tpe)
+        case (FiniteSet(els1, tpe), FiniteSet(els2, _)) => finiteSet(els1.filter(containsKey(tpe)(els2, _)), tpe)
         case (le,re) => throw EvalError(typeErrorMsg(le, s1.getType))
       }
 
     case SetDifference(s1,s2) =>
       (e(s1), e(s2)) match {
-        case (FiniteSet(els1, tpe), FiniteSet(els2, _)) => finiteSet(els1.toSet -- els2, tpe)
+        case (FiniteSet(els1, tpe), FiniteSet(els2, _)) => finiteSet(els1.filterNot(containsKey(tpe)(els2, _)), tpe)
         case (le,re) => throw EvalError(typeErrorMsg(le, s1.getType))
       }
 
     case MapMerge(cond, map1, map2) =>
       (e(cond), e(map1), e(map2)) match {
         case (FiniteSet(keys, kT), FiniteMap(kvs1, dflt1, _, vT), FiniteMap(kvs2, dflt2, _, _)) =>
-          val fromFstMap = keys.map(_ -> dflt1).toMap ++ kvs1.toMap.view.filterKeys(keys.contains(_)).toMap
-          val fromSndMap = kvs2.toMap -- keys
-          finiteMap((fromFstMap ++ fromSndMap).toSeq, dflt2, kT, vT)
+          val fromFstMap = keys.map(k => k -> lookupKey(kT)(kvs1, k).getOrElse(dflt1))
+          val fromSndMap = kvs2.filterNot { case (k, _) => containsKey(kT)(keys, k) }
+          finiteMap(fromFstMap ++ fromSndMap, dflt2, kT, vT)
         case (c, m1, m2) =>
           throw EvalError(typeErrorMsg(c, cond.getType))
       }
 
     case ElementOfSet(el,s) => (e(el), e(s)) match {
-      case (e, FiniteSet(els, _)) => BooleanLiteral(els.contains(e))
+      case (e, FiniteSet(els, base)) => checkKeys(base); BooleanLiteral(containsKey(base)(els, e))
       case (l,r) => throw EvalError(typeErrorMsg(r, SetType(l.getType)))
     }
 
     case SubsetOf(s1,s2) => (e(s1), e(s2)) match {
-      case (FiniteSet(els1, _),FiniteSet(els2, _)) => BooleanLiteral(els1.toSet.subsetOf(els2.toSet))
+      case (FiniteSet(els1, base),FiniteSet(els2, _)) => checkKeys(base); BooleanLiteral(els1.forall(containsKey(base)(els2, _)))
       case (le,re) => throw EvalError(typeErrorMsg(le, s1.getType))
     }
 
@@ -890,7 +975,8 @@ abstract class RecursiveEvaluator(override val program: Program,
 
     case BagAdd(bag, elem) => (e(bag), e(elem)) match {
       case (FiniteBag(els, tpe), evElem) =>
-        val (matching, rest) = els.partition(_._1 == evElem)
+        val i = indexOfKey(tpe)(els.map(_._1), evElem)
+        val (matching, rest) = if (i >= 0) (Seq(els(i)), els.patch(i, Nil, 1)) else (Seq.empty, els)
         finiteBag(rest :+ (evElem -> matching.lastOption.map {
           case (_, IntegerLiteral(i)) => IntegerLiteral(i + 1)
           case (_, e) => throw EvalError(typeErrorMsg(e, IntegerType()))
@@ -901,15 +987,15 @@ abstract class RecursiveEvaluator(override val program: Program,
 
     case MultiplicityInBag(elem, bag) => (e(elem), e(bag)) match {
       case (evElem, FiniteBag(els, tpe)) =>
-        els.collect { case (k,v) if k == evElem => v }.lastOption.getOrElse(IntegerLiteral(0))
+        checkKeys(tpe)
+        lookupKey(tpe)(els, evElem).getOrElse(IntegerLiteral(0))
       case (le, re) => throw EvalError(typeErrorMsg(re, bag.getType))
     }
 
     case BagIntersection(b1, b2) => (e(b1), e(b2)) match {
       case (FiniteBag(els1, tpe), FiniteBag(els2, _)) =>
-        val map2 = els2.toMap
         finiteBag(els1.flatMap { case (k, v) =>
-          val i = (v, map2.getOrElse(k, IntegerLiteral(0))) match {
+          val i = (v, lookupKey(tpe)(els2, k).getOrElse(IntegerLiteral(0))) match {
             case (IntegerLiteral(i1), IntegerLiteral(i2)) => i1 min i2
             case (le, re) => throw EvalError(typeErrorMsg(le, IntegerType()))
           }
@@ -922,9 +1008,8 @@ abstract class RecursiveEvaluator(override val program: Program,
 
     case BagUnion(b1, b2) => (e(b1), e(b2)) match {
       case (FiniteBag(els1, tpe), FiniteBag(els2, _)) =>
-        val (map1, map2) = (els1.toMap, els2.toMap)
-        finiteBag((map1.keys ++ map2.keys).toSet.map { (k: Expr) =>
-          k -> ((map1.getOrElse(k, IntegerLiteral(0)), map2.getOrElse(k, IntegerLiteral(0))) match {
+        finiteBag(distinctKeys(tpe)(els1.map(_._1) ++ els2.map(_._1)).map { (k: Expr) =>
+          k -> ((lookupKey(tpe)(els1, k).getOrElse(IntegerLiteral(0)), lookupKey(tpe)(els2, k).getOrElse(IntegerLiteral(0))) match {
             case (IntegerLiteral(i1), IntegerLiteral(i2)) => IntegerLiteral(i1 + i2)
             case (le, re) => throw EvalError(typeErrorMsg(le, IntegerType()))
           })
@@ -935,9 +1020,8 @@ abstract class RecursiveEvaluator(override val program: Program,
 
     case BagDifference(b1, b2) => (e(b1), e(b2)) match {
       case (FiniteBag(els1, tpe), FiniteBag(els2, _)) =>
-        val map2 = els2.toMap
         finiteBag(els1.flatMap { case (k, v) =>
-          val i = (v, map2.getOrElse(k, IntegerLiteral(0))) match {
+          val i = (v, lookupKey(tpe)(els2, k).getOrElse(IntegerLiteral(0))) match {
             case (IntegerLiteral(i1), IntegerLiteral(i2)) => i1 - i2
             case (le, re) => throw EvalError(typeErrorMsg(le, IntegerType()))
           }
@@ -955,15 +1039,16 @@ abstract class RecursiveEvaluator(override val program: Program,
       finiteMap(ss.map{ case (k, v) => (e(k), e(v)) }, e(dflt), kT.getType, vT.getType)
 
     case g @ MapApply(m,k) => (e(m), e(k)) match {
-      case (FiniteMap(ss, dflt, _, _), e) =>
-        ss.toMap.getOrElse(e, dflt)
+      case (FiniteMap(ss, dflt, from, _), e) =>
+        checkKeys(from)
+        lookupKey(from)(ss, e).getOrElse(dflt)
       case (l,r) =>
         throw EvalError(typeErrorMsg(l, MapType(r.getType, g.getType)))
     }
 
     case g @ MapUpdated(m, k, v) => (e(m), e(k), e(v)) match {
       case (FiniteMap(ss, dflt, kT, vT), ek, ev) =>
-        finiteMap((ss.toMap + (ek -> ev)).toSeq, dflt, kT, vT)
+        finiteMap(ss :+ (ek -> ev), dflt, kT, vT)
       case (m,l,r) =>
         throw EvalError("Unexpected operation: " + m.asString +
           ".updated(" + l.asString + ", " + r.asString + ")")

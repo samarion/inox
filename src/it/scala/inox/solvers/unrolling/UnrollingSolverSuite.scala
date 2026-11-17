@@ -15,9 +15,11 @@ class UnrollingSolverSuite extends TestSuite with DatastructureUtils {
   import inox.trees.dsl._
   import SolverResponses._
 
+  // Several tests compare functions, which needs a function equality other than the default
   override def configurations = Seq(Seq(
     optSelectedSolvers(Set(UnrollingTestSuite.solverName)),
     optTimeout(300),
+    optFunctionEquality(FunctionEquality.Intensional),
   ))
 
   override protected def optionsString(options: Options): String =
@@ -55,7 +57,20 @@ class UnrollingSolverSuite extends TestSuite with DatastructureUtils {
     Seq(), FunctionType(Seq(), I), { _ => Lambda(Seq(), int(1)) })
   }
 
-  given symbols: Symbols = baseSymbols.withFunctions(Seq(down, lengthFd, constant))
+  /** `pick(n, c) = if (n > 0) pick(n - 1, c) else (a => a + c)`, whose unfoldings each define the
+    * same lambda, on a path of their own. */
+  val pickID = FreshIdentifier("pick")
+  val pick = mkFunDef(pickID)() { _ => (
+    Seq("n" :: I, "c" :: I), I =>: I, { case Seq(n, c) =>
+      if_ (n > int(0)) {
+        E(pickID)(n - int(1), c)
+      } else_ {
+        \("a" :: I)(a => a + c)
+      }
+    })
+  }
+
+  given symbols: Symbols = baseSymbols.withFunctions(Seq(down, lengthFd, constant, pick))
   val program = InoxProgram(symbols)
 
   /** Checks `expr` under `config`, with the options of the test and `opts`. */
@@ -124,6 +139,46 @@ class UnrollingSolverSuite extends TestSuite with DatastructureUtils {
       case SatWithModel(model) =>
         val evaluated = program.getEvaluator.eval(E(lengthID)(I)(value(model, l)), model)
         assert(evaluated.result == Some(int(3)))
+      case res => fail(s"Expected a model, got $res")
+    }
+  }
+
+  test("lucky models whose validation times out leave the counterexample to the search") {
+    // The validation of every lucky model is given up at once, so the model comes from the search
+    val l = Variable.fresh("l", T(listID)(I))
+    check(E(lengthID)(I)(l) === int(3), Model, optFeelingLucky(true), optLuckyTimeout(0), optCheckModels(true)) match {
+      case SatWithModel(model) =>
+        val evaluated = program.getEvaluator.eval(E(lengthID)(I)(value(model, l)), model)
+        assert(evaluated.result == Some(int(3)))
+      case res => fail(s"Expected a model, got $res")
+    }
+  }
+
+  test("models give types to the type parameters they leave empty") {
+    // Only models in which `U` is empty satisfy the clause, and `V` has values
+    val U = TypeParameter.fresh("U")
+    val V = TypeParameter.fresh("V")
+    val g = Variable.fresh("g", U =>: I)
+    val clause = forall("w" :: U)(w => g(w) > g(w)) && !forall("w" :: V)(_ => BooleanLiteral(false))
+    for (checkModels <- Seq(false, true)) {
+      check(clause, Model, optCheckModels(checkModels)) match {
+        case SatWithModel(model) =>
+          assert(model.types.keySet == Set(U))
+          assert(program.getEvaluator.eval(clause, model).result == Some(BooleanLiteral(true)))
+          assert(model.toString.contains("type " + U.id.name))
+        case res => fail(s"Expected a model, got $res (check models = $checkModels)")
+      }
+    }
+  }
+
+  test("models with empty type parameters are found before everything is unrolled") {
+    // `length(l)` unrolls forever, but the model check already shows that only an empty `U`
+    // satisfies the clause
+    val U = TypeParameter.fresh("U")
+    val l = Variable.fresh("l", T(listID)(I))
+    val clause = forall("w" :: U)(_ => BooleanLiteral(false)) && E(lengthID)(I)(l) >= int(0)
+    check(clause, Model, optTimeout(5)) match {
+      case SatWithModel(model) => assert(model.types.keySet == Set(U))
       case res => fail(s"Expected a model, got $res")
     }
   }
@@ -339,6 +394,39 @@ class UnrollingSolverSuite extends TestSuite with DatastructureUtils {
         case res => fail(s"Expected a model, got $res")
       }
       assert(check(clause && x === int(bound) && !(y === int(1)), Simple) == Unsat)
+    }
+  }
+
+  test("lambdas defined on different paths are equal when their closures are") {
+    val c = Variable.fresh("c", I)
+    val d = Variable.fresh("d", I)
+    val bounded = x >= int(0) && x <= int(3) && y >= int(0) && y <= int(3)
+    assert(check(bounded && !(E(pickID)(x, c) === E(pickID)(y, c)), Simple) == Unsat)
+    assert(check(bounded && E(pickID)(x, c) === E(pickID)(y, d) && !(c === d), Simple) == Unsat)
+    check(bounded && !(E(pickID)(x, c) === E(pickID)(y, d)), Model, optCheckModels(true)) match {
+      case SatWithModel(model) => assert(value(model, c) != value(model, d))
+      case res => fail(s"Expected a model, got $res")
+    }
+  }
+
+  test("copies of a lambda on different paths add a constant number of clauses") {
+    // Each unfolding of `pick` defines a copy of the same lambda. The copies are equated through a
+    // shared symbol, rather than to each other, so the unfoldings don't grow with the previous ones.
+    class RecordingReporter extends DefaultReporter(Set(DebugSectionSolver)) {
+      val messages = scala.collection.mutable.ListBuffer.empty[String]
+      override def doEmit(msg: Message): Unit = messages += msg.msg.toString
+      override def doEmit(msg: ProgressMessage, prevLength: Int): String = msg.msg.toString
+    }
+    val unfolding = """Unrolling behind pick\(.*\(([0-9]+)\)""".r
+    val c = Variable.fresh("c", I)
+    for (equality <- FunctionEquality.values) {
+      val reporter = new RecordingReporter
+      given Context = Context(reporter, new utils.InterruptManager(reporter), summon[Context].options)
+      val res = check(E(pickID)(x, c)(int(0)) === y && x === int(8), Model, optFunctionEquality(equality))
+      assert(res.isSAT, s"Unexpected result $res under $equality")
+      val sizes = reporter.messages.toSeq.collect { case unfolding(size) => size.toInt }
+      assert(sizes.size >= 9, s"Unexpected unfoldings $sizes under $equality")
+      assert(sizes.tail.distinct.size == 1, s"Unfoldings grow under $equality: $sizes")
     }
   }
 
