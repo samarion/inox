@@ -1,0 +1,91 @@
+# Temporary: runs the coverage comment's jobs on this pull request, for testing.
+name: Coverage comment test
+permissions:
+  actions: read
+  pull-requests: write
+  contents: read
+jobs:
+  comment:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+    - name: Wait for the workflow run (stands in for workflow_run)
+      run: "for i in $(seq 120); do\n  id=$(gh run list --repo \"$GITHUB_REPOSITORY\" --workflow inox-coverage.yml --commit \"$HEAD_SHA\" --event pull_request --status completed --limit 1 --json databaseId\
+        \ --jq \".[].databaseId\")\n  if [ -n \"$id\" ]; then echo \"RUN_ID=$id\" >> \"$GITHUB_ENV\"; exit 0; fi\n  sleep 30\ndone\nexit 1\n"
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+    - name: Download the pull request's coverage
+      id: head
+      continue-on-error: true
+      run: gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name coverage-summary --dir head
+    - name: Download main's coverage
+      if: steps.head.outcome == 'success'
+      run: "# Notes about the comparison, added below the coverage table.\n: > notes.md\n[ \"$(cat head/tests-passed 2>/dev/null)\" = false ] &&\n  echo \"_Some tests failed or didn't run in this build,\
+        \ so its coverage is incomplete._\" >> notes.md\ncomplete() { [ \"$(cat \"$1/tests-passed\" 2>/dev/null)\" != false ]; }\nsha_link() { echo \"[\\`${1:0:7}\\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$1)\"\
+        ; }\n# Builds of main, newest first. Coverage was measured by Inox CI\n# before it moved to the Inox coverage workflow.\nmain_runs() {\n  for workflow in inox-coverage.yml inox-CI.yml; do\n    gh\
+        \ run list --repo \"$GITHUB_REPOSITORY\" --workflow $workflow --event push --status completed \\\n      --limit 10 --json databaseId,headSha,createdAt --jq '.[] | \"\\(.createdAt) \\(.databaseId)\
+        \ \\(.headSha)\"' \"$@\"\n  done | sort -r | head -n 10 | cut -d' ' -f2-\n}\n# The pull request was built merged into main: compare it with main at\n# the same commit, so that later changes to main\
+        \ don't show up as its own.\nbase_sha=$(cat head/base-sha 2>/dev/null || true)\nif [[ \"$base_sha\" =~ ^[0-9a-f]{40}$ ]]; then\n  while read -r run sha; do\n    gh run download \"$run\" --repo \"\
+        $GITHUB_REPOSITORY\" --name coverage-summary --dir base && break\n  done < <(main_runs --commit \"$base_sha\")\nfi\nif [ -f base/coverage.json ]; then\n  echo \"_Compared with \\`main\\` at $(sha_link\
+        \ \"$base_sha\"), which this build merged into._\" >> notes.md\n  complete base || echo \"_Some tests failed on \\`main\\` at $(sha_link \"$base_sha\"), so the differences are unreliable._\" >>\
+        \ notes.md\nelse\n  # Otherwise, the latest build of main with complete coverage.\n  while read -r run sha; do\n    rm -rf base\n    gh run download \"$run\" --repo \"$GITHUB_REPOSITORY\" --name\
+        \ coverage-summary --dir base && complete base && break\n    rm -rf base\n  done < <(main_runs --branch main)\n  if [ -f base/coverage.json ]; then\n    msg=\"_Compared with \\`main\\` at $(sha_link\
+        \ \"$sha\")\"\n    [[ \"$base_sha\" =~ ^[0-9a-f]{40}$ ]] && msg+=\", since \\`main\\` at $(sha_link \"$base_sha\"), which this build merged into, has no coverage data\"\n    echo \"$msg. Changes\
+        \ to \\`main\\` that aren't in this build show up as differences._\" >> notes.md\n  fi\nfi\ntrue\n"
+    - name: Find the Stainless tests that the downstream CI skips
+      if: steps.head.outcome == 'success'
+      continue-on-error: true
+      run: "pr=$(cat head/pr-number)\n[[ \"$pr\" =~ ^[0-9]+$ ]] || { echo \"Invalid pull request number\"; exit 1; }\ngit fetch -q origin \"refs/pull/$pr/head\"\n[ \"$(git rev-parse FETCH_HEAD)\" = \"$HEAD_SHA\"\
+        \ ] || { echo \"Pull request #$pr has moved on from $HEAD_SHA\"; exit 0; }\n# The build tested the pull request merged into main at base-sha.\nbase_sha=$(cat head/base-sha 2>/dev/null || true)\n\
+        if [[ \"$base_sha\" =~ ^[0-9a-f]{40}$ ]] && git cat-file -e \"$base_sha^{commit}\"; then\n  base=\"$base_sha\"\nelse\n  base=$(git rev-parse HEAD)\nfi\nINOX_REVS=\"$HEAD_SHA $base\" INOX_BASE=\"\
+        $base\" SKIP_REPORT=skip.md GITHUB_OUTPUT=/dev/null \\\n  .github/scripts/stainless-skip.sh\n"
+    - name: Compare the test durations with main
+      id: timings
+      continue-on-error: true
+      run: '# Its history includes the builds of main by Inox CI, which ran this
+
+        # job before the coverage moved to a workflow of its own.
+
+        .github/scripts/test-timings-comment.sh inox-coverage.yml,inox-CI.yml "$RUN_ID" test-timings- per-artifact Inox timings.json > tested
+
+        read -r pr pr_head < tested || true
+
+        echo "pr=$pr" >> "$GITHUB_OUTPUT"
+
+        '
+    - name: Post or update the comment
+      run: "pr=$(cat head/pr-number 2>/dev/null || echo \"$TIMINGS_PR\")\n: > coverage.md\nif [ -f head/coverage.json ]; then\n  base=$( [ -f base/coverage.json ] && echo base/coverage.json || true )\n\
+        \  # Without the marker line, which pr_comment.py adds.\n  python3 scripts/coverage_summary.py compare head/coverage.json $base | tail -n +2 > coverage.md\n  if [ -s notes.md ]; then echo >> coverage.md;\
+        \ sed G notes.md >> coverage.md; fi\nfi\ntouch skip.md timings.json\n[ -n \"$pr\" ] || { echo \"No pull request data in this build\"; exit 0; }\n.github/scripts/update-pr-comment.sh \"$pr\" \"$HEAD_SHA\"\
+        \ \\\n  stainless-skip skip.md coverage coverage.md timings-coverage timings.json\n"
+      env:
+        TIMINGS_PR: ${{ steps.timings.outputs.pr }}
+    timeout-minutes: 75
+  inox-timings:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+    - name: Wait for the workflow run (stands in for workflow_run)
+      run: "for i in $(seq 120); do\n  id=$(gh run list --repo \"$GITHUB_REPOSITORY\" --workflow inox-CI.yml --commit \"$HEAD_SHA\" --event pull_request --status completed --limit 1 --json databaseId --jq\
+        \ \".[].databaseId\")\n  if [ -n \"$id\" ]; then echo \"RUN_ID=$id\" >> \"$GITHUB_ENV\"; exit 0; fi\n  sleep 30\ndone\nexit 1\n"
+    - name: Checkout
+      uses: actions/checkout@v7
+    - name: Compare the test durations with main
+      run: '.github/scripts/test-timings-comment.sh inox-CI.yml "$RUN_ID" test-timings- per-artifact Inox timings.json > tested
+
+        read -r pr pr_head < tested || true
+
+        [ -n "$pr" ] || { echo "No pull request data in this build"; exit 0; }
+
+        .github/scripts/update-pr-comment.sh "$pr" "$HEAD_SHA" timings-inox timings.json
+
+        '
+    timeout-minutes: 75
+'on':
+  pull_request: null
