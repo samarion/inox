@@ -16,74 +16,9 @@ object optUnrollBound       extends IntOptionDef("unroll-bound", default = -1, "
 object optUnrollFactor      extends IntOptionDef("unroll-factor", default = 1, "<PosInt>")
 object optFeelingLucky      extends FlagOptionDef("feeling-lucky", false)
 object optUnrollAssumptions extends FlagOptionDef("unroll-assumptions", false)
+/** How long, in milliseconds, the validation of a lucky model may take (see [[optFeelingLucky]]). */
+object optLuckyTimeout      extends IntOptionDef("lucky-timeout", default = 5000, "<PosInt> (milliseconds)")
 
-/** The semantics of equality between first-class functions.
-  *
-  * - [[FunctionEquality.None]]: functions can't be compared, and solvers reject queries that
-  *   compare values containing functions. Counterexamples then never depend on function equality.
-  * - [[FunctionEquality.Intensional]]: functions are compared structurally (Inox's historical
-  *   semantics).
-  * - [[FunctionEquality.Extensional]]: functions are equal iff they agree on every input.
-  *
-  * Under `none` and `extensional`, distinct functions always have a distinguishing input, in
-  * refutations as well as in models (see [[LambdaTemplates.functionWitnesses]]). */
-enum FunctionEquality {
-  case None, Intensional, Extensional
-}
-
-object FunctionEquality {
-  /** The comparisons between values that may contain functions in `expr`, and in the functions it
-    * transitively calls, which `none` rejects. Callees are checked at the type arguments they are
-    * called with, so a comparison at a type parameter counts when the parameter is instantiated with
-    * a type that contains functions. The type parameters left free in `expr` are assumed not to. */
-  def comparisons(program: Program)(expr: program.trees.Expr): Seq[program.trees.Expr] = {
-    import program.trees._
-    import program.symbols.{given, _}
-
-    def containsFunctions(tpe: Type, seen: Set[Identifier] = Set.empty): Boolean = tpe match {
-      case _: FunctionType | _: PiType => true
-      case adt: ADTType =>
-        !seen(adt.id) && adt.getSort.constructors.exists(_.fields.exists(vd => containsFunctions(vd.getType, seen + adt.id)))
-      case NAryType(tps, _) => tps.exists(containsFunctions(_, seen))
-    }
-
-    def comparisons(e: Expr): Seq[Expr] = exprOps.collect[Expr] {
-      // a constructor without functions in its fields is only equal to itself, so comparing
-      // against it never compares functions
-      case Equals(ADT(_, _, args), _) if !args.exists(a => containsFunctions(a.getType)) => Set.empty
-      case Equals(_, ADT(_, _, args)) if !args.exists(a => containsFunctions(a.getType)) => Set.empty
-      case eq @ Equals(l, _) if containsFunctions(l.getType) => Set(eq)
-      case _ => Set.empty
-    } (e).toSeq
-
-    // polymorphic recursion can instantiate a function at ever larger types, so past a few
-    // instantiations of the same function, we check its generic body instead
-    val seen = scala.collection.mutable.Set[(Identifier, Seq[Type])]()
-    val result = scala.collection.mutable.ListBuffer[Expr]()
-    var queue: List[Expr] = List(expr)
-    while (queue.nonEmpty) {
-      val e = queue.head
-      queue = queue.tail
-      result ++= comparisons(e)
-      for (fi <- exprOps.functionCallsOf(e)) {
-        val instances = seen.count(_._1 == fi.id)
-        val key = if (instances < 8) (fi.id, fi.tps) else (fi.id, getFunction(fi.id).typeArgs: Seq[Type])
-        if (seen.add(key)) queue ::= getFunction(key._1, key._2).fullBody
-      }
-    }
-    result.distinct.toSeq
-  }
-}
-
-object optFunctionEquality extends OptionDef[FunctionEquality] {
-  val name: String = "function-equality"
-  val usageRhs: String = "none|intensional|extensional"
-  val default: FunctionEquality = FunctionEquality.Intensional
-  override def formatDefault: String = default.toString.toLowerCase
-
-  override def parser: OptionParsers.OptionParser[FunctionEquality] = s =>
-    FunctionEquality.values.find(_.toString.toLowerCase == s.toLowerCase)
-}
 object optModelFinding      extends IntOptionDef("model-finding", 0, "<PosInt> | 0 (off)") {
   override val parser: OptionParsers.OptionParser[Int] = (s => s match {
     case "" => Some(1)
@@ -168,6 +103,7 @@ abstract class AbstractUnrollingSolver private
   lazy val unrollBound = options.findOptionOrDefault(optUnrollBound)
   lazy val unrollFactor = options.findOptionOrDefault(optUnrollFactor)
   lazy val feelingLucky = options.findOptionOrDefault(optFeelingLucky)
+  lazy val luckyTimeout = options.findOptionOrDefault(optLuckyTimeout)
   lazy val unrollAssumptions = options.findOptionOrDefault(optUnrollAssumptions)
   lazy val modelFinding = options.findOptionOrDefault(optModelFinding) > 0
 
@@ -273,6 +209,15 @@ abstract class AbstractUnrollingSolver private
       throw new TypeErrorException(
         "Functions can't be compared under --function-equality=none: " +
           violations.map(_.asString).mkString(", "), violations.head, violations.head.getPos)
+    }
+
+    val collections = FunctionEquality.functionKeyedCollections(program)(expression)
+    if (collections.nonEmpty) {
+      throw new TypeErrorException(
+        "Sets and bags of functions and maps with function keys compare functions, which can't be " +
+          "compared under --function-equality=none: " +
+          collections.map(e => s"${e.asString}: ${e.getType.asString}").mkString(", "),
+        collections.head, collections.head.getPos)
     }
   }
 
@@ -493,7 +438,9 @@ abstract class AbstractUnrollingSolver private
     if (silenceErrors) reporter.debug(msg) else reporter.warning(msg)
 
   private def validateModel(model: program.Model, assumptions: Seq[Expr], silenceErrors: Boolean): Boolean = {
-    val expr = andJoin(assumptions ++ constraints)
+    // the values of the model have the types that it gives to the type parameters
+    val formulas = (assumptions ++ constraints).map(typeOps.instantiateType(_, model.types))
+    val expr = andJoin(formulas)
 
     // The uninterpreted functions whose models the typing conditions are being expanded through
     val expanding = MutableSet.empty[Identifier]
@@ -576,7 +523,7 @@ abstract class AbstractUnrollingSolver private
     // The results of the uninterpreted calls of the constraints lie in their types, where the
     // arguments of these calls are given by the model
     val modelVars = model.vars.keySet.map(_.toVariable)
-    val callTypings = (assumptions ++ constraints).flatMap(exprOps.collect[UninterpretedCall] {
+    val callTypings = formulas.flatMap(exprOps.collect[UninterpretedCall] {
       // The calls that the model doesn't interpret can't be evaluated, so validation fails on them
       case uc: UninterpretedCall if exprOps.variablesOf(uc).subsetOf(modelVars) &&
         model.interpretations.contains(uc.id -> uc.tps) => Set(uc)
@@ -595,7 +542,8 @@ abstract class AbstractUnrollingSolver private
       optCheckModels(checkModels || feelingLucky)
     ))
 
-    evaluator.eval(newExpr, inox.Model(program)(Map.empty, partialModel.interpretations ++ model.interpretations)) match {
+    val evalModel = inox.Model(program)(Map.empty, partialModel.interpretations ++ model.interpretations, model.types)
+    evaluator.eval(newExpr, evalModel) match {
       case EvaluationResults.Successful(BooleanLiteral(true)) =>
         reporter.debug("- Model validated.")
         true
@@ -611,6 +559,34 @@ abstract class AbstractUnrollingSolver private
       case EvaluationResults.EvaluatorError(msg) =>
         emit(silenceErrors)("- Model leads to evaluation error: " + msg)
         false
+    }
+  }
+
+  /** Runs the validation of a lucky model, which fails once [[luckyTimeout]] has elapsed.
+    *
+    * A lucky model is only a shortcut to a counterexample that the search would find later, but
+    * its validation evaluates the foralls of the program with nested solvers (see
+    * [[evaluators.SolvingEvaluator]]), which can take much longer than the search itself.
+    */
+  private def withinLuckyTimeout(validation: => Boolean): Boolean = {
+    var expired = false
+    val expiry = new Interruptible {
+      def interrupt(): Unit = evaluatorInterrupts.synchronized {
+        if (!evaluatorInterrupts.isInterrupted) {
+          expired = true
+          evaluatorInterrupts.interrupt()
+        }
+      }
+    }
+
+    try new TimeoutFor(expiry).interruptAfter(luckyTimeout.toLong)(validation) finally {
+      evaluatorInterrupts.synchronized {
+        // The solver may have been interrupted in the meantime, in which case its evaluators stay so
+        if (expired && !abort && evaluatorInterrupts.isInterrupted) {
+          reporter.debug("- Lucky model validation timed out.")
+          evaluatorInterrupts.reset()
+        }
+      }
     }
   }
 
@@ -649,6 +625,10 @@ abstract class AbstractUnrollingSolver private
     var functionExtractions: Seq[(Encoded, UninterpretedCall)] = Seq.empty
     // the uninterpreted functions that the closures which keep extracted functions distinct call
     var closureExtractions: Seq[(Identifier, Lambda)] = Seq.empty
+    // the functions that are being extracted as the lambdas they are equal to, and those of them
+    // whose lambda captures them, and which are then extracted from their applications instead
+    var lambdasInProgress: Seq[Encoded] = Seq.empty
+    var capturedByTheirLambda: Seq[Encoded] = Seq.empty
 
     // evaluating in the model can be costly, and extraction compares the same functions repeatedly
     val modelEqualities = MutableMap.empty[(Encoded, Encoded), Boolean]
@@ -871,8 +851,25 @@ abstract class AbstractUnrollingSolver private
         wrapped.modelEval(b, BooleanType()).filter(_ == BooleanLiteral(true)).map(_ => eArgs)
       }.distinct.sortBy(_.exists(templates.isWitnessArgument))
 
-      extractLambda(f, tpe).orElse {
-        if (seen(tpe).exists(e => modelEq(f, e))) {
+      // Unless equality is intensional, a lambda can be equal to a function that it captures, such
+      // as `() => f()` and `f`. The model of `f` is then that of its applications, as its lambda's
+      // depends on it. Applications that lead back to `f` again then refer to it as to the other
+      // functions being extracted.
+      val inLambda = lambdasInProgress.exists(modelEq(f, _))
+      val inCycle = inLambda && !capturedByTheirLambda.exists(modelEq(f, _))
+      if (inCycle) capturedByTheirLambda :+= f
+      val asLambda = if (inLambda) None else {
+        lambdasInProgress :+= f
+        val lambda = try extractLambda(f, tpe) finally lambdasInProgress = lambdasInProgress.init
+        // the lambda of `f` applies its model, which is simpler
+        lambda.map { l =>
+          if (!capturedByTheirLambda.exists(modelEq(f, _))) l
+          else lambdaExtractions.collectFirst { case (e, img) if img.getType == l.getType && modelEq(e, f) => img }.getOrElse(l)
+        }
+      }
+
+      asLambda.orElse {
+        if (!inCycle && seen(tpe).exists(e => modelEq(f, e))) {
           Some(functionExtractions.collectFirst { case (e, c) if modelEq(f, e) => c }.getOrElse {
             val c = UninterpretedCall(FreshIdentifier("x", true), Seq.empty, Seq.empty, FunctionType(Seq.empty, tpe))
             functionExtractions :+= f -> c
@@ -1111,6 +1108,22 @@ abstract class AbstractUnrollingSolver private
 
     import SolverResponses._
 
+    // the lambdas and the functions they capture that the model makes equal, and that the unrolling
+    // hasn't related yet (see [[LambdaTemplates.equalCaptures]])
+    var modelCaptures: Option[(underlying.Model, Seq[(Encoded, Encoded)])] = None
+    def equalCaptures(umodel: underlying.Model): Seq[(Encoded, Encoded)] = modelCaptures match {
+      case Some((m, captures)) if m.asInstanceOf[AnyRef] eq umodel.asInstanceOf[AnyRef] => captures
+      case _ =>
+        val candidates = templates.equalCaptures
+        val captures = if (candidates.isEmpty) Seq.empty else {
+          val wrapped = wrapModel(umodel)
+          def holds(e: Encoded): Boolean = wrapped.modelEval(e, t.BooleanType()) == Some(t.BooleanLiteral(true))
+          candidates.collect { case (start, lambda, f) if holds(start) && holds(templates.mkEquals(lambda, f)) => lambda -> f }
+        }
+        modelCaptures = Some(umodel -> captures)
+        captures
+    }
+
     sealed abstract class CheckState
     class CheckResult(val response: config.Response[Model, Assumptions]) extends CheckState
     case class Validate(model: underlying.Model) extends CheckState
@@ -1160,6 +1173,38 @@ abstract class AbstractUnrollingSolver private
     // The depth up to which distinguishing inputs are instantiated: 0 until the first model is found,
     // then one more level with each unrolling (see [[LambdaTemplates.witnessEqualities]])
     var witnessLevel: Int = 0
+
+    /** `model`, extracted from `umodel`, with the type parameters whose flags are off in `umodel`
+      * instantiated with the empty type. The model checks only assume that type parameters have
+      * values until a guard lets them be empty (see [[TypeTemplates.satisfactionAssumptions]]),
+      * and from then on, the values of a type parameter that the model holds imply its flag. The
+      * values of the model have the instantiated types, and the values of an empty type parameter
+      * that the extracted model may still hold where nothing reaches them, such as the default
+      * results of functions into it, become errors. */
+    def withEmptyTypes(model: program.Model, umodel: underlying.Model): program.Model = {
+      val flags = templates.typesManager.typeParameterFlags
+      val emptyTypes = if (flags.isEmpty) Set.empty else {
+        val wrapped = wrapModel(umodel)
+        flags.collect {
+          case (tp, flag) if wrapped.modelEval(flag, t.BooleanType()) == Some(t.BooleanLiteral(false)) =>
+            decode(tp.asInstanceOf[t.Type])
+        }.collect { case tp: TypeParameter => tp }
+      }
+      if (emptyTypes.isEmpty) model else {
+        val empty: Type = RefinementType(ValDef.fresh("empty", UnitType()), BooleanLiteral(false))
+        val types: Map[TypeParameter, Type] = emptyTypes.map(_ -> empty).toMap
+        def inst(tpe: Type): Type = typeOps.instantiateType(tpe, types)
+        def instValue(e: Expr): Expr = typeOps.instantiateType(exprOps.postMap {
+          case GenericValue(tp, _) if types.contains(tp) => Some(Error(tp, "Value of the empty type " + tp.id.name))
+          case _ => None
+        } (e), types)
+        inox.Model(program)(
+          model.vars.map { case (vd, e) => vd.copy(tpe = inst(vd.tpe)) -> instValue(e) },
+          model.interpretations.map { case ((id, tps), e) => (id, tps.map(inst)) -> instValue(e) },
+          types)
+      }
+    }
+
     def witnessEqualities: Map[Encoded, Int] =
       if (witnessLevel > 0) templates.witnessEqualities else Map.empty
 
@@ -1351,10 +1396,20 @@ abstract class AbstractUnrollingSolver private
         case Validate(_) if abort || pause =>
           CheckResult.cast(Unknown)
 
+        case Validate(umodel) if !abort && !pause && equalCaptures(umodel).nonEmpty =>
+          // the unrolling left out the clauses that relate these lambdas to the functions they capture
+          // (see [[LambdaTemplates.equalCaptures]]), so the model needs them before it can be trusted
+          reporter.debug(" - Relating lambdas to the captured functions that the model makes equal")
+          for ((lambda, f) <- equalCaptures(umodel); cl <- templates.relateCapture(lambda, f)) {
+            underlying.assertCnstr(cl)
+          }
+          // the applications of the functions are then related to the lambdas by unrolling them
+          if (templates.canUnroll) Unroll else ModelCheck
+
         case Validate(umodel) =>
           requestedWitnesses = Map.empty
           exposedWitnesses = Set.empty
-          val validated = (try { Some(extractTotalModel(umodel)) } catch {
+          val validated = (try { Some(withEmptyTypes(extractTotalModel(umodel), umodel)) } catch {
             case NoSimpleValue(tpe) =>
               if (!silentErrors) {
                 reporter.error("No simple value found for type " + tpe.asString)
@@ -1499,8 +1554,8 @@ abstract class AbstractUnrollingSolver private
 
             case SatWithModel(model) =>
               lazy val luckyModel = if (!feelingLucky) None else {
-                (try { Some(extractSimpleModel(model)) } catch { case _: NoSimpleValue => None })
-                  .filter(exModel => validateModel(exModel, assumptionsSeq, silenceErrors = true))
+                (try { Some(withEmptyTypes(extractSimpleModel(model), model)) } catch { case _: NoSimpleValue => None })
+                  .filter(exModel => withinLuckyTimeout(validateModel(exModel, assumptionsSeq, silenceErrors = true)))
               }
 
               if (luckyModel.isDefined) {
@@ -1533,8 +1588,7 @@ abstract class AbstractUnrollingSolver private
           CheckResult.cast(Unknown)
 
         case Unroll if !templates.canUnroll =>
-          // Only satisfaction assumptions that unrolling cannot discharge are left,
-          // e.g. a model exists only if some type parameter is empty.
+          // Only satisfaction assumptions that unrolling cannot discharge are left
           reporter.debug("- We need to keep going, but nothing is left to unroll")
           CheckResult.cast(Unknown)
 

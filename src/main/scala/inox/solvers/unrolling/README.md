@@ -134,7 +134,10 @@ The semantics is the one implemented by `evaluators/RecursiveEvaluator`.
 The procedure is a semi-decision procedure for satisfiability, so it may run
 forever on unsatisfiable queries, and the soundness of proofs is relative to
 terminating function definitions. Inox checks neither termination nor
-positivity of datatypes; Stainless does both before it calls Inox.
+positivity of datatypes; Stainless does both before it calls Inox. How the
+procedure treats evaluation that fails or diverges, and a function that calls
+itself on its own parameters, is described in
+[`partial-execution.md`](partial-execution.md).
 
 ## Departures from the thesis
 
@@ -150,4 +153,7 @@ reading the proofs against the code:
   their base type, Π codomains and return types are only assumed for
   arguments in the domain, and type parameters may be empty.
 - **`optAssumeChecked`** lets a front-end that checks arguments itself, such
-  as Stainless, skip the domain checks.
+  as Stainless, skip the domain checks. Without it, the partial operations
+  (divisions, remainders and modulos of integers and reals, and selectors)
+  make the paths on which they fail infeasible, like errors, as they fail in
+  the evaluator. With it, they are total, as in SMT-LIB.
