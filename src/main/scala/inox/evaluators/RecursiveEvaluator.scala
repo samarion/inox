@@ -303,7 +303,7 @@ abstract class RecursiveEvaluator(override val program: Program,
         case _ => throw EvalError(typeErrorMsg(first, BooleanType()))
       }
 
-    case FunctionInvocation(id, tps, args) =>
+    case fi @ FunctionInvocation(id, tps, args) =>
       if (gctx.stepsLeft < 0) {
         throw RuntimeError("Exceeded number of allocated methods calls ("+gctx.maxSteps+")")
       }
@@ -315,7 +315,12 @@ abstract class RecursiveEvaluator(override val program: Program,
       // build a mapping for the function...
       val frame = rctx.withNewVars(tfd.paramSubst(evArgs)).newTypes(tps)
 
-      e(tfd.fullBody)(using frame, gctx)
+      val active = new ActiveCall(id, tps, evArgs)
+      if (!gctx.activeCalls.add(active)) {
+        throw RuntimeError(s"Diverges: ${fi.asString} calls itself on the same arguments")
+      }
+      try e(tfd.fullBody)(using frame, gctx)
+      finally gctx.activeCalls.remove(active)
 
     case And(Seq(e1, e2)) => e(e1) match {
       case BooleanLiteral(false) => BooleanLiteral(false)

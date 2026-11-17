@@ -97,7 +97,8 @@ trait FunctionTemplates { self: Templates =>
 
       val (contents0, str) = Template.contents(
         pathVar, arguments, tmplClauses, optCall = Some(Defined(tfd)), partial = true)
-      val contents = contents0.copy(clauses = contents0.clauses ++ rankClauses(tfd, contents0, bodySites))
+      val contents1 = selfCallFailures(tfd, contents0, bodySites)
+      val contents = contents1.copy(clauses = contents1.clauses ++ rankClauses(tfd, contents1, bodySites))
 
       val funString : () => String = () => {
         "Template for def " + tfd.signature +
@@ -149,7 +150,36 @@ trait FunctionTemplates { self: Templates =>
     ranked.flatMap { case (b, fi, callee) =>
       // Calls whose arguments mention symbols that the template doesn't bind aren't ranked
       if (!exprOps.variablesOf(callee).forall(allSymbols.contains)) Seq.empty
-      else Seq(encoder(Implies(b, GreaterThan(self, callee))))
+      else if (!partialFunctions) Seq(encoder(Implies(b, GreaterThan(self, callee))))
+      // Under partial functions, divergence is a failure: a call whose rank doesn't decrease fails.
+      // Its failure is defined by its own unfolding, so a call that returns doesn't fail whatever
+      // the ranks, while a call on a cycle can't rank below itself, so it fails.
+      else Seq(mkImplies(encoder(b),
+        mkOr(encoder(GreaterThan(self, callee)), callFails(Defined(fi.tfd), fi.args.map(encoder)))))
+    }
+  }
+
+  /** Under partial functions, the calls of a function's body on its own arguments, which the
+    * template drops (see `Template.extractCalls`), fail with it: they make it fail where it does.
+    * Each one gets a failure literal of the template, which holds on its path where the call fails,
+    * so that a body that reaches itself on the same arguments fails (see `rankClauses`). */
+  private def selfCallFailures(tfd: TypedFunDef, contents: TemplateContents,
+                               sites: Seq[(Variable, FunctionInvocation)]): TemplateContents = {
+    val params = tfd.params.map(_.toVariable)
+    val selfSites = sites.filter { case (_, fi) => fi.tfd == tfd && fi.args == params }
+    if (!partialFunctions || selfSites.isEmpty) contents else {
+      val encoder = mkEncoder(Map(contents.pathVar) ++ contents.arguments ++ contents.condVars ++ contents.exprVars)
+      val fails = callFails(Defined(tfd), contents.arguments.take(params.size).map(_._2))
+      val literals = selfSites.map { case (b, _) =>
+        val l = Variable.fresh("fails", BooleanType(), true)
+        failureSymbols += l
+        val lT = encodeSymbol(l)
+        (l -> lT, mkEquals(lT, mkAnd(encoder(b), fails)))
+      }
+      contents.copy(
+        exprVars = contents.exprVars ++ literals.map(_._1),
+        clauses = contents.clauses ++ literals.map(_._2),
+        failures = contents.failures.map(_ ++ literals.map(_._1._2)))
     }
   }
 

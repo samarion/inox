@@ -94,6 +94,16 @@ belong to their own templates, and the calls in type checks aren't evaluated by 
 exception: the refinements of an uninterpreted call's result type are assumed on the body's paths,
 though the evaluator never evaluates them, so a call in such a refinement is also ranked.
 
+Under partial functions (extensional equality without `--assume-checked`, §4), divergence is a
+failure instead: the clause becomes `rank_f(a) > rank_g(b) || fails(g(b))` on the path that reaches
+`g(b)`, where `fails(g(b))` is the failure predicate of the call. This doesn't make calls that return
+fail: the unfolding of a call that returns defines its failure, whatever the ranks. A call on a
+cycle on the same arguments can't rank below itself, so it fails, and the failure predicate's
+congruence makes every call on the cycle fail. The calls of a body on its own arguments, which its
+template drops, make it fail where they do (`FunctionTemplates.selfCallFailures`). `loop(k) == 0`
+and `f(k) == 0` stay UNSAT, but `x => loop(x)` now equals `x => error[BigInt]` and differs from
+`x => 0`.
+
 A front-end that proves termination with Inox must not assume the postconditions of the functions
 it is checking, as Stainless's termination checker did before it was fixed: a postcondition holds
 vacuously of a call that never returns, and ranks let the solver show that a call never returns.
@@ -107,9 +117,9 @@ apart needs a literal for "`f(a)` fails", which the encoding builds as follows:
 
 - Each point where evaluation may fail (an `Error`, an `Assume`, a partial operation) gets a literal
   that holds exactly when its path is taken and its condition doesn't hold (`Builder.storeFailure`).
-- Whether a call `f(a)` fails is a literal of the call, and whether an application `g(a)` fails is
-  a first-order uninterpreted predicate of `g` and its arguments, whose congruence makes
-  applications to equal arguments fail alike (`Templates.callFailure` and `appFailure`). When a call
+- Whether a call `f(a)` fails is a first-order uninterpreted predicate of its arguments, and whether
+  an application `g(a)` fails is one of `g` and its arguments, whose congruence makes calls and
+  applications on equal arguments fail alike (`Templates.callFails` and `appFailure`). When a call
   or an application is unfolded, the template of the body it reaches defines its failure: the body
   fails iff one of its failure literals holds, or a call or an application on one of its paths fails
   (`Template.instantiate`).
@@ -140,11 +150,12 @@ solvers make the paths on which these fail infeasible, unless a front-end has ch
 `--assume-checked`. They are then total SMT terms, and a model may rely on a value of `x / 0` that
 evaluation never produces.
 
-**Divergence isn't a failure.** The ranks of §3 make the paths of calls that reach themselves
-infeasible, and the failure literals don't cover them: every finite unrolling is consistent with a
-call returning at the next step, so "diverges" can't be established, only "returns" and "fails". A
-function that diverges on an input agrees there with every function, and the evaluator, which runs
-out of steps, can't tell such functions apart.
+**Only divergence on repeated arguments is a failure.** Ranks only show that a call diverges when
+it reaches itself on the same arguments (§3). A call that diverges on changing arguments, such as
+`f(x + 1)` above, may fail or return any value in a model, as every finite unrolling is consistent
+with both. The evaluator detects a call that reaches itself on the same arguments when these are
+the same objects (`ContextualEvaluator.ActiveCall`), and fails there. Otherwise it runs out of
+steps, and can't tell whether a function that diverges differs from another.
 
 **Quantified assumptions cost more.** The failure literal of an `Assume` is equal to the negation
 of its condition, so quantifiers in the condition are encoded with both polarities, and the negative

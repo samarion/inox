@@ -186,11 +186,26 @@ class RecursiveEvaluatorSuite extends AnyFunSuite {
   test("Function calls are bounded by the maximal number of steps") {
     val fid = FreshIdentifier("loop")
     val x = ValDef.fresh("x", IntegerType())
-    val loop = new FunDef(fid, Seq(), Seq(x), IntegerType(), FunctionInvocation(fid, Seq(), Seq(x.toVariable)), Seq())
+    // the arguments change, so the evaluator can't tell that the calls diverge
+    val loop = new FunDef(fid, Seq(), Seq(x), IntegerType(),
+      FunctionInvocation(fid, Seq(), Seq(Plus(x.toVariable, IntegerLiteral(1)))), Seq())
     val p = InoxProgram(NoSymbols.withFunctions(Seq(loop)))
     val e = RecursiveEvaluator(p, TestContext(Options(Seq(optMaxCalls(10)))))
     e.eval(FunctionInvocation(fid, Seq(), Seq(i))) match {
       case EvaluationResults.RuntimeError(msg) => assert(msg.contains("Exceeded number of allocated methods calls"))
+      case res => fail(s"Unexpected result $res")
+    }
+  }
+
+  test("Calls that reach themselves on the same arguments diverge") {
+    val (fid, gid) = (FreshIdentifier("ping"), FreshIdentifier("pong"))
+    val x = ValDef.fresh("x", IntegerType())
+    val ping = new FunDef(fid, Seq(), Seq(x), IntegerType(), FunctionInvocation(gid, Seq(), Seq(x.toVariable)), Seq())
+    val pong = new FunDef(gid, Seq(), Seq(x), IntegerType(), FunctionInvocation(fid, Seq(), Seq(x.toVariable)), Seq())
+    val p = InoxProgram(NoSymbols.withFunctions(Seq(ping, pong)))
+    val e = RecursiveEvaluator(p, TestContext(Options(Seq(optMaxCalls(1000)))))
+    e.eval(FunctionInvocation(fid, Seq(), Seq(i))) match {
+      case EvaluationResults.RuntimeError(msg) => assert(msg.contains("calls itself on the same arguments"))
       case res => fail(s"Unexpected result $res")
     }
   }

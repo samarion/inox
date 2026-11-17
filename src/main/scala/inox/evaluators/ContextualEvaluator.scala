@@ -44,6 +44,21 @@ trait ContextualEvaluator extends Evaluator {
 
   class GlobalContext(val maxSteps: Int) {
     var stepsLeft = maxSteps
+
+    /** The calls being evaluated, whose arguments are compared by reference (see [[ActiveCall]]). */
+    val activeCalls = new java.util.HashSet[ActiveCall]
+  }
+
+  /** A call being evaluated. Evaluation is deterministic, so a call that reaches itself on the same
+    * arguments never returns. Arguments are compared by reference, which is cheap and catches the
+    * calls that pass their parameters on unchanged, e.g. `def f(x: Int): Int = f(x)`. */
+  final class ActiveCall(val id: Identifier, val tps: Seq[Type], val args: Seq[Expr]) {
+    override def hashCode: Int = (id, tps, args.map(System.identityHashCode)).hashCode
+    override def equals(that: Any): Boolean = that match {
+      case c: ActiveCall => c.id == id && c.tps == tps && c.args.size == args.size &&
+        c.args.lazyZip(args).forall(_ eq _)
+      case _ => false
+    }
   }
 
   type RC <: RecContext[RC]

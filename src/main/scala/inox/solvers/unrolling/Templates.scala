@@ -123,7 +123,28 @@ trait Templates
 
   /** Whether the call of `callee` on `args` fails. */
   private[unrolling] def callFailure(callee: Callee, args: Seq[Encoded]): Encoded =
-    callFailures.cached(callee -> args)(encodeSymbol(Variable.fresh("fails", BooleanType(), true)))
+    callFailures.cached(callee -> args) {
+      val literal = encodeSymbol(Variable.fresh("fails", BooleanType(), true))
+      // the predicate is mirrored by a literal, as for applications (see [[appFailure]])
+      if (partialFunctions) failureDefinitions += mkEquals(literal, callFails(callee, args))
+      literal
+    }
+
+  /** Whether the call of `callee` on `args` fails, as a first-order uninterpreted predicate of the
+    * arguments, which templates can refer to before the call is unfolded (see
+    * [[FunctionTemplates.rankClauses]]), and whose congruence makes calls on equal arguments fail
+    * alike. */
+  private[unrolling] def callFails(callee: Callee, args: Seq[Encoded]): Encoded = {
+    val fails = callFailurePredicates.getOrElseUpdate(callee, {
+      val from = callee match {
+        case Defined(tfd) => tfd.params.map(_.getType)
+        case i: Interpreted => i.function.getType.asInstanceOf[FunctionType].from
+      }
+      mkFunction("fails", from, BooleanType())
+    })
+    mkFunApp(fails, args)
+  }
+  private val callFailurePredicates = scala.collection.mutable.Map.empty[Callee, Function]
 
   /** Whether the application of `caller` of type `tpe` to `args` fails.
     *
