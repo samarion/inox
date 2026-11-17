@@ -96,11 +96,61 @@ trait TemplateGenerator { self: Templates =>
     }
   }
 
-  private def isSimple(expr: Expr): Boolean = {
+  /** Unless the front-end has checked them (see `optAssumeChecked`), the partial operations that
+    * may fail make their path infeasible when they do, like errors, so that the solver agrees with
+    * the evaluator (see [[ast.SymbolOps.definedness]]). */
+  private lazy val guardPartialOperations: Boolean = !options.findOptionOrDefault(optAssumeChecked)
+
+  private def guard(expr: Expr): Option[Expr] =
+    if (guardPartialOperations) definedness(expr) else None
+
+  /** The facts that hold when `cond` holds. */
+  private def conjuncts(cond: Expr): Set[Expr] = cond match {
+    case And(es) => es.toSet.flatMap(conjuncts)
+    case Not(Or(es)) => es.toSet.flatMap(negated)
+    case Not(Not(e)) => conjuncts(e)
+    case BooleanLiteral(true) => Set.empty
+    case _ => Set(cond)
+  }
+
+  /** The facts that hold when `cond` doesn't hold. */
+  private def negated(cond: Expr): Set[Expr] = cond match {
+    case Or(es) => es.toSet.flatMap(negated)
+    case Not(e) => conjuncts(e)
+    case Implies(l, r) => conjuncts(l) ++ negated(r)
+    case _ => Set(Not(cond))
+  }
+
+  /** Whether `expr` holds a partial operation that needs a guard, i.e. one that the conditions
+    * around it don't already guard, as in `s.is(Cons) ==> s.head > 0` or
+    * `if (d != 0) n / d else 0`. Facts are the conditions that are known to hold at `expr`. */
+  private def hasUnguardedOperation(expr: Expr, facts: Set[Expr]): Boolean = {
+    def rec(e: Expr, facts: Set[Expr]): Boolean = e match {
+      case IfExpr(c, t, el) =>
+        rec(c, facts) || rec(t, facts ++ conjuncts(c)) || rec(el, facts ++ negated(c))
+      case And(es) =>
+        es.foldLeft((false, facts)) { case ((res, fs), e) => (res || rec(e, fs), fs ++ conjuncts(e)) }._1
+      case Or(es) =>
+        es.foldLeft((false, facts)) { case ((res, fs), e) => (res || rec(e, fs), fs ++ negated(e)) }._1
+      case Implies(l, r) =>
+        rec(l, facts) || rec(r, facts ++ conjuncts(l))
+      case _ if guard(e).isDefined =>
+        guard(e).exists(g => !facts(g)) || rec2(e, facts)
+      case _ => rec2(e, facts)
+    }
+    def rec2(e: Expr, facts: Set[Expr]): Boolean = {
+      val Operator(es, _) = e: @unchecked
+      es.exists(rec(_, facts))
+    }
+
+    guardPartialOperations && rec(expr, facts)
+  }
+
+  private def isSimple(expr: Expr, facts: Set[Expr] = Set.empty): Boolean = {
     exprOps.isSimple(expr) && !exprOps.exists {
       case Equals(e1, e2) => unrollEquality(e1.getType)
       case _ => false
-    } (expr)
+    } (expr) && !hasUnguardedOperation(expr, facts) // unguarded operations are encoded on their own path
   }
 
   // Due to a Scala 3 bug, if we name the following two methods the same, we encounter a strange error.
@@ -192,21 +242,12 @@ trait TemplateGenerator { self: Templates =>
     builder.result
   }
 
-  private lazy val extensionalStructures: Boolean =
-    options.findOptionOrDefault(optFunctionEquality) != FunctionEquality.Intensional
-
   protected def mkExprStructure(
     pathVar: Variable,
     expr: Expr,
     substMap: Map[Variable, Encoded]
   ): (Expr, TemplateStructure, Map[Variable, Encoded]) = {
-    // Unless function equality is intensional, lambdas can also lift the expressions that may fail, which
-    // gives more of them equal structures (eg. `x => x + a` and `x => x + b / 2` when `a == b / 2`)
-    val (struct, depsByScope) = expr match {
-      case lambda: Lambda => normalizeStructure(lambda,
-        if (extensionalStructures) ast.SymbolOps.NormalizationLifting.Partial else ast.SymbolOps.NormalizationLifting.Pure)
-      case _ => normalizeStructure(expr)
-    }
+    val (struct, depsByScope) = normalizeStructure(expr)
     val deps = depsByScope.map { case (v, e, _) => v -> e }.toMap
 
     val (depSubst, depContents) =
@@ -306,7 +347,7 @@ trait TemplateGenerator { self: Templates =>
     }
 
     var types = Map[Encoded, Set[Typing]]()
-    def storeType(pathVar: Variable, tpe: Type, arg: Expr, inDomain: Boolean = false)
+    def storeType(pathVar: Variable, tpe: Type, arg: Expr, inDomain: Boolean = false, ground: Boolean = false)
                  (using generator: TypingGenerator): Expr = {
       val b = encodedCond(pathVar)
       val encoder = mkEncoder(localSubst)
@@ -316,9 +357,10 @@ trait TemplateGenerator { self: Templates =>
           val typeCall: Variable = Variable.fresh("tp", BooleanType(), true)
           storeExpr(typeCall)
 
-          // Function types are unfolded by `registerFunction`, which doesn't use the flag
-          val domain = inDomain && !tpe.isInstanceOf[FunctionType | PiType]
-          val constraint = Constraint(exprVars(typeCall), closures, generator == FreeGenerator, domain)
+          // Function types are unfolded by `registerFunction`, which doesn't use the flag, unless they
+          // are checked as fresh grounds (see `ensureGrounds`)
+          val domain = inDomain && (ground || !tpe.isInstanceOf[FunctionType | PiType])
+          val constraint = Constraint(exprVars(typeCall), closures, generator == FreeGenerator, domain, ground && domain)
           (typeCall, Typing(tpe, encoder(arg), constraint))
 
         case MembershipGenerator =>
@@ -399,7 +441,8 @@ trait TemplateGenerator { self: Templates =>
     pathVar: Variable,
     expr: Expr,
     substMap: Map[Variable, Encoded],
-    polarity: Option[Boolean] = None
+    polarity: Option[Boolean] = None,
+    facts: Set[Expr] = Set.empty
   ): (Expr, TemplateClauses) = {
     exprOps.preTraversal {
       case e if unsupportedContainer(e.getType) =>
@@ -409,6 +452,17 @@ trait TemplateGenerator { self: Templates =>
 
     val builder = new Builder(pathVar, substMap)
     import builder._
+
+    // The facts known to hold on each path, so that the partial operations they guard need no guard
+    val pathFacts = MutableMap[Variable, Set[Expr]](pathVar -> facts)
+    def factsOf(v: Variable): Set[Expr] = pathFacts.getOrElse(v, Set.empty)
+
+    // Groups the consecutive simple parts of a conjunction or disjunction, where each part may
+    // rely on the facts that the parts before it give (see `conjuncts` and `negated`)
+    def simpleGroups(pathVar: Variable, parts: Seq[Expr], next: Expr => Set[Expr]): Seq[Seq[Expr]] = {
+      val facts = parts.scanLeft(factsOf(pathVar))((fs, e) => fs ++ next(e))
+      SeqUtils.groupWhile(parts zip facts)(isSimple(_, _)).map(_.map(_._1))
+    }
 
     def rec(pathVar: Variable, expr: Expr, pol: Option[Boolean]): Expr = expr match {
       case a @ Assume(cond, body) =>
@@ -484,14 +538,14 @@ trait TemplateGenerator { self: Templates =>
         Not(rec(pathVar, e, pol.map(!_)))
 
       case i @ Implies(lhs, rhs) =>
-        if (!isSimple(i)) {
+        if (!isSimple(i, factsOf(pathVar))) {
           rec(pathVar, Or(Not(lhs), rhs), pol)
         } else {
           implies(rec(pathVar, lhs, None), rec(pathVar, rhs, None))
         }
 
       case a @ And(parts) =>
-        val partitions = SeqUtils.groupWhile(parts)(isSimple)
+        val partitions = simpleGroups(pathVar, parts, conjuncts)
         partitions.map(andJoin) match {
           case Seq(e) => e
           case seq =>
@@ -518,6 +572,7 @@ trait TemplateGenerator { self: Templates =>
 
                 storeGuarded(pathVar, implies(not(newRes), not(newExpr)))
                 iff(and(pathVar, newRes), newBool)
+                pathFacts(newBool) = factsOf(pathVar) ++ conjuncts(x)
 
                 recAnd(newBool, xs)
 
@@ -529,7 +584,7 @@ trait TemplateGenerator { self: Templates =>
         }
 
       case o @ Or(parts) =>
-        val partitions = SeqUtils.groupWhile(parts)(isSimple)
+        val partitions = simpleGroups(pathVar, parts, negated)
         partitions.map(orJoin) match {
           case Seq(e) => e
           case seq =>
@@ -552,6 +607,7 @@ trait TemplateGenerator { self: Templates =>
 
                 storeGuarded(pathVar, implies(newRes, newExpr))
                 iff(and(pathVar, not(newRes)), newBool)
+                pathFacts(newBool) = factsOf(pathVar) ++ negated(x)
 
                 recOr(newBool, xs)
 
@@ -563,7 +619,7 @@ trait TemplateGenerator { self: Templates =>
         }
 
       case i @ IfExpr(cond, thenn, elze) => {
-        if (isSimple(i)) {
+        if (isSimple(i, factsOf(pathVar))) {
           i
         } else {
           val newBool1 : Variable = Variable.fresh("b", BooleanType(), true)
@@ -581,8 +637,8 @@ trait TemplateGenerator { self: Templates =>
           iff(and(pathVar, condVar), newBool1)
           iff(and(pathVar, not(condVar)), newBool2)
 
-          val (trec, tClauses) = mkExprClauses(newBool1, thenn, localSubst, pol)
-          val (erec, eClauses) = mkExprClauses(newBool2, elze, localSubst, pol)
+          val (trec, tClauses) = mkExprClauses(newBool1, thenn, localSubst, pol, factsOf(pathVar) ++ conjuncts(cond))
+          val (erec, eClauses) = mkExprClauses(newBool2, elze, localSubst, pol, factsOf(pathVar) ++ negated(cond))
           builder ++=  mergeCalls(pathVar, condVar, localSubst,
                                   tClauses + (newBool1 -> Equals(newExpr, trec)),
                                   eClauses + (newBool2 -> Equals(newExpr, erec)))
@@ -642,6 +698,12 @@ trait TemplateGenerator { self: Templates =>
         storeEquality(pathVar, re1, re2)
         Application(v, Seq(re1, re2))
 
+      case e if guard(e).isDefined =>
+        val Operator(as, r) = e: @unchecked
+        val res = r(as.map(a => rec(pathVar, a, None)))
+        if (!guard(e).exists(factsOf(pathVar))) definedness(res).foreach(storeGuarded(pathVar, _))
+        res
+
       case Operator(as, r) => r(as.map(a => rec(pathVar, a, None)))
     }
 
@@ -684,7 +746,8 @@ trait TemplateGenerator { self: Templates =>
     tpe: Type,
     expr: Expr,
     substMap: Map[Variable, Encoded],
-    inDomain: Boolean = false
+    inDomain: Boolean = false,
+    ground: Boolean = false
   )(using generator: TypingGenerator): (Expr, TemplateClauses) = {
     val builder = new Builder(pathVar, substMap)
     import builder._
@@ -753,7 +816,10 @@ trait TemplateGenerator { self: Templates =>
       //
       // The domains of quantifiers in positive polarity are checked the same way: there, the result
       // may only be false if the value lies outside of the type, as it disables the instantiation.
-      case (_: FunctionType | _: PiType) if generator == MembershipGenerator || (inDomain && generator == ContractGenerator) =>
+      // So are the fresh grounds at which such quantifiers are instantiated when they have no other
+      // ground (see `ensureGrounds`): assuming that the ground lies in its type would assume that the
+      // type is inhabited, which a function type into an empty type isn't.
+      case (_: FunctionType | _: PiType) if generator == MembershipGenerator || (inDomain && (generator == ContractGenerator || ground)) =>
         val (params, to) = tpe match {
           case PiType(params, to) => (params, to)
           case FunctionType(from, to) => (from.map(tpe => ValDef.fresh("x", tpe, true)), to)
@@ -786,7 +852,7 @@ trait TemplateGenerator { self: Templates =>
       // never completes for collections that may hold infinitely many elements. The keys of maps
       // must be unrefined, as the value of a map at a key outside of `A` must be its default.
       case MapType(from, to) if !(ContractUnrolling `unroll` from) &&
-          (generator == MembershipGenerator || (inDomain && generator == ContractGenerator)) =>
+          (generator == MembershipGenerator || (inDomain && (generator == ContractGenerator || ground))) =>
         val w = membershipGuard(pathVar)
         val key = Variable.fresh("key", from, true)
         storeExpr(key)
@@ -806,7 +872,7 @@ trait TemplateGenerator { self: Templates =>
         storeGuarded(w, GreaterThan(MultiplicityInBag(elem, expr), IntegerLiteral(0)))
         implies(w, rec(w, base, elem, state))
 
-      case (_: FunctionType | _: PiType) => storeType(pathVar, tpe, expr, inDomain)
+      case (_: FunctionType | _: PiType) => storeType(pathVar, tpe, expr, inDomain, ground)
 
       case tp: TypeParameter if generator == FreeGenerator => typesManager.storeTypeParameter(tp)
 
@@ -858,7 +924,7 @@ trait TemplateGenerator { self: Templates =>
             .map(_.applied(Seq(expr)))
             .getOrElse(BooleanLiteral(true)),
           if (sort.definition.isInductive && !state.recurseAdt) {
-            storeType(pathVar, tpe, expr, inDomain)
+            storeType(pathVar, tpe, expr, inDomain, ground)
           } else {
             val newExpr = Variable.fresh("e", BooleanType(), true)
             storeExpr(newExpr)
@@ -906,7 +972,7 @@ trait TemplateGenerator { self: Templates =>
 
       case MapType(from, to) =>
         if (!state.recurseMap) {
-          storeType(pathVar, tpe, expr, inDomain)
+          storeType(pathVar, tpe, expr, inDomain, ground)
         } else {
           val newBool1 : Variable = Variable.fresh("mapIsEmpty", BooleanType(), true)
           val newBool2 : Variable = Variable.fresh("mapNonEmpty", BooleanType(), true)
@@ -944,7 +1010,7 @@ trait TemplateGenerator { self: Templates =>
 
       case SetType(base) =>
         if (!state.recurseSet) {
-          storeType(pathVar, tpe, expr, inDomain)
+          storeType(pathVar, tpe, expr, inDomain, ground)
         } else {
           val newBool1 : Variable = Variable.fresh("setIsEmpty", BooleanType(), true)
           val newBool2 : Variable = Variable.fresh("setNonEmpty", BooleanType(), true)
@@ -977,7 +1043,7 @@ trait TemplateGenerator { self: Templates =>
 
       case BagType(base) =>
         if (!state.recurseBag) {
-          storeType(pathVar, tpe, expr, inDomain)
+          storeType(pathVar, tpe, expr, inDomain, ground)
         } else {
           val newBool1 : Variable = Variable.fresh("bagIsEmpty", BooleanType(), true)
           val newBool2 : Variable = Variable.fresh("bagNonEmpty", BooleanType(), true)

@@ -15,9 +15,11 @@ class UnrollingSolverSuite extends TestSuite with DatastructureUtils {
   import inox.trees.dsl._
   import SolverResponses._
 
+  // Several tests compare functions, which needs a function equality other than the default
   override def configurations = Seq(Seq(
     optSelectedSolvers(Set(UnrollingTestSuite.solverName)),
     optTimeout(300),
+    optFunctionEquality(FunctionEquality.Intensional),
   ))
 
   override protected def optionsString(options: Options): String =
@@ -124,6 +126,46 @@ class UnrollingSolverSuite extends TestSuite with DatastructureUtils {
       case SatWithModel(model) =>
         val evaluated = program.getEvaluator.eval(E(lengthID)(I)(value(model, l)), model)
         assert(evaluated.result == Some(int(3)))
+      case res => fail(s"Expected a model, got $res")
+    }
+  }
+
+  test("lucky models whose validation times out leave the counterexample to the search") {
+    // The validation of every lucky model is given up at once, so the model comes from the search
+    val l = Variable.fresh("l", T(listID)(I))
+    check(E(lengthID)(I)(l) === int(3), Model, optFeelingLucky(true), optLuckyTimeout(0), optCheckModels(true)) match {
+      case SatWithModel(model) =>
+        val evaluated = program.getEvaluator.eval(E(lengthID)(I)(value(model, l)), model)
+        assert(evaluated.result == Some(int(3)))
+      case res => fail(s"Expected a model, got $res")
+    }
+  }
+
+  test("models give types to the type parameters they leave empty") {
+    // Only models in which `U` is empty satisfy the clause, and `V` has values
+    val U = TypeParameter.fresh("U")
+    val V = TypeParameter.fresh("V")
+    val g = Variable.fresh("g", U =>: I)
+    val clause = forall("w" :: U)(w => g(w) > g(w)) && !forall("w" :: V)(_ => BooleanLiteral(false))
+    for (checkModels <- Seq(false, true)) {
+      check(clause, Model, optCheckModels(checkModels)) match {
+        case SatWithModel(model) =>
+          assert(model.types.keySet == Set(U))
+          assert(program.getEvaluator.eval(clause, model).result == Some(BooleanLiteral(true)))
+          assert(model.toString.contains("type " + U.id.name))
+        case res => fail(s"Expected a model, got $res (check models = $checkModels)")
+      }
+    }
+  }
+
+  test("models with empty type parameters are found before everything is unrolled") {
+    // `length(l)` unrolls forever, but the model check already shows that only an empty `U`
+    // satisfies the clause
+    val U = TypeParameter.fresh("U")
+    val l = Variable.fresh("l", T(listID)(I))
+    val clause = forall("w" :: U)(_ => BooleanLiteral(false)) && E(lengthID)(I)(l) >= int(0)
+    check(clause, Model, optTimeout(5)) match {
+      case SatWithModel(model) => assert(model.types.keySet == Set(U))
       case res => fail(s"Expected a model, got $res")
     }
   }
