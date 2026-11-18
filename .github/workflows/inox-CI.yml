@@ -20,12 +20,12 @@ jobs:
       fail-fast: false
       # Linux / JDK 17 runs in the Inox coverage workflow, with coverage
       # measurements, so that the coverage comment doesn't wait for these jobs.
+      # macOS runners are scarce (pull requests queue for them), so macOS only
+      # runs on JDK 21: JDK 17 is covered on Linux.
       matrix:
         include:
           - runners: {name: Linux, os: Linux, labels: ['ubuntu-latest']}
             java-version: 21
-          - runners: {name: macOS ARM64, os: macOS, labels: ['macos-latest']}
-            java-version: 17
           - runners: {name: macOS ARM64, os: macOS, labels: ['macos-latest']}
             java-version: 21
     env:
