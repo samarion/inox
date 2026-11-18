@@ -30,6 +30,8 @@ abstract class Z3Unrolling(override val program: Program)
 
   protected lazy val z3 = underlying.z3
 
+  override def resourceLimitReached: Boolean = underlying.resourceLimitReached
+
   override val templates =
     new TemplatesImpl(targetProgram, context)(using targetSemantics)
 
@@ -64,6 +66,10 @@ abstract class Z3Unrolling(override val program: Program)
     def mkAnd(es: Z3AST*) = z3.mkAnd(es*)
     def mkEquals(l: Z3AST, r: Z3AST) = z3.mkEq(l, r)
     def mkImplies(l: Z3AST, r: Z3AST) = z3.mkImplies(l, r)
+
+    type Function = Z3FuncDecl
+    def mkFunction(name: String, from: Seq[Type], to: Type) = underlying.declareFunction(name, from, to)
+    def mkFunApp(f: Z3FuncDecl, args: Seq[Z3AST]) = z3.mkApp(f, args*)
 
     def extractNot(e: Z3AST): Option[Z3AST] = underlying.extractNot(e)
 
