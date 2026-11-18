@@ -79,7 +79,7 @@ trait LambdaTemplates { self: Templates =>
 
       val lidT = encodeSymbol(lid)
       val (contents, str) = Template.contents(pathVar, idArgs zip trArgs, tmplClauses,
-        substMap = depSubst + (lid -> lidT), optApp = Some(lidT -> tpe))
+        substMap = depSubst + (lid -> lidT), optApp = Some(lidT -> tpe), partial = true)
 
       val lambdaString : () => String = () => {
         "Template for lambda " + lid + ": " + lambda + " is :\n" + str()
@@ -119,6 +119,11 @@ trait LambdaTemplates { self: Templates =>
     override def instantiate(blocker: Encoded, args: Seq[Arg]): Clauses = {
       val (b, clauses) = encodeBlockers(Set(blocker, contents.pathVar._2))
       clauses ++ super.instantiate(b, args)
+    }
+
+    override def instantiate(blocker: Encoded, args: Seq[Arg], failure: Encoded): Clauses = {
+      val (b, clauses) = encodeBlockers(Set(blocker, contents.pathVar._2))
+      clauses ++ super.instantiate(b, args, failure)
     }
 
     private lazy val str : String = stringRepr()
@@ -356,15 +361,7 @@ trait LambdaTemplates { self: Templates =>
   }
 
   private def registerAppInfo(gen: Int, key: (Encoded, App), template: Either[LambdaTemplate, Encoded], equals: Encoded, args: Seq[Arg]): Unit = {
-    val info = TemplateAppInfo(template, equals, args)
-    appInfos.get(key) match {
-      case Some((exGen, origGen, exInfo)) =>
-        val minGen = gen min exGen
-        appInfos += key -> (minGen, origGen, exInfo + info)
-
-      case None =>
-        appInfos += key -> (gen, gen, Set(info))
-    }
+    appInfos.register(key, gen, Set(TemplateAppInfo(template, equals, args)))
   }
 
   private def registerAppBlocker(app: (Encoded, App), blocker: Encoded): Unit = {
@@ -385,8 +382,8 @@ trait LambdaTemplates { self: Templates =>
       byID += pointer -> template
       applications += template.tpe -> applications(template.tpe).filterNot(_._2.caller == pointer)
 
-      for ((key @ (_, app), (gen, origGen, fis)) <- appInfos.toSeq if fis.nonEmpty && app.caller == pointer) {
-        appInfos += key -> (gen, origGen, Set(TemplateAppInfo(template, trueT, app.args)))
+      for ((key @ (_, app), _, fis) <- appInfos.entries if fis.nonEmpty && app.caller == pointer) {
+        appInfos.replace(key, Set(TemplateAppInfo(template, trueT, app.args)))
       }
 
       true
@@ -746,11 +743,11 @@ trait LambdaTemplates { self: Templates =>
 
   private[unrolling] object lambdasManager extends Manager {
     // Function instantiations have their own defblocker
-    private[LambdaTemplates] val lambdaBlockers = new IncrementalMap[TemplateAppInfo, Encoded]()
+    private[LambdaTemplates] val lambdaBlockers = new IncrementalMap[TemplateAppInfo, (Encoded, Encoded)]()
 
-    // Keep which function invocation is guarded by which guard,
-    // also specify the generation of the blocker.
-    private[LambdaTemplates] val appInfos      = new IncrementalMap[(Encoded, App), (Int, Int, Set[TemplateAppInfo])]()
+    // The lambdas (or free functions) that each application may be dispatched to, which are
+    // unfolded with it, under the application's current blocker (see [[appBlockers]])
+    private[LambdaTemplates] val appInfos      = new UnrollingQueue[(Encoded, App), TemplateAppInfo]
     private[LambdaTemplates] val appBlockers   = new IncrementalMap[(Encoded, App), Encoded]()
     private[LambdaTemplates] val blockerToApps = new IncrementalMap[Encoded, (Encoded, App)]()
 
@@ -841,9 +838,7 @@ trait LambdaTemplates { self: Templates =>
       byID, byType, lambdaClasses, applications, freeBlockers, nonFreeBlockers, freeFunctions,
       instantiated, typeBlockers, witnessFunctions, witnessDepths, appDepths, resultGuards, witnessArguments, witnessInputs, pendingWitnesses)
 
-    def unrollGeneration: Option[Int] =
-      if (appInfos.isEmpty) None
-      else Some(appInfos.values.map(_._1).min)
+    def unrollGeneration: Option[Int] = appInfos.generation
 
     private def assumptions: Seq[Encoded] =
       freeBlockers.toSeq.flatMap(_._2.map(_._1)) ++
@@ -852,34 +847,17 @@ trait LambdaTemplates { self: Templates =>
     def satisfactionAssumptions = appBlockers.map(p => mkNot(p._2)).toSeq ++ assumptions
     def refutationAssumptions = assumptions
 
-    def promoteBlocker(b: Encoded): Boolean = {
-      if (blockerToApps `contains` b) {
-        val app = blockerToApps(b)
-        if (appInfos `contains` app) {
-          val (_, origGen, infos) = appInfos(app)
-          appInfos += app -> (currentGeneration, origGen, infos)
-          true
-        } else {
-          false
-        }
-      } else {
-        false
-      }
-    }
+    def promoteBlocker(b: Encoded): Boolean = blockerToApps.get(b).exists(appInfos.promote)
 
     def unroll: Clauses = if (appInfos.isEmpty) Seq.empty else {
       val newClauses = new scala.collection.mutable.ListBuffer[Encoded]
 
-      val apps = appInfos.toList.filter(_._2._1 <= currentGeneration).map(_._1)
-      val thisAppInfos = apps.map(app => app -> {
-        val (gen, _, infos) = appInfos(app)
-        (gen, infos)
-      })
+      val thisAppInfos = appInfos.dequeue().map { case (app, gen, infos) => app -> (gen, infos) }
+      val apps = thisAppInfos.map(_._1)
 
       val remainingApps = MutableSet.empty ++ apps
 
       blockerToApps --= apps.map(appBlockers)
-      appInfos --= apps
 
       val newBlockers = (for ((app, (_, infos)) <- thisAppInfos if infos.nonEmpty) yield {
         app -> nextAppBlocker(app)
@@ -904,24 +882,28 @@ trait LambdaTemplates { self: Templates =>
           for (info @ TemplateAppInfo(tmpl, equals, args) <- infos if !abort; template <- tmpl.left) {
             val newCls = new scala.collection.mutable.ListBuffer[Encoded]
 
-            val lambdaBlocker = lambdaBlockers.get(info) match {
-              case Some(lambdaBlocker) => lambdaBlocker
+            val (lambdaBlocker, lambdaFailure) = lambdaBlockers.get(info) match {
+              case Some(blockerAndFailure) => blockerAndFailure
 
               case None =>
                 val lambdaBlocker = encodeSymbol(Variable.fresh("d", BooleanType(), true))
-                lambdaBlockers += info -> lambdaBlocker
+                val lambdaFailure = encodeSymbol(Variable.fresh("fails", BooleanType(), true))
+                lambdaBlockers += info -> (lambdaBlocker, lambdaFailure)
 
                 // the lambda body is instantiated on the arguments of `app`, so it inherits their witness depth
                 val depth = appDepths.getOrElse(app._2, 0) max witnessDepths.getOrElse(template.ids._2, 0)
-                val instClauses: Clauses = withWitnessDepth(depth)(template.instantiate(lambdaBlocker, args))
+                val instClauses: Clauses =
+                  withWitnessDepth(depth)(template.instantiate(lambdaBlocker, args, lambdaFailure))
 
                 newCls ++= instClauses
-                lambdaBlocker
+                (lambdaBlocker, lambdaFailure)
             }
 
             val enabler = if (equals == trueT) b else mkAnd(equals, b)
             registerImplication(b, lambdaBlocker)
             newCls += mkImplies(enabler, lambdaBlocker)
+            // the application fails iff the body of the lambda it is dispatched to does
+            if (partialFunctions) newCls += mkImplies(enabler, mkEquals(appFailure(app._2), lambdaFailure))
 
             reporter.debug("Unrolling behind "+info+" ("+newCls.size+")")
             for (cl <- newCls) {
@@ -933,16 +915,13 @@ trait LambdaTemplates { self: Templates =>
         }
       }
 
-      val remainingInfos = thisAppInfos.filter { case (app, _) => remainingApps(app) }
-      for ((app, (gen, infos)) <- thisAppInfos if remainingApps(app)) appInfos.get(app) match {
-        case Some((newGen, origGen, newInfos)) =>
-          appInfos += app -> (gen min newGen, origGen, infos ++ newInfos)
-
-        case None =>
-          appInfos += app -> (gen, gen, infos)
-          blockerToApps += appBlockers(app) -> app
+      // the applications that an interruption left out are unfolded later
+      for ((app, (gen, infos)) <- thisAppInfos if remainingApps(app)) {
+        if (!appInfos.contains(app)) blockerToApps += appBlockers(app) -> app
+        appInfos.register(app, gen, infos)
       }
 
+      newClauses ++= newFailureDefinitions()
       reporter.debug(s"   - ${newClauses.size} new clauses")
 
       newClauses.toSeq
