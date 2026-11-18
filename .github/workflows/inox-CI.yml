@@ -82,7 +82,7 @@ jobs:
       run: cvc5 --version && z3 --version && cvc4 --version && bitwuzla --version
     - name: Machine
       run: |
-        sed -i '' 's/-Xmx8G/-Xmx${{ matrix.xmx }}/' .jvmopts; cat .jvmopts
+        sed -i '' 's/-Xmx8G/-Xmx${{ matrix.xmx }}/' .sbtopts; cat .sbtopts
         sysctl hw.ncpu hw.memsize vm.swapusage
         (while true; do sleep 15; echo "$(date +%T) $(sysctl -n vm.swapusage) $(memory_pressure | tail -1)"; done) > mem.log 2>&1 &
     - name: Run Tests
