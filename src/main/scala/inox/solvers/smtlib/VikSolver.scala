@@ -9,6 +9,19 @@ import _root_.smtlib.trees.CommandsResponses.{Error => SMTError, GetProofRespons
 import _root_.smtlib.trees.Terms.SString
 
 trait VikSolver extends SMTLIBSolver with VikTarget with ProofProducingSolver {
+  import program.trees._
+  import SolverResponses._
+
+  /** Vik doesn't answer `get-unsat-assumptions`, so the core of an UNSAT answer is all the
+    * assumptions, which is a core, if not the smallest. */
+  override def checkAssumptions(config: Configuration)(assumptions: Set[Expr]): config.Response[Model, Assumptions] = {
+    val res: SolverResponse[Model, Assumptions] =
+      super.checkAssumptions(Configuration(model = config.withModel, unsatAssumptions = false))(assumptions)
+    config.cast(res match {
+      case Unsat if config.withUnsatAssumptions => UnsatWithAssumptions(assumptions)
+      case _ => res
+    })
+  }
 
   /** The Lean proof of the last check that answered UNSAT, which Vik writes when it runs with
     * `--proofs` (see [[optLeanProofs]]). */
