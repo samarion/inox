@@ -253,6 +253,10 @@ trait SolverTestSuite extends AnyFunSuite with org.scalatest.ParallelTestExecuti
   protected def test(name: String, requires: Feature*)(body: Context => Unit): Unit =
     register(name, solverInfos.filter(_.supports(requires)))(body)
 
+  /** Registers `body` once per solver that supports all of `requires` and satisfies `on`. */
+  protected def testOn(name: String, on: SolverInfo => Boolean, requires: Feature*)(body: Context => Unit): Unit =
+    register(name, solverInfos.filter(info => info.supports(requires) && on(info)))(body)
+
   /** Registers `body` once per solver that does not support `feature`. */
   protected def testWithout(name: String, feature: Feature)(body: Context => Unit): Unit =
     register(name, solverInfos.filterNot(_.supports(Seq(feature))))(body)
