@@ -26,8 +26,8 @@ At step *i*, the current clause set `Φi` over-approximates the query, because
 every call that has not been unfolded is uninterpreted. Adding `block(Fi)`
 (the negation of each blocker guarding a call that has not been unfolded) gives
 an under-approximation, because it only keeps paths whose calls are all
-encoded. The loop in `UnrollingSolver.scala` (`checkAssumptions`) alternates
-between the two:
+encoded. The loop in `UnrollingSolver.scala` (`checkAssumptions`, whose class
+`Check` has one method per state) alternates between the two:
 
 - `ModelCheck` checks `Φi` together with `satisfactionAssumptions` (the blocking
   literals). A model is a candidate counterexample and goes to `Validate`,
@@ -49,7 +49,8 @@ between the two:
 | Clause and blocker infrastructure | `Templates.scala` |
 | Custom equality on datatypes (`ADTSort.equality`), unfolded like calls | `EqualityTemplates.scala` |
 | Uninterpreted calls, as applications of free functions (constants when nullary) | `TemplateGenerator.uninterpretedFunction` |
-| The check/unroll loop and model extraction | `UnrollingSolver.scala` |
+| The check/unroll loop | `UnrollingSolver.scala` |
+| Model extraction, with functions as lambdas | `ModelExtraction.scala` |
 
 ### First-class functions (thesis Chapter 2)
 
