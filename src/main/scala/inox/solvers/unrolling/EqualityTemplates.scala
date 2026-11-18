@@ -92,21 +92,12 @@ trait EqualityTemplates { self: Templates =>
       instantiate(aVar, Seq(Left(e1), Left(e2)))
     }
 
-    override protected def instantiate(substMap: Map[Encoded, Arg]): Clauses = {
-      val clauses = Template.instantiate(
-        contents.clauses, contents.blockers, contents.applications, contents.matchers,
-        contents.reads, Map.empty, substMap)
-
+    override protected def instantiate(instantiation: Instantiation): Clauses = {
       // register equalities (WILL NOT lead to any [[instantiate]] calls)
-      val substituter = mkSubstituter(substMap.view.mapValues(_.encoded).toMap)
-      for 
-        eq <- contents.equalities
-        bp = substituter(eq._1)
-        equality <- eq._2
-      yield
-        registerEquality(bp, equality.substitute(substituter))
-
-      clauses
+      instantiation.clauses(onEquality = { (bp, equality) =>
+        registerEquality(bp, equality)
+        Seq.empty
+      })
     }
   }
 
@@ -229,16 +220,7 @@ trait EqualityTemplates { self: Templates =>
 
   def registerEquality(blocker: Encoded, equality: Equality): Encoded = {
     val tpe = equality.tpe
-    val gen = nextGeneration(currentGeneration)
-    val notBlocker = mkNot(blocker)
-
-    equalityInfos.get(blocker) match {
-      case Some((exGen, origGen, _, exEqs)) =>
-        val minGen = gen min exGen
-        equalityInfos += blocker -> (minGen, origGen, notBlocker, exEqs + equality)
-      case None =>
-        equalityInfos += blocker -> (gen, gen, notBlocker, Set(equality))
-    }
+    equalityInfos.register(blocker, nextGeneration(currentGeneration), Set(equality))
 
     mkApp(equalitySymbol(tpe)._2, FunctionType(Seq(tpe, tpe), BooleanType()), Seq(equality.e1, equality.e2))
   }
@@ -246,36 +228,22 @@ trait EqualityTemplates { self: Templates =>
   private[unrolling] object equalityManager extends Manager {
     private[EqualityTemplates] val eqBlockers = new IncrementalMap[Equality, Encoded]()
     private[EqualityTemplates] val typeSymbols = new IncrementalMap[Type, (Variable, Encoded)]
-    private[EqualityTemplates] val equalityInfos = new IncrementalMap[Encoded, (Int, Int, Encoded, Set[Equality])]
+    private[EqualityTemplates] val equalityInfos = new BlockerQueue[Equality]
     private[EqualityTemplates] val instantiated = new IncrementalMap[Type, Set[(Encoded, Encoded, Encoded)]].withDefaultValue(Set.empty)
 
     val incrementals: Seq[IncrementalState] = Seq(eqBlockers, typeSymbols, equalityInfos, instantiated)
 
-    def unrollGeneration: Option[Int] =
-      if (equalityInfos.isEmpty) None
-      else Some(equalityInfos.values.map(_._1).min)
+    def unrollGeneration: Option[Int] = equalityInfos.generation
 
-    def satisfactionAssumptions: Seq[Encoded] = equalityInfos.map(_._2._3).toSeq
+    def satisfactionAssumptions: Seq[Encoded] = equalityInfos.satisfactionAssumptions
     def refutationAssumptions: Seq[Encoded] = Seq.empty
 
-    def promoteBlocker(b: Encoded): Boolean = {
-      if (equalityInfos `contains` b) {
-        val (_, origGen, notB, eqs) = equalityInfos(b)
-        equalityInfos += b -> (currentGeneration, origGen, notB, eqs)
-        true
-      } else {
-        false
-      }
-    }
+    def promoteBlocker(b: Encoded): Boolean = equalityInfos.promote(b)
 
     def unroll: Clauses = if (equalityInfos.isEmpty) Seq.empty else {
       val newClauses = new scala.collection.mutable.ListBuffer[Encoded]
 
-      val eqBlockers = equalityInfos.filter(_._2._1 <= currentGeneration).toSeq.map(_._1)
-      val newEqInfos = eqBlockers.flatMap(id => equalityInfos.get(id).map(id -> _))
-      equalityInfos --= eqBlockers
-
-      for ((blocker, (gen, _, _, eqs)) <- newEqInfos; e <- eqs) {
+      for ((blocker, _, eqs) <- equalityInfos.dequeue(); e <- eqs) {
         newClauses ++= instantiateEquality(blocker, e)
       }
 

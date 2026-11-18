@@ -16,6 +16,9 @@ trait Templates
      with QuantificationTemplates
      with EqualityTemplates
      with TypeTemplates
+     with WitnessTemplates
+     with BlockerGraph
+     with PartialFunctions
      with IncrementalStateWrapper {
 
   val program: Program
@@ -47,6 +50,13 @@ trait Templates
   def mkEquals(l: Encoded, r: Encoded): Encoded
   def mkImplies(l: Encoded, r: Encoded): Encoded
 
+  /** A first-order uninterpreted function of the underlying solver, which an SMT-LIB solver declares
+    * with `declare-fun`. Unlike first-class functions, these are never values. */
+  type Function
+
+  def mkFunction(name: String, from: Seq[Type], to: Type): Function
+  def mkFunApp(f: Function, args: Seq[Encoded]): Encoded
+
   def extractNot(e: Encoded): Option[Encoded]
   def decodePartial(e: Encoded, tpe: Type): Option[Expr]
 
@@ -68,6 +78,63 @@ trait Templates
     def promoteBlocker(b: Encoded): Boolean
   }
 
+  /** The pending unfoldings of a manager: the items to unfold under each key (a blocker, or an
+    * application whose unfolding a blocker guards), and the generation at which they are unfolded.
+    * Items registered under a pending key join it, at the earliest of their generations, and a
+    * promoted key is unfolded at the current generation. */
+  class UnrollingQueue[K, I] extends IncrementalStateWrapper {
+    private val pending = new IncrementalMap[K, (Int, Set[I])]
+    protected def extraIncrementals: Seq[IncrementalState] = Seq.empty
+    protected val incrementals: Seq[IncrementalState] = pending +: extraIncrementals
+
+    def isEmpty: Boolean = pending.isEmpty
+    def contains(key: K): Boolean = pending.contains(key)
+    def keys: Iterable[K] = pending.map(_._1)
+    def entries: Seq[(K, Int, Set[I])] = pending.toSeq.map { case (k, (gen, items)) => (k, gen, items) }
+
+    /** The earliest generation of the pending keys, if any. */
+    def generation: Option[Int] = if (pending.isEmpty) None else Some(pending.values.map(_._1).min)
+
+    def register(key: K, gen: Int, items: Set[I]): Unit = pending.get(key) match {
+      case Some((exGen, exItems)) => pending += key -> (gen min exGen, exItems ++ items)
+      case None => pending += key -> (gen, items)
+    }
+
+    /** Replaces the items of the pending `key`, which keeps its generation. */
+    def replace(key: K, items: Set[I]): Unit =
+      for ((gen, _) <- pending.get(key)) pending += key -> (gen, items)
+
+    def promote(key: K): Boolean = pending.get(key) match {
+      case Some((_, items)) =>
+        pending += key -> (currentGeneration, items)
+        true
+      case None =>
+        false
+    }
+
+    /** Removes the keys that are due at the current generation, and returns them with their items. */
+    def dequeue(): Seq[(K, Int, Set[I])] = {
+      val due = pending.toSeq.filter(_._2._1 <= currentGeneration)
+      pending --= due.map(_._1)
+      due.map { case (k, (gen, items)) => (k, gen, items) }
+    }
+  }
+
+  /** A queue of the items that blockers guard, whose blockers the model checks assume false. */
+  class BlockerQueue[I] extends UnrollingQueue[Encoded, I] {
+    // lazy, as the constructor of [[UnrollingQueue]] collects it
+    private lazy val negations = new IncrementalMap[Encoded, Encoded]
+    override protected def extraIncrementals: Seq[IncrementalState] = Seq(negations)
+
+    override def register(blocker: Encoded, gen: Int, items: Set[I]): Unit = {
+      if (!negations.contains(blocker)) negations += blocker -> mkNot(blocker)
+      super.register(blocker, gen, items)
+    }
+
+    /** The negations of the pending blockers. */
+    def satisfactionAssumptions: Seq[Encoded] = keys.toSeq.map(negations)
+  }
+
   private val managers: Seq[Manager] = Seq(
     functionsManager,
     typesManager,
@@ -87,97 +154,10 @@ trait Templates
   def satisfactionAssumptions = managers.flatMap(_.satisfactionAssumptions)
   def refutationAssumptions = managers.flatMap(_.refutationAssumptions)
 
-  // implication tree that we're sure about: if  (b1, b2) is in the tree, then
-  // we have the precise semantics of b1 ==> b2 in the resulting clause set
-  private val condImplies = new IncrementalMap[Encoded, Set[Encoded]].withDefaultValue(Set.empty)
-  private val condImplied = new IncrementalMap[Encoded, Set[Encoded]].withDefaultValue(Set.empty)
-
-  // implication tree that isn't quite ensured in the resulting clause set
-  // this can happen due to defBlocker caching in unrolling
-  private val potImplies = new IncrementalMap[Encoded, Set[Encoded]].withDefaultValue(Set.empty)
-  private val potImplied = new IncrementalMap[Encoded, Set[Encoded]].withDefaultValue(Set.empty)
-
-  private val condEquals  = new IncrementalBijection[Encoded, Set[Encoded]]
-
   // Set of variables that have already been declared in this solver
   private val declared = new IncrementalSet[(Variable, Encoded)]
 
-  val incrementals: Seq[IncrementalState] = managers ++ Seq(
-    condImplies, condImplied, potImplies, potImplied, condEquals, declared
-  )
-
-  protected def freshConds(
-    pathVar: Encoded,
-    condVars: Map[Variable, Encoded],
-    tree: Map[Variable, Set[Variable]]): Map[Encoded, Encoded] = {
-
-    val subst = condVars.map { case (v, idT) => idT -> encodeSymbol(v) }
-    val mapping = condVars.view.mapValues(subst).toMap
-
-    for ((parent, children) <- tree) {
-      mapping.get(parent) match {
-        case None => // enabling condition, corresponds to pathVar
-          for (child <- children) {
-            val ec = mapping(child)
-            condImplies += pathVar -> (condImplies(pathVar) + ec)
-            condImplied += ec -> (condImplied(ec) + pathVar)
-          }
-
-        case Some(ep) =>
-          for (child <- children) {
-            val ec = mapping(child)
-            condImplies += ep -> (condImplies(ep) + ec)
-            condImplied += ec -> (condImplied(ec) + ep)
-          }
-      }
-    }
-
-    subst
-  }
-
-  private val sym = Variable.fresh("bs", BooleanType(), true)
-  protected def encodeBlockers(bs: Set[Encoded]): (Encoded, Clauses) = bs.toSeq.filter(_ != trueT) match {
-    case Seq(b) if (
-      condImplies.isDefinedAt(b) || condImplied.isDefinedAt(b) ||
-      potImplies.isDefinedAt(b) || potImplied.isDefinedAt(b) ||
-      condEquals.containsA(b)
-    ) => (b, Seq.empty)
-
-    case _ =>
-      val flatBs = fixpoint((bs: Set[Encoded]) => bs.flatMap(b => condEquals.getBorElse(b, Set(b))))(bs)
-      condEquals.getA(flatBs) match {
-        case Some(b) => (b, Seq.empty)
-        case None =>
-          val b = encodeSymbol(sym)
-          condEquals += (b -> flatBs)
-          (b, Seq(mkEquals(b, if (flatBs.isEmpty) trueT else mkAnd(flatBs.toSeq*))))
-      }
-  }
-
-  protected def registerImplication(b1: Encoded, b2: Encoded): Unit = {
-    potImplies += b1 -> (potImplies(b1) + b2)
-    potImplied += b2 -> (potImplied(b2) + b1)
-  }
-
-  protected def blockerEquals(b: Encoded): Set[Encoded] = condEquals.getBorElse(b, Set.empty)
-
-  protected def blockerParents(b: Encoded, strict: Boolean = true): Set[Encoded] = {
-    condImplied(b) ++ (if (!strict) potImplied(b) else Set.empty)
-  }
-
-  protected def blockerChildren(b: Encoded, strict: Boolean = true): Set[Encoded] = {
-    condImplies(b) ++ (if (!strict) potImplies(b) else Set.empty)
-  }
-
-  protected def blockerPath(b: Encoded): Set[Encoded] = blockerPath(Set(b))
-
-  /* This set is guaranteed finite and won't expand beyond the limit of a function's
-   * definition as aVar ==> defBlocker is NOT a strict implication (ie. won't be in
-   * the condImplied map) */
-  protected def blockerPath(bs: Set[Encoded]): Set[Encoded] = fixpoint((bs: Set[Encoded]) => bs.flatMap { b =>
-    val equal = condEquals.getBorElse(b, Set.empty)
-    if (equal.nonEmpty) equal else (condImplied(b) + b)
-  })(bs).filter(_ != trueT)
+  val incrementals: Seq[IncrementalState] = managers ++ Seq(witnessState, blockerGraph, partialFunctionState, declared)
 
   def promoteBlocker(b: Encoded, force: Boolean = false): Boolean = {
     var seen: Set[Encoded] = Set.empty
@@ -252,8 +232,15 @@ trait Templates
     def getType: Type = function.getType.asInstanceOf[FunctionType].to
   }
 
+  /** An item that a template guards by a blocker: a call, an application, a matcher, a collection
+    * read, an equality or a typing. Instantiating the template under the blocker instantiates its
+    * items (see [[Instantiation]]). */
+  trait Item {
+    def substitute(substituter: Encoded => Encoded, msubst: Map[Encoded, Matcher]): Item
+  }
+
   /** Represents a named function call in the unfolding procedure */
-  case class Call(callee: Callee, args: Seq[Arg], tpSubst: Seq[Arg]) {
+  case class Call(callee: Callee, args: Seq[Arg], tpSubst: Seq[Arg]) extends Item {
     override def toString: String = {
       def pArgs(args: Seq[Arg]): String = args.map {
         case Right(m) => m.toString
@@ -277,7 +264,7 @@ trait Templates
   }
 
   /** Represents an application of a first-class function in the unfolding procedure */
-  case class App(caller: Encoded, tpe: FunctionType, args: Seq[Arg], encoded: Encoded) {
+  case class App(caller: Encoded, tpe: FunctionType, args: Seq[Arg], encoded: Encoded) extends Item {
     override def toString: String =
       "(" + asString(caller) + " : " + tpe.asString + ")" + args.map(a => asString(a.encoded)).mkString("(", ",", ")")
 
@@ -289,7 +276,7 @@ trait Templates
   }
 
   /** Represents an E-matching matcher that will be used to instantiate relevant quantified propositions */
-  case class Matcher(key: Either[(Encoded, Type), TypedFunDef], args: Seq[Arg], encoded: Encoded) {
+  case class Matcher(key: Either[(Encoded, Type), TypedFunDef], args: Seq[Arg], encoded: Encoded) extends Item {
     override def toString: String = (key match {
       case Left((c, tpe)) => asString(c)
       case Right(tfd) => tfd.signature
@@ -309,13 +296,15 @@ trait Templates
     * a set membership or a bag multiplicity, or a key that a built collection defines. The value it
     * reads is typed for the free collections that `collection` may equal (@see
     * [[TypeTemplates.Collection]]), as the results of the applications of free functions are. */
-  case class Read(tpe: Type, collection: Encoded, key: Encoded) {
+  case class Read(tpe: Type, collection: Encoded, key: Encoded) extends Item {
     override def toString: String = asString(collection) + "(" + asString(key) + ")"
 
     def substitute(substituter: Encoded => Encoded): Read = copy(
       collection = substituter(collection),
       key = substituter(key)
     )
+
+    def substitute(substituter: Encoded => Encoded, msubst: Map[Encoded, Matcher]): Read = substitute(substituter)
   }
 
   /** The keys at which the decompositions of collection types unfold their collection, e.g. `e` in
@@ -325,7 +314,7 @@ trait Templates
   private[unrolling] val decompositionKeys: MutableSet[Expr] = MutableSet.empty
 
   /** Represents an equality relation between two instances of a given type */
-  case class Equality(tpe: Type, e1: Encoded, e2: Encoded) {
+  case class Equality(tpe: Type, e1: Encoded, e2: Encoded) extends Item {
     override def toString: String =
       s"${asString(e1)} == ${asString(e2)} (of type ${tpe.asString})"
 
@@ -333,6 +322,8 @@ trait Templates
       e1 = substituter(e1),
       e2 = substituter(e2)
     )
+
+    def substitute(substituter: Encoded => Encoded, msubst: Map[Encoded, Matcher]): Equality = substitute(substituter)
 
     lazy val symbols: (Variable, Encoded) = equalitySymbol(tpe)
   }
@@ -386,10 +377,30 @@ trait Templates
   type Equalities = Map[Encoded, Set[Equality]]
   type Pointers   = Map[Encoded, Encoded]
 
+  /** The items of a template under their blockers. */
+  type Items      = Map[Encoded, Set[Item]]
+
+  extension (items: Items) {
+    /** The items that `select` picks, under their blockers. */
+    def ofKind[I](select: PartialFunction[Item, I]): Map[Encoded, Set[I]] = items.flatMap { case (b, is) =>
+      val selected = is.collect(select)
+      if (selected.isEmpty) None else Some(b -> selected)
+    }
+
+    def calls: Calls = ofKind { case c: Call => c }
+    def apps: Apps = ofKind { case a: App => a }
+    def matchers: Matchers = ofKind { case m: Matcher => m }
+    def reads: Reads = ofKind { case r: Read => r }
+    def equalities: Equalities = ofKind { case e: Equality => e }
+    def typings: Types = ofKind { case t: Typing => t }
+  }
+
+  /** The items of a map from blockers to items of one kind. */
+  def asItems[I <: Item](guarded: Map[Encoded, Set[I]]): Items = guarded.map { case (b, is) => b -> is.toSet[Item] }
+
   object TemplateContents {
     def empty(pathVar: (Variable, Encoded), args: Seq[(Variable, Encoded)]) =
-      TemplateContents(pathVar, args,
-        Map(), Map(), Map(), Seq(), Map(), Map(), Map(), Map(), Map(), Map(), Seq(), Seq(), Map())
+      TemplateContents(pathVar, args, Map(), Map(), Map(), Seq(), Map(), Seq(), Seq(), Map())
   }
 
   case class TemplateContents(
@@ -400,18 +411,19 @@ trait Templates
     val exprVars   : Map[Variable, Encoded],
     val condTree   : Map[Variable, Set[Variable]],
 
-    val clauses      : Clauses,
-    val types        : Types,
-    val blockers     : Calls,
-    val applications : Apps,
-    val matchers     : Matchers,
-    val reads        : Reads,
-    val equalities   : Equalities,
+    val clauses : Clauses,
+
+    /** The calls, applications, matchers, collection reads, equalities and typings under each blocker. */
+    val items   : Items,
 
     val lambdas         : Seq[LambdaTemplate],
     val quantifications : Seq[QuantificationTemplate],
 
-    val pointers : Pointers) {
+    val pointers : Pointers,
+
+    /** The failure literals of the body of a function or lambda, which define whether it fails
+      * (see [[Instantiation.itemClauses]]), or `None` if the template asserts that they don't hold. */
+    val failures : Option[Seq[Encoded]] = None) {
 
     lazy val args = arguments.map(_._2)
 
@@ -420,37 +432,27 @@ trait Templates
         pathVar._1 -> substituter(pathVar._2),
         arguments, condVars, exprVars, condTree,
         clauses.map(substituter),
-        types.map { case (b, tps) => substituter(b) -> tps.map(_.substitute(substituter, msubst)) },
-        blockers.map { case (b, fis) => substituter(b) -> fis.map(_.substitute(substituter, msubst)) },
-        applications.map { case (b, apps) => substituter(b) -> apps.map(_.substitute(substituter, msubst)) },
-        matchers.map { case (b, ms) => substituter(b) -> ms.map(_.substitute(substituter, msubst)) },
-        reads.map { case (b, rs) => substituter(b) -> rs.map(_.substitute(substituter)) },
-        equalities.map { case (b, eqs) => substituter(b) -> eqs.map(_.substitute(substituter)) },
+        items.map { case (b, is) => substituter(b) -> is.map(_.substitute(substituter, msubst)) },
         lambdas.map(_.substitute(substituter, msubst)),
         quantifications.map(_.substitute(substituter, msubst)),
-        pointers.map(p => substituter(p._1) -> substituter(p._2))
+        pointers.map(p => substituter(p._1) -> substituter(p._2)),
+        failures.map(_.map(substituter))
       )
 
-    def substitution(aVar: Encoded, args: Seq[Arg]): (Clauses, Map[Encoded, Arg]) =
-      substitution(aVar, (this.args zip args).toMap + (pathVar._2 -> Left(aVar)))
+    /** Instantiates the contents under `aVar`, where the arguments take the values `args`. */
+    def instantiation(aVar: Encoded, args: Seq[Arg]): Instantiation =
+      instantiation(aVar, (this.args zip args).toMap + (pathVar._2 -> Left(aVar)))
 
-    def substitution(aVar: Encoded, substMap: Map[Encoded, Arg]): (Clauses, Map[Encoded, Arg]) =
-      Template.substitution(condVars, exprVars, condTree, types, lambdas, quantifications, pointers, substMap, aVar)
-
-    def instantiate(substMap: Map[Encoded, Arg]): Clauses =
-      Template.instantiate(clauses, blockers, applications, matchers, reads, equalities, substMap)
+    /** Instantiates the contents under `aVar`, where `baseSubst` gives the values of their symbols. */
+    def instantiation(aVar: Encoded, baseSubst: Map[Encoded, Arg]): Instantiation =
+      new Instantiation(this, aVar, baseSubst)
 
     def merge(
       condVars   : Map[Variable, Encoded],
       exprVars   : Map[Variable, Encoded],
       condTree   : Map[Variable, Set[Variable]],
-      clauses      : Clauses,
-      types        : Types,
-      blockers     : Calls,
-      applications : Apps,
-      matchers     : Matchers,
-      reads        : Reads,
-      equalities   : Equalities,
+      clauses    : Clauses,
+      items      : Items,
       lambdas         : Seq[LambdaTemplate],
       quantifications : Seq[QuantificationTemplate],
       pointers : Pointers
@@ -461,15 +463,11 @@ trait Templates
       this.exprVars ++ exprVars,
       this.condTree `merge` condTree,
       this.clauses ++ clauses,
-      this.types `merge` types,
-      this.blockers `merge` blockers,
-      this.applications `merge` applications,
-      this.matchers `merge` matchers,
-      this.reads `merge` reads,
-      this.equalities `merge` equalities,
+      this.items `merge` items,
       this.lambdas ++ lambdas,
       this.quantifications ++ quantifications,
-      this.pointers ++ pointers
+      this.pointers ++ pointers,
+      this.failures
     )
   }
 
@@ -478,14 +476,14 @@ trait Templates
 
     lazy val start = contents.pathVar._2
 
-    def instantiate(aVar: Encoded, args: Seq[Arg]): Clauses = {
-      val (clauses, substMap) = contents.substitution(aVar, args)
-      clauses ++ instantiate(substMap)
-    }
+    def instantiate(aVar: Encoded, args: Seq[Arg]): Clauses =
+      instantiate(contents.instantiation(aVar, args))
 
-    protected def instantiate(substMap: Map[Encoded, Arg]): Clauses = {
-      contents.instantiate(substMap)
-    }
+    /** Instantiates the body of a function or lambda, which fails iff `failure` holds. */
+    def instantiate(aVar: Encoded, args: Seq[Arg], failure: Encoded): Clauses =
+      contents.instantiation(aVar, args).clauses(failure = Some(failure))
+
+    protected def instantiate(instantiation: Instantiation): Clauses = instantiation.clauses()
 
     override def toString : String = "Instantiated template"
   }
@@ -524,7 +522,7 @@ trait Templates
       * templates are equal, then they must necessarily be equal in every model.
       *
       * The [[instantiation]] consists of the clause set instantiation (in the sense of
-      * [[Template.instantiate]] that is required for [[dependencies]] to make sense in the solver
+      * [[Instantiation]] that is required for [[dependencies]] to make sense in the solver
       * (introduces blockers, lambdas, quantifications, etc.) Since [[dependencies]] CHANGE during
       * instantiation and [[key]] makes no sense without the associated instantiation, the implicit
       * contract here is that whenever a new key appears during unfolding, its associated
@@ -541,12 +539,11 @@ trait Templates
       * constructing [[locals]].
       */
     lazy val (key, instantiation, locals, instantiationSubst) = {
-      val (substClauses, substMap) = contents.substitution(contents.pathVar._2, Map.empty[Encoded, Arg])
-      val tmplClauses = contents.instantiate(substMap)
-      val instantiation = substClauses ++ tmplClauses
+      val inst = contents.instantiation(contents.pathVar._2, Map.empty[Encoded, Arg])
+      val instantiation = inst.clauses()
+      val substMap = inst.substMap
 
-      val substituter = mkSubstituter(substMap.view.mapValues(_.encoded).toMap)
-      val deps = dependencies.map(substituter)
+      val deps = dependencies.map(inst.substituter)
       val key = (body, blockerPath(contents.pathVar._2), deps)
 
       val sortedDeps = exprOps.variablesOf(body).toSeq.sortBy(_.id)
@@ -604,12 +601,20 @@ trait Templates
       pointers.map(p => encoder(p._1) -> encoder(p._2))
     }
 
+    /** The calls, applications, matchers and collection reads of an expression, and its lambda pointers. */
+    case class ExtractedCalls(items: Set[Item], pointers: Pointers)
+
+    /** The encoding of [[TemplateClauses]]: the encoded clauses and the items under each blocker,
+      * i.e. the calls, applications, matchers and collection reads of the clauses, and their
+      * equalities and typings (see [[encode]]). */
+    case class Encoding(clauses: Clauses, items: Items, pointers: Pointers, stringRepr: () => String)
+
     def extractCalls(
       expr: Expr,
       substMap: Map[Variable, Encoded] = Map.empty[Variable, Encoded],
       optCall: Option[(Callee, Seq[Arg])] = None,
       optApp: Option[App] = None
-    ): (Set[Call], Set[App], Set[Matcher], Set[Read], Pointers) = {
+    ): ExtractedCalls = {
       val encoder : Expr => Encoded = mkEncoder(substMap)
 
       val pointers = lambdaPointers(encoder)(expr)
@@ -709,8 +714,12 @@ trait Templates
         case _ => Set.empty
       } (expr)
 
-      (calls, apps, matchers, reads, pointers)
+      ExtractedCalls(calls.toSet[Item] ++ apps ++ matchers ++ reads, pointers)
     }
+
+    /** The failure literals among the expression variables of a template (see [[failureSymbols]]). */
+    def failures(exprVars: Map[Variable, Encoded]): Seq[Encoded] =
+      exprVars.toSeq.collect { case (v, vT) if failureSymbols(v) => vT }
 
     def encode(
       pathVar: (Variable, Encoded),
@@ -718,13 +727,15 @@ trait Templates
       tmplClauses: TemplateClauses,
       substMap: Map[Variable, Encoded] = Map.empty[Variable, Encoded],
       optCall: Option[Callee] = None,
-      optApp: Option[(Encoded, FunctionType)] = None
-    ): (Clauses, Calls, Apps, Matchers, Reads, Pointers, () => String) = {
-      val (condVars, exprVars, _, guardedExprs, eqs, _, equalities, lambdas, quants) = tmplClauses
+      optApp: Option[(Encoded, FunctionType)] = None,
+      partial: Boolean = false
+    ): Encoding = {
+      import tmplClauses.{condVars, exprVars, guardedExprs, equations => eqs, lambdas, quantifications => quants}
+      val equals = tmplClauses.equalities
 
       val idToTrId : Map[Variable, Encoded] =
         condVars ++ exprVars + pathVar ++ arguments ++ substMap ++
-        lambdas.map(_.ids) ++ quants.flatMap(_.mapping) ++ equalities.flatMap(_._2.map(_.symbols)) ++
+        lambdas.map(_.ids) ++ quants.flatMap(_.mapping) ++ equals.flatMap(_._2.map(_.symbols)) ++
         typesManager.tpSubst ++ uninterpretedSubst
       val encoder: Expr => Encoded = mkEncoder(idToTrId)
 
@@ -733,35 +744,21 @@ trait Templates
         App(idT, tpe, arguments.map(p => Left(p._2)), mkApp(idT, tpe, arguments.map(_._2)))
       }
 
-      val (clauses, blockers, applications, matchers, reads, pointers) = {
-        var clauses      : Clauses = Seq.empty
-        var blockers     : Map[Encoded, Set[Call]]     = Map.empty
-        var applications : Map[Encoded, Set[App]]      = Map.empty
-        var matchers     : Map[Encoded, Set[Matcher]]  = Map.empty
-        var reads        : Reads                       = Map.empty
-        var pointers     : Map[Encoded, Encoded]       = Map.empty
+      val (clauses, items, pointers) = {
+        var clauses  : Clauses  = Seq.empty
+        var items    : Items    = asItems(tmplClauses.types) `merge` asItems(equals)
+        var pointers : Pointers = Map.empty
 
         val pv = pathVar._1
         for ((b,es) <- guardedExprs `merge` Map(pv -> eqs)) {
-          var calls  : Set[Call]     = Set.empty
-          var apps   : Set[App]      = Set.empty
-          var matchs : Set[Matcher]  = Set.empty
-          var rds    : Set[Read]     = Set.empty
-          val bp = idToTrId(b)
-
+          var bItems : Set[Item] = Set.empty
           for (e <- es) {
-            val (eCalls, eApps, eMatchers, eReads, ePtrs) = extractCalls(e, idToTrId, optIdCall, optIdApp)
-            calls ++= eCalls
-            apps ++= eApps
-            matchs ++= eMatchers
-            rds ++= eReads
-            pointers ++= ePtrs
+            val extracted = extractCalls(e, idToTrId, optIdCall, optIdApp)
+            bItems ++= extracted.items
+            pointers ++= extracted.pointers
           }
 
-          if (calls.nonEmpty) blockers += bp -> calls
-          if (apps.nonEmpty) applications += bp -> apps
-          if (matchs.nonEmpty) matchers += bp -> matchs
-          if (rds.nonEmpty) reads += bp -> rds
+          if (bItems.nonEmpty) items = items `merge` Map(idToTrId(b) -> bItems)
         }
 
         for (e <- guardedExprs.getOrElse(pv, Seq.empty)) {
@@ -771,10 +768,15 @@ trait Templates
         clauses ++= (for ((b,es) <- guardedExprs; e <- es) yield encoder(Implies(b, e)))
         clauses ++= eqs.map(encoder)
 
-        (clauses, blockers, applications, matchers, reads, pointers)
+        // The failure literals of the body of a function or lambda define whether it fails (see
+        // [[Instantiation.itemClauses]]), while other templates assert that they don't hold
+        if (!partial) clauses ++= failures(exprVars).map(mkNot)
+
+        (clauses, items, pointers)
       }
 
       val stringRepr : () => String = () => {
+        val (blockers, applications, matchers, reads) = (items.calls, items.apps, items.matchers, items.reads)
         " * Activating boolean : " + pathVar._1.asString + "\n" +
         " * Control booleans   : " + condVars.keys.map(_.asString).mkString(", ") + "\n" +
         " * Expression vars    : " + exprVars.keys.map(_.asString).mkString(", ") + "\n" +
@@ -801,7 +803,7 @@ trait Templates
         }.mkString("\n")
       }
 
-      (clauses, blockers, applications, matchers, reads, pointers, stringRepr)
+      Encoding(clauses, items, pointers, stringRepr)
     }
 
     def contents(
@@ -810,56 +812,74 @@ trait Templates
       tmplClauses: TemplateClauses,
       substMap: Map[Variable, Encoded] = Map.empty,
       optCall: Option[Callee] = None,
-      optApp: Option[(Encoded, FunctionType)] = None
+      optApp: Option[(Encoded, FunctionType)] = None,
+      partial: Boolean = false
     ): (TemplateContents, () => String) = {
 
-      val (condVars, exprVars, condTree, types, equalities, lambdas, quants) = tmplClauses.proj
-      val (clauses, blockers, applications, matchers, reads, pointers, string) = Template.encode(
-        pathVar, arguments, tmplClauses, substMap = substMap, optCall = optCall, optApp = optApp)
+      val encoding = Template.encode(
+        pathVar, arguments, tmplClauses, substMap = substMap, optCall = optCall, optApp = optApp, partial = partial)
 
       val contents = TemplateContents(
-        pathVar, arguments, condVars, exprVars, condTree,
-        clauses, types, blockers, applications, matchers, reads, equalities,
-        lambdas, quants, pointers
+        pathVar, arguments, tmplClauses.condVars, tmplClauses.exprVars, tmplClauses.condTree,
+        encoding.clauses, encoding.items, tmplClauses.lambdas, tmplClauses.quantifications, encoding.pointers,
+        if (partial) Some(failures(tmplClauses.exprVars)) else None
       )
 
-      (contents, string)
+      (contents, encoding.stringRepr)
     }
 
-    def substitution(
-      condVars: Map[Variable, Encoded],
-      exprVars: Map[Variable, Encoded],
-      condTree: Map[Variable, Set[Variable]],
-      types: Types,
-      lambdas: Seq[LambdaTemplate],
-      quants: Seq[QuantificationTemplate],
-      pointers: Map[Encoded, Encoded],
-      baseSubst: Map[Encoded, Arg],
-      aVar: Encoded
-    ): (Clauses, Map[Encoded, Arg]) = {
+  }
 
-      val freshSubst = exprVars.map { case (v, vT) => vT -> encodeSymbol(v) } ++
-                       freshConds(aVar, condVars, condTree)
+  /** The instantiation of the contents of a template under the blocker `aVar`, where `baseSubst`
+    * gives the values of the arguments (and of the start blocker of the contents).
+    *
+    * Instantiation proceeds in two stages. Creating an [[Instantiation]] runs the substitution
+    * stage, which builds [[substMap]] by
+    *  1. giving fresh symbols to the expression and condition variables,
+    *  2. instantiating the typings, which registers functions before the matchers of the
+    *     quantifications are instantiated,
+    *  3. instantiating the lambdas, in the order of their dependencies,
+    *  4. instantiating the quantifications, the positive ones last, and
+    *  5. registering the lambda pointers.
+    *
+    * [[clauses]] then runs the item stage, which instantiates
+    *  6. the calls and applications, which define whether the template fails, and then
+    *  7. the matchers, collection reads and equalities.
+    */
+  final class Instantiation private[unrolling] (
+    contents: TemplateContents,
+    aVar: Encoded,
+    baseSubst: Map[Encoded, Arg]
+  ) {
+    private val matcherSubst = baseSubst.collect { case (c, Right(m)) => c -> m }
+    private var subst: Map[Encoded, Arg] = baseSubst
+    private val buffer = new scala.collection.mutable.ListBuffer[Encoded]
 
-      val matcherSubst = baseSubst.collect { case (c, Right(m)) => c -> m }
+    private def substitution: Map[Encoded, Encoded] = subst.view.mapValues(_.encoded).toMap
 
-      var subst = freshSubst.view.mapValues(Left(_)).toMap ++ baseSubst
-      var clauses : Clauses = Seq.empty
+    private def freshSymbols(): Unit = {
+      val freshSubst = contents.exprVars.map { case (v, vT) => vT -> encodeSymbol(v) } ++
+                       freshConds(aVar, contents.condVars, contents.condTree)
+      subst = freshSubst.view.mapValues(Left(_)).toMap ++ baseSubst
+    }
 
-      // We instantiate types before quantifications in order to register functions
-      // before trying to instantiate matchers introduced by quantifications
-      val baseSubstituter = mkSubstituter(subst.view.mapValues(_.encoded).toMap)
-      for ((b, tps) <- types if !abort; bp = baseSubstituter(b); tp <- tps if !abort) {
-        clauses ++= instantiateType(bp, tp.substitute(baseSubstituter, matcherSubst))
+    // We instantiate types before quantifications in order to register functions
+    // before trying to instantiate matchers introduced by quantifications
+    private def typings(): Unit = {
+      val substituter = mkSubstituter(substitution)
+      for ((b, tps) <- contents.items.typings if !abort; bp = substituter(b); tp <- tps if !abort) {
+        buffer ++= instantiateType(bp, tp.substitute(substituter, matcherSubst))
       }
+    }
 
-      // /!\ CAREFUL /!\
-      // We have to be wary while computing the lambda subst map since lambdas can
-      // depend on each other. However, these dependencies cannot be cyclic so it
-      // suffices to make sure the traversal order is correct.
+    // /!\ CAREFUL /!\
+    // We have to be wary while computing the lambda subst map since lambdas can
+    // depend on each other. However, these dependencies cannot be cyclic so it
+    // suffices to make sure the traversal order is correct.
+    private def lambdas(): Unit = {
       var seen : Set[LambdaTemplate] = Set.empty
 
-      val lambdaKeys = lambdas.map(lambda => lambda.ids._2 -> lambda).toMap
+      val lambdaKeys = contents.lambdas.map(lambda => lambda.ids._2 -> lambda).toMap
       def extractSubst(lambda: LambdaTemplate): Unit = {
         for {
           dep <- lambda.closures.map(_._2) flatMap lambdaKeys.get
@@ -867,69 +887,123 @@ trait Templates
         } extractSubst(dep)
 
         if (!seen(lambda)) {
-          val substMap = subst.view.mapValues(_.encoded).toMap
-          val substLambda = lambda.substitute(mkSubstituter(substMap), matcherSubst)
+          val substLambda = lambda.substitute(mkSubstituter(substitution), matcherSubst)
           val (idT, cls) = instantiateLambda(substLambda)
           subst += lambda.ids._2 -> Left(idT)
-          clauses ++= cls
+          buffer ++= cls
           seen += lambda
         }
       }
 
-      for (l <- lambdas) extractSubst(l)
-
-      // instantiate positive quantifications last to avoid introducing
-      // extra quantifier instantiations that arise due to empty domains
-      val (others, positives) = quants.partition(_.polarity.isNegative)
-      for (q <- others ++ positives) {
-        val substMap = subst.view.mapValues(_.encoded).toMap
-        val substQuant = q.substitute(mkSubstituter(substMap), matcherSubst)
-        val (map, cls) = instantiateQuantification(substQuant)
-        subst ++= map.view.mapValues(Left(_)).toMap
-        clauses ++= cls
-      }
-
-      val substituter = mkSubstituter(subst.view.mapValues(_.encoded).toMap)
-      for ((ptr, lambda) <- pointers) {
-        registerLambda(substituter(ptr), substituter(lambda))
-      }
-
-      (clauses, subst)
+      for (l <- contents.lambdas) extractSubst(l)
     }
 
-    def instantiate(
-      clauses: Clauses,
-      calls: Calls,
-      apps: Apps,
-      matchers: Matchers,
-      reads: Reads,
-      equalities: Equalities,
-      substMap: Map[Encoded, Arg]
+    // instantiate positive quantifications last to avoid introducing
+    // extra quantifier instantiations that arise due to empty domains
+    private def quantifications(): Unit = {
+      val (others, positives) = contents.quantifications.partition(_.polarity.isNegative)
+      for (q <- others ++ positives) {
+        val substQuant = q.substitute(mkSubstituter(substitution), matcherSubst)
+        val (map, cls) = instantiateQuantification(substQuant)
+        subst ++= map.view.mapValues(Left(_)).toMap
+        buffer ++= cls
+      }
+    }
+
+    private def pointers(): Unit = {
+      val substituter = mkSubstituter(substitution)
+      for ((ptr, lambda) <- contents.pointers) {
+        registerLambda(substituter(ptr), substituter(lambda))
+      }
+    }
+
+    freshSymbols()
+    typings()
+    lambdas()
+    quantifications()
+    pointers()
+
+    /** The clauses of the substitution stage. */
+    val substClauses: Clauses = buffer.toSeq
+
+    /** The values of the symbols of the contents. */
+    val substMap: Map[Encoded, Arg] = subst
+
+    lazy val substituter: Encoded => Encoded = mkSubstituter(substitution)
+    lazy val msubst: Map[Encoded, Matcher] = substMap.collect { case (c, Right(m)) => c -> m }
+
+    /** The clauses of both stages (see [[itemClauses]]). */
+    def clauses(
+      failure: Option[Encoded] = None,
+      exempt: App => Boolean = _ => false,
+      onMatcher: (Encoded, Matcher) => Clauses = instantiateMatcher(_, _),
+      onEquality: (Encoded, Equality) => Clauses = instantiateEquality(_, _)
+    ): Clauses = substClauses ++ itemClauses(failure, exempt, onMatcher, onEquality)
+
+    /** Instantiates the clauses and the items of the contents under their blockers: first the calls
+      * and applications, then the matchers, collection reads and equalities.
+      *
+      * The body of a function or lambda fails iff `failure` holds, while other templates assert
+      * that their failure literals don't hold. The applications that `exempt` picks may fail. The
+      * templates that handle matchers or equalities differently pass `onMatcher` or `onEquality`,
+      * which receive these items under their substituted blockers. */
+    def itemClauses(
+      failure: Option[Encoded] = None,
+      exempt: App => Boolean = _ => false,
+      onMatcher: (Encoded, Matcher) => Clauses = instantiateMatcher(_, _),
+      onEquality: (Encoded, Equality) => Clauses = instantiateEquality(_, _)
     ): Clauses = {
-      val substituter : Encoded => Encoded = mkSubstituter(substMap.view.mapValues(_.encoded).toMap)
-      val msubst = substMap.collect { case (c, Right(m)) => c -> m }
+      val literals = contents.failures.getOrElse(Seq.empty)
 
       val allClauses = new scala.collection.mutable.ListBuffer[Encoded]
-      allClauses ++= clauses.map(substituter)
+      if (failure.isEmpty) allClauses ++= literals.map(f => mkNot(substituter(f)))
+      allClauses ++= contents.clauses.map(substituter)
 
-      for ((b, fis) <- calls if !abort; bp = substituter(b); fi <- fis if !abort) {
-        allClauses ++= instantiateCall(bp, fi.substitute(substituter, msubst))
+      // Applies `f` to the items that `select` picks, under their substituted blockers
+      def each[I](select: PartialFunction[Item, I])(f: (Encoded, I) => Unit): Unit =
+        for ((b, is) <- contents.items if !abort; bp = substituter(b); i <- is.collect(select) if !abort) f(bp, i)
+
+      // The calls and applications that may fail, under their blockers
+      val failing = new scala.collection.mutable.ListBuffer[Encoded]
+      def mayFail(b: Encoded, fails: => Encoded): Unit = if (partialFunctions) {
+        if (failure.isDefined) failing += mkAnd(b, fails) else allClauses += mkImplies(b, mkNot(fails))
       }
 
-      for ((b,fas) <- apps if !abort; bp = substituter(b); fa <- fas if !abort) {
-        allClauses ++= instantiateApp(bp, fa.substitute(substituter, msubst))
+      each { case c: Call => c } { (bp, fi) =>
+        val call = fi.substitute(substituter, msubst)
+        mayFail(bp, callFailure(call))
+        allClauses ++= instantiateCall(bp, call)
       }
 
-      for ((b, matchs) <- matchers if !abort; bp = substituter(b); m <- matchs if !abort) {
-        allClauses ++= instantiateMatcher(bp, m.substitute(substituter, msubst))
+      each { case a: App => a } { (bp, fa) =>
+        val app = fa.substitute(substituter, msubst)
+        if (!exempt(app)) mayFail(bp, appFailure(app))
+        allClauses ++= instantiateApp(bp, app)
       }
 
-      for ((b, rs) <- reads if !abort; bp = substituter(b); r <- rs if !abort) {
+      // The body of a function or lambda fails iff one of its failure literals holds, or one of the
+      // calls and applications on its paths fails
+      for (self <- failure if partialFunctions) {
+        val sources = literals.map(substituter) ++ failing
+        val fails = sources match {
+          case Seq() => falseT
+          case Seq(source) => source
+          case _ => mkOr(sources.toSeq*)
+        }
+        allClauses += mkImplies(substituter(contents.pathVar._2), mkEquals(self, fails))
+      }
+      allClauses ++= newFailureDefinitions()
+
+      each { case m: Matcher => m } { (bp, m) =>
+        allClauses ++= onMatcher(bp, m.substitute(substituter, msubst))
+      }
+
+      each { case r: Read => r } { (bp, r) =>
         allClauses ++= instantiateRead(bp, r.substitute(substituter))
       }
 
-      for ((b, eqs) <- equalities if !abort; bp = substituter(b); e <- eqs if !abort) {
-        allClauses ++= instantiateEquality(bp, e.substitute(substituter))
+      each { case e: Equality => e } { (bp, e) =>
+        allClauses ++= onEquality(bp, e.substitute(substituter))
       }
 
       allClauses.toSeq
@@ -938,22 +1012,17 @@ trait Templates
 
   private def instantiate(
     bindings: Map[Variable, Encoded],
-    gen: (Variable, Encoded) => TemplateClauses
+    gen: (Variable, Encoded) => TemplateClauses,
+    exempt: App => Boolean = _ => false
   ): Clauses = {
     val start = Variable.fresh("start", BooleanType(), true)
     val encodedStart = encodeSymbol(start)
 
     val tmplClauses = gen(start, encodedStart)
 
-    val (clauses, calls, apps, matchers, reads, pointers, _) =
-      Template.encode(start -> encodedStart, bindings.toSeq, tmplClauses)
-
-    val (condVars, exprVars, condTree, types, equalities, lambdas, quants) = tmplClauses.proj
-    val (substClauses, substMap) = Template.substitution(
-      condVars, exprVars, condTree, types, lambdas, quants, pointers, Map.empty, encodedStart)
-
-    val templateClauses = Template.instantiate(clauses, calls, apps, matchers, reads, equalities, substMap)
-    val allClauses = encodedStart +: (substClauses ++ templateClauses)
+    val (contents, _) = Template.contents(start -> encodedStart, bindings.toSeq, tmplClauses)
+    val allClauses = encodedStart +:
+      contents.instantiation(encodedStart, Map.empty[Encoded, Arg]).clauses(exempt = exempt)
 
     for (cl <- allClauses) {
       reporter.debug("  . " + cl)
@@ -975,8 +1044,10 @@ trait Templates
 
   /** Instantiates a distinguishing input for the first-class functions `f1` and `f2` of type `tpe`.
     *
-    * Fresh witness arguments `ws` are introduced such that `f1(ws) != f2(ws)` holds whenever
-    * `guard` holds and `f1 != f2`. The witnesses are typed as free variables, so function-typed
+    * Fresh witness arguments `ws` are introduced such that `f1` and `f2` differ on `ws` whenever
+    * `guard` holds and `f1 != f2`: one of `f1(ws)` and `f2(ws)` fails and the other doesn't, or
+    * neither fails and `f1(ws) != f2(ws)`. The applications on `ws` are the only ones whose failure
+    * the witness doesn't exclude. The witnesses are typed as free variables, so function-typed
     * witnesses are themselves registered as free functions (and will in turn receive witnesses).
     *
     * @see [[LambdaTemplates]] for a discussion of how these witnesses are used.
@@ -986,27 +1057,42 @@ trait Templates
     val v2 = Variable.fresh("g", tpe, true)
     val ws = tpe.from.map(tp => Variable.fresh("w", tp, true))
     val bindings = Map(v1 -> f1, v2 -> f2) ++ ws.map(w => w -> encodeSymbol(w))
-    lambdasManager.witnessArguments ++= ws.map(bindings)
-    lambdasManager.witnessInputs += (f1 -> f2) -> (tpe, ws.map(bindings))
+    witnessState.witnessArguments ++= ws.map(bindings)
+    witnessState.witnessInputs += (f1 -> f2) -> (tpe, ws.map(bindings))
 
     // the compared functions have already been typed where they were registered
     declared += v1 -> f1
     declared += v2 -> f2
 
-    val clauses = instantiate(bindings, { (start, encodedStart) =>
-      val substMap = bindings + (start -> encodedStart)
-      val tmplClauses = mkClauses0(start, Not(Equals(Application(v1, ws), Application(v2, ws))), substMap, polarity = Some(true))
+    // whether the results of the applications on `ws` differ
+    val differ = Variable.fresh("differ", BooleanType(), true)
+    val differT = encodeSymbol(differ)
+    val wsT = ws.map(bindings)
+    // Only extensional equality observes where functions fail (see [[partialFunctions]]). Without
+    // function equality, distinguishing inputs only tell apart the functions of models, whose tests
+    // can't observe failures (applying a function where it fails fails the test).
+    val partial = partialFunctions
+    def isWitnessApp(app: App): Boolean = partial &&
+      (app.caller == f1 || app.caller == f2) && app.tpe == tpe && app.args.map(_.encoded) == wsT
+
+    val clauses = instantiate(bindings + (differ -> differT), { (start, encodedStart) =>
+      val substMap = bindings + (differ -> differT) + (start -> encodedStart)
+      val tmplClauses = mkClauses0(start,
+        Equals(differ, Not(Equals(Application(v1, ws), Application(v2, ws)))), substMap)
       val tpeClauses = ws.map { w =>
         declared += w -> bindings(w)
         mkClauses1(start, w.tpe, w, substMap)(using FreeGenerator)
       }
 
-      tpeClauses.foldLeft(tmplClauses)(_ +++ _)
-    })
+      tpeClauses.foldLeft(tmplClauses)(_ ++ _)
+    }, isWitnessApp)
 
     // `instantiate` asserts the start blocker, which we replace with the witness condition
     val encodedStart +: rest = clauses: @unchecked
-    mkEquals(encodedStart, mkAnd(guard, mkNot(mkEquals(f1, f2)))) +: rest
+    val (err1, err2) = (appFailure(f1, tpe, wsT), appFailure(f2, tpe, wsT))
+    val distinguished = if (!partial) differT else mkOr(mkNot(mkEquals(err1, err2)), mkAnd(mkNot(err1), mkNot(err2), differT))
+    (mkEquals(encodedStart, mkAnd(guard, mkNot(mkEquals(f1, f2)))) +: mkImplies(encodedStart, distinguished) +: rest) ++
+      newFailureDefinitions()
   }
 
   def instantiateExpr(expr: Expr, bindings: Map[Variable, Encoded]): Clauses = {
@@ -1019,7 +1105,7 @@ trait Templates
         mkClauses1(start, v.tpe, v, bindings + (start -> encodedStart))(using FreeGenerator)
       }
 
-      tpeClauses.foldLeft(tmplClauses)(_ +++ _)
+      tpeClauses.foldLeft(tmplClauses)(_ ++ _)
     })
   }
 }
