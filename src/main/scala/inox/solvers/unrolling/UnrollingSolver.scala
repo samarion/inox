@@ -1174,6 +1174,13 @@ abstract class AbstractUnrollingSolver private
 
     object CheckResult {
       def cast(resp: Response): CheckResult = {
+        // the last check that the underlying solver answered is the one that proves the query
+        resp match {
+          case _: Unsatisfiable =>
+            val dir = context.options.findOptionOrDefault(optLeanProofs)
+            if (dir.nonEmpty) ProofProducingSolver.write(underlying, dir)(using context)
+          case _ =>
+        }
         // unsat assumptions may have been requested internally (eg. for witness assumptions)
         val res = resp match {
           case _: Unsatisfiable if !config.withUnsatAssumptions => Unsat
