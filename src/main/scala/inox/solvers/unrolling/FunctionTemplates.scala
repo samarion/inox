@@ -96,7 +96,7 @@ trait FunctionTemplates { self: Templates =>
       }
 
       val (contents0, str) = Template.contents(
-        pathVar, arguments, tmplClauses, optCall = Some(Defined(tfd)))
+        pathVar, arguments, tmplClauses, optCall = Some(Defined(tfd)), partial = true)
       val contents = contents0.copy(clauses = contents0.clauses ++ rankClauses(tfd, contents0, bodySites))
 
       val funString : () => String = () => {
@@ -112,6 +112,14 @@ trait FunctionTemplates { self: Templates =>
   }
 
   private val rankCache: MutableMap[TypedFunDef, Variable] = MutableMap.empty
+
+  /** Whether some call may reach itself on the same arguments (see `rankClauses`). The search for
+    * models assumes that it doesn't, and proofs don't, so neither relies on a call diverging. */
+  private lazy val diverges: Encoded = {
+    rankedCalls = true
+    encodeSymbol(Variable.fresh("diverges", BooleanType(), true))
+  }
+  private var rankedCalls = false
   private val rankSymbols: MutableMap[Variable, Encoded] = MutableMap.empty
 
   /** The rank of the call `tfd(args)`: an uninterpreted integer function of the arguments. */
@@ -131,10 +139,18 @@ trait FunctionTemplates { self: Templates =>
     * A call that returns a value has a finite evaluation, so ranking each call by the depth of its
     * evaluation satisfies these clauses. A call that reaches itself, possibly through other calls,
     * on the same arguments never returns, as evaluation is deterministic: the ranks along the cycle
-    * can't decrease, so the paths that close the cycle are infeasible. Without these clauses, the
-    * equations of the calls on such a cycle, e.g. `f(x) = g(x)` and `g(x) = f(x)`, would be
-    * satisfied by any value once every call on it is unfolded. This includes `f(x) = f(x)` for
+    * can't decrease. Without these clauses, the equations of the calls on such a cycle, e.g.
+    * `f(x) = g(x)` and `g(x) = f(x)`, would be satisfied by any value once every call on it is
+    * unfolded, and models could rely on these values. This includes `f(x) = f(x)` for
     * `def f(x) = f(x)`, whose body call is dropped from the template (see `Template.extractCalls`).
+    *
+    * The clauses only hold unless `diverges` does, which the search for models assumes not to hold,
+    * so that models never take the paths that close a cycle, but proofs don't: a query whose answer
+    * depends on a call diverging is neither satisfiable nor refuted, as the evaluator can't tell
+    * either, and the solver answers `Unknown`.
+    *
+    * Under `optAssumeChecked`, the front-end has checked that functions are total, so every call
+    * returns and the clauses hold unconditionally, in proofs as well.
     *
     * Only the calls of the body are ranked: the evaluator doesn't evaluate the calls in type checks,
     * and those in lambdas and quantifiers belong to their own templates. */
@@ -149,7 +165,8 @@ trait FunctionTemplates { self: Templates =>
     ranked.flatMap { case (b, fi, callee) =>
       // Calls whose arguments mention symbols that the template doesn't bind aren't ranked
       if (!exprOps.variablesOf(callee).forall(allSymbols.contains)) Seq.empty
-      else Seq(encoder(Implies(b, GreaterThan(self, callee))))
+      else if (assumeChecked) Seq(mkImplies(encoder(b), encoder(GreaterThan(self, callee))))
+      else Seq(mkImplies(encoder(b), mkOr(encoder(GreaterThan(self, callee)), diverges)))
     }
   }
 
@@ -171,7 +188,7 @@ trait FunctionTemplates { self: Templates =>
       val (p, clauses) = mkExprClauses(start, interpreted, substMap)
       val tmplClauses = clauses + (start -> Equals(Application(callee.function, args), p))
 
-      val (contents, str) = Template.contents(pathVar, arguments, tmplClauses, optCall = Some(callee))
+      val (contents, str) = Template.contents(pathVar, arguments, tmplClauses, optCall = Some(callee), partial = true)
       val res = new FunctionTemplate(contents, () => "Template for the interpretation of " + callee.signature + " is :\n" + str())
       cache(callee) = res
       res
@@ -292,7 +309,8 @@ trait FunctionTemplates { self: Templates =>
       if (callInfos.isEmpty) None
       else Some(callInfos.values.map(_._1).min)
 
-    def satisfactionAssumptions: Seq[Encoded] = callInfos.map(_._2._3).toSeq
+    def satisfactionAssumptions: Seq[Encoded] =
+      callInfos.map(_._2._3).toSeq ++ (if (rankedCalls) Seq(mkNot(diverges)) else Seq.empty)
     def refutationAssumptions: Seq[Encoded] = Seq.empty
 
     def promoteBlocker(b: Encoded): Boolean = {
@@ -339,7 +357,7 @@ trait FunctionTemplates { self: Templates =>
 
             callee match {
               case interpreted: Interpreted =>
-                newCls ++= InterpretedTemplate(interpreted).instantiate(defBlocker, args)
+                newCls ++= InterpretedTemplate(interpreted).instantiate(defBlocker, args, callFailure(call))
               case Defined(tfd) =>
                 // Ground calls are evaluated rather than unfolded, and unfolded when evaluation fails. A call is
                 // blocked if a ground argument that runs no functions gets stuck (e.g. `nil.tail`).
@@ -386,17 +404,20 @@ trait FunctionTemplates { self: Templates =>
                     start -> defBlocker,
                     tfd.params.map(_.toVariable) zip args.map(_.encoded),
                     tmplClauses,
-                    optCall = Some(Defined(tfd))
+                    optCall = Some(Defined(tfd)),
+                    partial = true
                   )
 
                   val (clauses, calls, apps, matchers, reads, pointers, _) = encoding
                   val (condVars, exprVars, condTree, types, equalities, lambdas, quants) = tmplClauses.proj
                   val (substClauses, substMap) = Template.substitution(
                     condVars, exprVars, condTree, types, lambdas, quants, pointers, Map.empty, defBlocker)
-                  val templateClauses = Template.instantiate(clauses, calls, apps, matchers, reads, equalities, substMap)
+                  val failure = (defBlocker, callFailure(call), Template.failures(exprVars))
+                  val templateClauses = Template.instantiate(
+                    clauses, calls, apps, matchers, reads, equalities, substMap, Some(failure))
                   substClauses ++ templateClauses
                 } getOrElse {
-                  FunctionTemplate(tfd).instantiate(defBlocker, args ++ tpSubst)
+                  FunctionTemplate(tfd).instantiate(defBlocker, args ++ tpSubst, callFailure(call))
                 }
             }
 
