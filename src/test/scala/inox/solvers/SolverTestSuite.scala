@@ -66,7 +66,6 @@ object SolverTestSuite {
     def supports(features: Seq[Feature]): Boolean = features.forall(f => !unsupported(f))
   }
 
-  private val z3BagUnionModels = "Z3 models leave equalities between bag unions unevaluated"
   private val cvcKnownIssues = Map(
     "Map Merges" -> "returns Unknown on the quantified axiom that encodes merges",
   )
@@ -83,14 +82,11 @@ object SolverTestSuite {
     */
   val solvers: Seq[SolverInfo] = Seq(
     SolverInfo("nativez3", () => SolverFactory.hasNativeZ3,
-      Set(FloatingPoint, Reset),
-      groundOnly = Map("Bag Operations" -> z3BagUnionModels)),
+      Set(FloatingPoint, Reset)),
     SolverInfo("unrollz3", () => SolverFactory.hasNativeZ3,
-      Set(FloatingPoint, Reset),
-      groundOnly = Map("Bag Operations" -> z3BagUnionModels)),
+      Set(FloatingPoint, Reset)),
     SolverInfo("smt-z3", () => SolverFactory.hasZ3,
-      Set(),
-      groundOnly = Map("Bag Operations" -> z3BagUnionModels)),
+      Set()),
     SolverInfo("smt-cvc4", () => SolverFactory.hasCVC4,
       Set(FloatingPoint, BagAlgebra, NestedArrays),
       knownIssues = cvcKnownIssues,
@@ -106,9 +102,6 @@ object SolverTestSuite {
       Set(FloatingPoint, Sets, BagAlgebra, Maps, NestedArrays, Reset),
       // Times out on conjunctions of string checks that it solves quickly one by one
       batchSize = 1,
-      groundOnly = Map(
-        "BigInt Division and Modulo" -> "throws on division by a variable, which Presburger arithmetic lacks",
-      ),
       knownIssues = Map(
         "Simple Bag Operations" -> "struggles with bit-vector keys in bags, as in sets and maps",
         "Bag with several multiplicities" -> "returns Unknown after about two minutes",
@@ -259,6 +252,10 @@ trait SolverTestSuite extends AnyFunSuite with org.scalatest.ParallelTestExecuti
   /** Registers `body` once per solver that supports all of `requires`. */
   protected def test(name: String, requires: Feature*)(body: Context => Unit): Unit =
     register(name, solverInfos.filter(_.supports(requires)))(body)
+
+  /** Registers `body` once per solver that supports all of `requires` and satisfies `on`. */
+  protected def testOn(name: String, on: SolverInfo => Boolean, requires: Feature*)(body: Context => Unit): Unit =
+    register(name, solverInfos.filter(info => info.supports(requires) && on(info)))(body)
 
   /** Registers `body` once per solver that does not support `feature`. */
   protected def testWithout(name: String, feature: Feature)(body: Context => Unit): Unit =

@@ -21,10 +21,19 @@ class StringSemanticsSuite extends SolverTestSuite {
   // As in SMT-LIB, each code point is a character: `codePoints("😀")` is a single one.
   val specialStrings = Seq("abc", "\n", "\u0000x", "é", "€", "😀", "\ud83d", "ÿĀ", "\uffff", "\ud800", "\\u{41}", "\\x41", "\\", "a\"b")
 
+  /** The special strings that Princess is tested on.
+    *
+    * Princess encodes strings as lists of characters (see [[theories.StringEncoder]]), so that, unlike the
+    * SMT-LIB solvers, it never escapes a character: its encoding only depends on the values of the characters.
+    * Each of its queries takes about a second, so it is only tested on the extreme values: the null character,
+    * the largest character of the BMP, a character outside of the BMP and a lone surrogate.
+    */
+  val princessStrings = Set("abc", "\u0000x", "\uffff", "😀", "\ud800")
+
   // One test per string, so that they run in parallel
   for (str <- specialStrings) {
     val shown = str.flatMap(c => if (c >= ' ' && c < '\u007f') c.toString else f"\\u${c.toInt}%04x")
-    test(s"String Operations on \"$shown\"", Strings) { ctx =>
+    testOn(s"String Operations on \"$shown\"", info => info.name != "princess" || princessStrings(str), Strings) { ctx =>
       val s = solver(ctx)
       val lit = codePoints(str)
       val cps = lit.value
