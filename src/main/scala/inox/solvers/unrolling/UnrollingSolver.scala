@@ -1177,7 +1177,7 @@ abstract class AbstractUnrollingSolver private
         // the last check that the underlying solver answered is the one that proves the query
         resp match {
           case _: Unsatisfiable =>
-            val dir = context.options.findOptionOrDefault(optLeanProofs)
+            val dir = context.options.findOptionOrDefault(optProofs)
             if (dir.nonEmpty) ProofProducingSolver.write(underlying, dir)(using context)
           case _ =>
         }

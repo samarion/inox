@@ -6,7 +6,7 @@ package smtlib
 
 import _root_.smtlib.trees.Commands.GetProof
 import _root_.smtlib.trees.CommandsResponses.{Error => SMTError, GetProofResponseSuccess}
-import _root_.smtlib.trees.Terms.SString
+import _root_.smtlib.printer.RecursivePrinter
 
 trait VikSolver extends SMTLIBSolver with VikTarget with ProofProducingSolver {
   import program.trees._
@@ -23,10 +23,10 @@ trait VikSolver extends SMTLIBSolver with VikTarget with ProofProducingSolver {
     })
   }
 
-  /** The Lean proof of the last check that answered UNSAT, which Vik writes when it runs with
-    * `--proofs` (see [[optLeanProofs]]). */
-  def leanProof(): Either[String, String] = emit(GetProof()) match {
-    case GetProofResponseSuccess(SString(lean)) => Right(lean)
+  /** The certificate of the last check that answered UNSAT, `(vik-proof 1 ...)`, which Vik gives
+    * when it runs with `--proofs` (see [[optProofs]]). */
+  def proof(): Either[String, String] = emit(GetProof()) match {
+    case GetProofResponseSuccess(certificate) => Right(RecursivePrinter.toString(certificate))
     case SMTError(msg) => Left(msg)
     case other => Left(s"unexpected answer to (get-proof): $other")
   }
