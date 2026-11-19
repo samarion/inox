@@ -92,7 +92,33 @@ abstract class SemanticsEvaluator(override val program: Program, override val co
     * function equality. */
   private def hasFunctions(t: Type): Boolean = typeOps.exists { case _: FunctionType => true; case _ => false }(t)
 
-  private def expr(e: Expr): S.Expr = {
+  /** Rewrites a tree that the semantics doesn't cover into trees that it does, before evaluation:
+    * a subclass that extends the language lowers its own trees here. `None` leaves the tree as it
+    * is. */
+  protected def lower(e: Expr): Option[Expr] = None
+
+  /** Whether the uninterpreted function `id` is native: the subclass implements it with
+    * [[native]], instead of the model. A lowering can call native functions for the trees that it
+    * doesn't lower to the semantics, as Stainless does for `choose`. */
+  protected def isNative(id: Identifier): Boolean = false
+
+  /** The value of the native function `id` at the type arguments `tps`, on the values `args`. */
+  protected def native(id: Identifier, tps: Seq[Type], args: Seq[Expr]): Expr =
+    throw EvalError(s"No native implementation of ${id.asString}")
+
+  /** The recursive evaluator, which evaluates the programs that the semantics doesn't cover, calls
+    * the native functions too. */
+  override protected[evaluators] def e(expr: Expr)(using rctx: RC, gctx: GC): Expr = expr match {
+    case UninterpretedCall(id, tps, args, _) if isNative(id) => native(id, tps, args.map(e))
+    case _ => super.e(expr)
+  }
+
+  private def expr(e: Expr): S.Expr = lower(e) match {
+    case Some(lowered) => expr(lowered)
+    case None => convert(e)
+  }
+
+  private def convert(e: Expr): S.Expr = {
     def rec(e: Expr): S.Expr = expr(e)
     def all(es: Seq[Expr]) = list(es.map(rec))
     def pairs(ps: Seq[(Expr, Expr)]) = list(ps.map((k, v) => S.ExprPair(rec(k), rec(v))))
@@ -282,13 +308,17 @@ abstract class SemanticsEvaluator(override val program: Program, override val co
     case _ => throw RuntimeError(s"Unexpected value $v of type ${t.asString}")
   }
 
+  /** The types that `tys` gives to the type parameters of `orig`. */
+  private def typeSubst(orig: Expr, tys: S.List[S.TypeBinding])(using ev: Impl): Map[TypeParameter, Type] =
+    seq(tys).flatMap { case S.TypeBinding(id, _, _) =>
+      typeOps.typeParamsOf(orig).find(_.id == id).map(tp => tp -> typeBack(ev.resolve(tys, S.TypeParameter(id))))
+    }.toMap
+
   /** The Inox tree of `body`, with the values that `env` gives to its free variables. */
   private def closed(body: S.Expr, env: S.Env)(using ev: Impl): Expr = {
     val orig = origin(body)
     val S.Env(tys, vars) = env
-    val tpSubst: Map[TypeParameter, Type] = seq(tys).flatMap { case S.TypeBinding(id, _, _) =>
-      typeOps.typeParamsOf(orig).find(_.id == id).map(tp => tp -> typeBack(ev.resolve(tys, S.TypeParameter(id))))
-    }.toMap
+    val tpSubst = typeSubst(orig, tys)
     val bindings = seq(vars).reverse.map { case S.Binding(id, v) => id -> v }.toMap
     val values = exprOps.variablesOf(orig).flatMap { v =>
       bindings.get(v.id).map(x => v -> back(x, typeOps.instantiateType(v.tpe, tpSubst)))
@@ -328,7 +358,23 @@ abstract class SemanticsEvaluator(override val program: Program, override val co
 
     override def eval(P: S.Program, fuel: BigInt, env: S.Env, e: S.Expr): S.Result[S.Value] = {
       if (interruptManager.isInterrupted) throw RuntimeError("Evaluation interrupted")
-      super.eval(P, fuel, env, e)
+      e match {
+        case S.UninterpretedCall(id, _, args) if isNative(id) => eval_list(P, fuel, env, args) match {
+          case S.Ok(vs) => callNative(P, fuel, e, env, seq(vs))
+          case S.Stuck() => S.Stuck()
+          case S.OutOfFuel() => S.OutOfFuel()
+        }
+        case _ => super.eval(P, fuel, env, e)
+      }
+    }
+
+    /** The value of the call `e` to a native function, on the values `vs` (see [[isNative]]). */
+    private def callNative(P: S.Program, fuel: BigInt, e: S.Expr, env: S.Env, vs: Seq[S.Value]): S.Result[S.Value] = {
+      val call = origin(e).asInstanceOf[UninterpretedCall]
+      val tpSubst = typeSubst(call, env.types)(using this)
+      val args = vs.zip(call.args).map((v, a) => back(v, typeOps.instantiateType(a.getType, tpSubst))(using this))
+      val result = native(call.id, call.tps.map(typeOps.instantiateType(_, tpSubst)), args)
+      super.eval(P, fuel, S.Env(S.Nil(), S.Nil()), expr(result))
     }
 
     override def call(P: S.Program, fuel: BigInt, f: Identifier, tps: S.List[S.Type],
