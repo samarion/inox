@@ -54,6 +54,27 @@ package object theories {
     e3 `andThen` realEncoder
   }
 
+  // Vik has no theory of strings, sets or bags, and doesn't read the constant arrays or `(_ map f)`
+  // with which the SMT-LIB target encodes them, so they are encoded as datatypes, as for Princess.
+  // Vik has real arithmetic, so reals are kept.
+  def Vik(enc: ProgramTransformer)
+         (ev: DeterministicEvaluator { val program: enc.sourceProgram.type }): ProgramTransformer {
+    val sourceProgram: enc.targetProgram.type
+    val targetProgram: Program { val trees: enc.targetProgram.trees.type }
+  } = {
+    val stringEncoder = StringEncoder(enc.targetProgram, maxStringChar(ev.context.options))
+
+    val encAndString = enc `andThen` stringEncoder
+    val bagEncoder = BagEncoder(encAndString)(ev)
+    val mapMergeEncoder = MapMergeEncoder(bagEncoder.targetProgram)
+
+    val setEncoder = SetEncoder(mapMergeEncoder.targetProgram)
+
+    val e1 = stringEncoder `andThen` bagEncoder
+    val e2 = e1 `andThen` mapMergeEncoder
+    e2 `andThen` setEncoder
+  }
+
   object ReverseEvaluator {
     def apply(enc: ProgramTransformer)
              (ev: DeterministicEvaluator { val program: enc.sourceProgram.type }):
