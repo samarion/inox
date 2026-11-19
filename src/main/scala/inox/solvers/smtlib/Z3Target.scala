@@ -21,7 +21,13 @@ import utils.CaseSplit.*
 
 // In millions of z3 resource units
 // An Int, so that the limit in resource units can't overflow the Long it is computed in
-object optZ3Rlimit extends IntOptionDef("z3-rlimit", -1, "<N>")
+object optZ3Rlimit extends IntOptionDef("z3-rlimit", -1, "<N>") {
+  /** The limit in z3's resource units, which z3 takes as an unsigned 32-bit integer, if one is set. */
+  def resourceUnits(options: Options): Option[Long] = {
+    val rlimit = options.findOptionOrDefault(this).toLong * 1000000L min 0xFFFFFFFFL
+    if (rlimit >= 0) Some(rlimit) else None
+  }
+}
 
 trait Z3Target extends SMTLIBTarget with SMTLIBDebugger {
   import context.{given, _}
@@ -32,12 +38,10 @@ trait Z3Target extends SMTLIBTarget with SMTLIBDebugger {
   def targetName = "z3"
 
   protected def interpreterOpts = {
-    // z3 takes the limit as an unsigned 32-bit integer
-    val rlimit = options.findOptionOrDefault(optZ3Rlimit).toLong * 1000000L min 0xFFFFFFFFL
     Seq(
       "-in",
       "-smt2"
-    ) ++ (if (rlimit >= 0) Seq(s"rlimit=$rlimit") else Seq())
+    ) ++ optZ3Rlimit.resourceUnits(options).map(rlimit => s"rlimit=$rlimit")
   }
 
   // the parser doesn't refer to the target, so that the processes left for other solvers don't
@@ -77,6 +81,23 @@ trait Z3Target extends SMTLIBTarget with SMTLIBDebugger {
   // Z3 version 4.5.1 has disabled producing unsat assumptions by default,
   // so make sure it is enabled at this point.
   emit(SetOption(ProduceUnsatAssumptions(true)))
+
+  /* Z3 answers a check without scopes or assumptions with a non-incremental solver, whose models
+   * give the variables that its preprocessing eliminated as terms. Equalities of arrays built with
+   * `(_ map f)`, as for `s1.subsetOf(s2)` or `s1 ++ s2 == s3`, are left unevaluated in these terms,
+   * so their values can't be extracted. Once such an array shows up, Z3 uses its incremental
+   * solver, whose models evaluate them. The non-incremental solver is kept otherwise, as it is much
+   * faster on floating point. The option outlives `reset`, so each solver sets it, and older
+   * versions of Z3 that don't know it ignore it. */
+  private var ignoringSolver1 = false
+  private def setIgnoreSolver1(ignore: Boolean): Unit =
+    emit(SetOption(AttributeOption(Attribute(SKeyword(Z3Target.ignoreSolver1), Some(SSymbol(ignore.toString))))), rawOut = true)
+  setIgnoreSolver1(false)
+
+  protected def ignoreSolver1(): Unit = if (!ignoringSolver1) {
+    ignoringSolver1 = true
+    setIgnoreSolver1(true)
+  }
 
   // Under `--strings-bmp`, restrict the string alphabet to the BMP (the default `unicode` encoding
   // ranges up to 0x2FFFF, as SMT-LIB). Older versions of Z3 don't know the option, so we ignore
@@ -448,6 +469,7 @@ trait Z3Target extends SMTLIBTarget with SMTLIBDebugger {
 
   protected object ArrayMap {
     def apply(op: SExpr, arrs: Term*) = {
+      ignoreSolver1()
       FunctionApplication(
         QualifiedIdentifier(SMTIdentifier(SSymbol("map"), List(op)), None),
         arrs
@@ -465,6 +487,9 @@ trait Z3Target extends SMTLIBTarget with SMTLIBDebugger {
 }
 
 object Z3Target {
+  /** The option that makes Z3 always use its incremental solver (see `Z3Target.ignoreSolver1()`). */
+  val ignoreSolver1: String = "combined_solver.ignore_solver1"
+
   class Z3Parser(lexer: Lexer) extends Parser(lexer) {
     // Z3 uses a non-standard version of get-unsat-assumptions-response that
     // returns prop literals instead of symbols directly
