@@ -54,6 +54,14 @@ package object theories {
     e3 `andThen` realEncoder
   }
 
+  // Vik has no theory of strings, so they are encoded as datatypes, as for Princess. Sets, bags and
+  // map merges are arrays, as for Z3 (see `smtlib.ArrayCollectionsTarget`), and reals are kept.
+  def Vik(enc: ProgramTransformer)
+         (ev: DeterministicEvaluator { val program: enc.sourceProgram.type }): ProgramTransformer {
+    val sourceProgram: enc.targetProgram.type
+    val targetProgram: Program { val trees: enc.targetProgram.trees.type }
+  } = StringEncoder(enc.targetProgram, maxStringChar(ev.context.options))
+
   object ReverseEvaluator {
     def apply(enc: ProgramTransformer)
              (ev: DeterministicEvaluator { val program: enc.sourceProgram.type }):
