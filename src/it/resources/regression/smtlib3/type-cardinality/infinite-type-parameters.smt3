@@ -1,0 +1,23 @@
+; Queries whose models need a type parameter with infinitely many values, which the solver
+; can't always find, but must not refute with `finite-type-parameters`.
+
+(set-option :finite-type-parameters true)
+(declare-type T ())
+(declare-const a T)
+(declare-const f (-> T T))
+
+; f is injective but not surjective: only infinite T (Dedekind-infinite)
+(push 1)
+(assert (forall ((x T) (y T)) (=> (= (f x) (f y)) (= x y))))
+(assert (forall ((x T)) (not (= (f x) a))))
+(set-info :status sat)
+(set-info :inox-may-be-unknown true)
+(check-sat)
+(pop 1)
+
+; a value other than a exists: holds at every cardinality but one
+(push 1)
+(assert (not (forall ((x T)) (= (f x) a))))
+(set-info :status sat)
+(check-sat)
+(pop 1)

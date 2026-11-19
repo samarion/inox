@@ -127,6 +127,7 @@ trait MainHelpers {
     solvers.unrolling.optFeelingLucky -> Description(Solvers, "Use evaluator to find counter-examples early"),
     solvers.unrolling.optLuckyTimeout -> Description(Solvers, s"Time in milliseconds after which a model found by ${unrolling.optFeelingLucky.name} is given up"),
     solvers.unrolling.optUnrollAssumptions -> Description(Solvers, "Use unsat-assumptions to drive unfolding while remaining fair"),
+    solvers.unrolling.optFiniteTypeParameters -> Description(Solvers, "Look for models where type parameters have finitely many values"),
     solvers.unrolling.optModelFinding -> Description(Solvers, "Enhance model-finding capabilities of solvers by given aggressivity"),
     solvers.unrolling.optFunctionEquality -> Description(Solvers, "Semantics of equality between first-class functions: none (functions can't be compared), intensional or extensional"),
     solvers.smtlib.optCVC4Options -> Description(Solvers, "Pass extra options to CVC4"),

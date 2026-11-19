@@ -1,0 +1,46 @@
+; Uninterpreted types are type parameters, which may be instantiated at finite types such as
+; Unit or Boolean. With `finite-type-parameters`, a query that only holds when a type parameter
+; has few values is satisfiable: its model reads the type parameter as a finite type. A query
+; that holds at no cardinality is still unsatisfiable.
+; The quantifier bodies apply `k`, the identity, so that the solver has matchers to instantiate
+; them with: equalities alone between bound variables give it none.
+
+(set-option :finite-type-parameters true)
+(declare-type T ())
+(declare-const a T)
+(declare-const b T)
+(declare-const c T)
+(declare-const k (-> T T))
+(assert (forall ((x T)) (= (k x) x)))
+
+; T has exactly one value (T = Unit)
+(push 1)
+(assert (forall ((x T)) (= (k x) a)))
+(assert (= (k b) b))
+(set-info :status sat)
+(check-sat)
+(pop 1)
+
+; T has exactly two values (T = Boolean)
+(push 1)
+(assert (not (= (k a) (k b))))
+(assert (forall ((x T)) (or (= (k x) a) (= (k x) b))))
+(set-info :status sat)
+(check-sat)
+(pop 1)
+
+; T has no three distinct values, and two distinct ones (T = Boolean)
+(push 1)
+(assert (not (= (k a) (k b))))
+(assert (forall ((x T) (y T) (z T)) (or (= (k x) (k y)) (= (k y) (k z)) (= (k x) (k z)))))
+(set-info :status sat)
+(check-sat)
+(pop 1)
+
+; at most two values, but three distinct constants: unsatisfiable at every cardinality
+(push 1)
+(assert (distinct (k a) (k b) (k c)))
+(assert (forall ((x T) (y T) (z T)) (or (= (k x) (k y)) (= (k y) (k z)) (= (k x) (k z)))))
+(set-info :status unsat)
+(check-sat)
+(pop 1)

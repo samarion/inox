@@ -1,0 +1,24 @@
+; Cardinality constraints that come from functions and sets over a type parameter, with
+; `finite-type-parameters`.
+
+(set-option :finite-type-parameters true)
+(declare-type T ())
+(declare-const a T)
+(declare-const p (-> T Bool))
+
+; every predicate on T is p or its negation: holds for T = Unit, which has two predicates
+(push 1)
+(assert (forall ((q (-> T Bool))) (or (forall ((x T)) (= (q x) (p x))) (forall ((x T)) (= (q x) (not (p x)))))))
+(assert (= a a))
+(set-info :status sat)
+(check-sat)
+(pop 1)
+
+; the set of all values of T has a single element: holds for T = Unit
+(push 1)
+(declare-const s (Set T))
+(assert (= s (insert (as emptyset T) a)))
+(assert (forall ((x T)) (member x s)))
+(set-info :status sat)
+(check-sat)
+(pop 1)

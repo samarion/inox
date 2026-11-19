@@ -16,6 +16,9 @@ object optUnrollBound       extends IntOptionDef("unroll-bound", default = -1, "
 object optUnrollFactor      extends IntOptionDef("unroll-factor", default = 1, "<PosInt>")
 object optFeelingLucky      extends FlagOptionDef("feeling-lucky", false)
 object optUnrollAssumptions extends FlagOptionDef("unroll-assumptions", false)
+/** Whether models may read type parameters as finite types, to find counterexamples that depend on
+  * their cardinality (e.g. `T` has no three distinct values when it is `Boolean`). */
+object optFiniteTypeParameters extends FlagOptionDef("finite-type-parameters", false)
 /** How long, in milliseconds, the validation of a lucky model may take (see [[optFeelingLucky]]). */
 object optLuckyTimeout      extends IntOptionDef("lucky-timeout", default = 5000, "<PosInt> (milliseconds)")
 
@@ -105,6 +108,7 @@ abstract class AbstractUnrollingSolver private
   lazy val feelingLucky = options.findOptionOrDefault(optFeelingLucky)
   lazy val luckyTimeout = options.findOptionOrDefault(optLuckyTimeout)
   lazy val unrollAssumptions = options.findOptionOrDefault(optUnrollAssumptions)
+  lazy val finiteTypeParameters = options.findOptionOrDefault(optFiniteTypeParameters)
   lazy val modelFinding = options.findOptionOrDefault(optModelFinding) > 0
 
   def check(config: CheckConfiguration): config.Response[Model, Assumptions] =
@@ -1262,6 +1266,46 @@ abstract class AbstractUnrollingSolver private
       }
     }
 
+    /** The model `model` with its type parameters read as finite types, when its quantifiers only
+      * hold for few values of them, e.g. a type parameter with no three distinct values. Each type
+      * parameter `T` that the model has values of becomes the type of the integers in `[0, n)`,
+      * where `n` is the number of distinct values of `T` in the model, which are renumbered to
+      * these integers. The model then describes a counterexample at a type with `n` values, such
+      * as `Unit` for 1 or `Boolean` for 2, and holds if it validates at these types. */
+    private def withFiniteTypes(model: program.Model): Option[program.Model] = {
+      val exprs = model.vars.values.toSeq ++ model.interpretations.values
+      val generics = exprs.flatMap(exprOps.collect[GenericValue] {
+        case gv: GenericValue if !model.types.contains(gv.tp) => Set(gv)
+        case _ => Set.empty
+      }).toSet
+      if (generics.isEmpty) None else {
+        val byType = generics.groupBy(_.tp).map { case (tp, gvs) => tp -> gvs.toSeq.sortBy(_.id).zipWithIndex.toMap }
+        val types: Map[TypeParameter, Type] = byType.map { case (tp, values) =>
+          val vd = ValDef.fresh("v", IntegerType())
+          tp -> RefinementType(vd, And(
+            GreaterEquals(vd.toVariable, IntegerLiteral(0)),
+            LessThan(vd.toVariable, IntegerLiteral(values.size))))
+        }
+        def inst(tpe: Type): Type = typeOps.instantiateType(tpe, types)
+        def instValue(e: Expr): Expr = typeOps.instantiateType(exprOps.postMap {
+          case gv: GenericValue if byType.contains(gv.tp) => Some(IntegerLiteral(byType(gv.tp)(gv)))
+          case _ => None
+        } (e), types)
+        Some(inox.Model(program)(
+          model.vars.map { case (vd, e) => vd.copy(tpe = inst(vd.tpe)) -> instValue(e) },
+          model.interpretations.map { case ((id, tps), e) => (id, tps.map(inst)) -> instValue(e) },
+          model.types ++ types))
+      }
+    }
+
+    /** A model of the query with finite type parameters (@see [[withFiniteTypes]]), if there is one. */
+    private def finiteModel(model: program.Model): Option[program.Model] =
+      if (!finiteTypeParameters) None
+      else withFiniteTypes(model).filter { fmodel =>
+        reporter.debug(" - Validating the model with finite type parameters")
+        validateModel(fmodel, assumptionsSeq, silenceErrors = true)
+      }
+
     private def witnessEqualities: Map[Encoded, Int] =
       if (witnessLevel > 0) templates.witnesses.equalities else Map.empty
 
@@ -1511,6 +1555,8 @@ abstract class AbstractUnrollingSolver private
         sat
       } else if (abort || pause) {
         unknown
+      } else if (checkModels && !valid && finiteModel(model).isDefined) {
+        CheckResult(config `cast` (if (config.withModel) SatWithModel(finiteModel(model).get) else Sat))
       } else if (checkModels && !valid) {
         if (!silentErrors) {
           reporter.error("Something went wrong. The model should have been valid, yet we got this:")
@@ -1535,6 +1581,8 @@ abstract class AbstractUnrollingSolver private
           case Some(_) if !axioms.exists(_.hasComplexMatchers(modelEq)) &&
               validateModel(model, assumptionsSeq, silenceErrors = true) =>
             sat
+          case Some(_) if !axioms.exists(_.hasComplexMatchers(modelEq)) && finiteModel(model).isDefined =>
+            CheckResult(config `cast` (if (config.withModel) SatWithModel(finiteModel(model).get) else Sat))
           case Some((expr, err)) =>
             if (!silentErrors) {
               reporter.error("Quantification " + expr.asString(using templates.program.printerOpts) +
