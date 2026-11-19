@@ -8,10 +8,11 @@ import _root_.smtlib.interpreters.ProcessInterpreter
 
 /** Vik (https://github.com/mbovel/vik) through SMT-LIB, run as `vik -in`.
   *
-  * Vik covers uninterpreted functions, datatypes, arrays, linear integer and real arithmetic, and
-  * bit-vectors. The other theories are encoded before they reach it (see [[theories.Vik]]).
+  * Vik covers uninterpreted functions, datatypes, arrays (with constant arrays and `(_ map f)`),
+  * linear integer and real arithmetic, and bit-vectors. Sets, bags and map merges are arrays (see
+  * [[ArrayCollectionsTarget]]), and strings are encoded before they reach it (see [[theories.Vik]]).
   */
-trait VikTarget extends SMTLIBTarget with SMTLIBDebugger {
+trait VikTarget extends ArrayCollectionsTarget with SMTLIBDebugger {
   import context.{given, _}
 
   def targetName = "vik"

@@ -33,7 +33,7 @@ trait Z3Solver extends SMTLIBSolver with Z3Target { self =>
 
   // Define the set sort outside of any scope, since `pop` would drop a definition made inside one
   override def push(): Unit = {
-    setSort
+    inoxSet
     super.push()
   }
 
