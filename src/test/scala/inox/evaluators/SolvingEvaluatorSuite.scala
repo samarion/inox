@@ -8,13 +8,16 @@ import org.scalatest.funsuite.AnyFunSuite
 /** Evaluation of `forall`, which the evaluator hands to a solver, and of uninterpreted calls, which
   * the model must interpret. */
 class SolvingEvaluatorSuite extends AnyFunSuite {
+  def mkEvaluator(p: InoxProgram, c: Context): RecursiveEvaluator { val program: p.type } =
+    RecursiveEvaluator(p, c)
+
   import inox.trees.{given, _}
   import inox.trees.dsl._
 
   val program = InoxProgram(NoSymbols)
 
   def evaluate(expr: Expr, opts: OptionValue[?]*): EvaluationResults.Result[Expr] = {
-    val evaluator = RecursiveEvaluator(program, TestContext(Options(opts)))
+    val evaluator = mkEvaluator(program, TestContext(Options(opts)))
     evaluator.eval(expr, Model.empty(program))
   }
 
@@ -52,7 +55,7 @@ class SolvingEvaluatorSuite extends AnyFunSuite {
   }
 
   test("an evaluator reuses its forall results") {
-    val evaluator = RecursiveEvaluator(program, TestContext.empty)
+    val evaluator = mkEvaluator(program, TestContext.empty)
     val forall = Forall(Seq(x), GreaterThan(x.toVariable, IntegerLiteral(0)))
     val expr = And(Not(forall), Not(forall))
     assert(evaluator.eval(expr, Model.empty(program)) == EvaluationResults.Successful(BooleanLiteral(true)))
@@ -75,7 +78,7 @@ class SolvingEvaluatorSuite extends AnyFunSuite {
 
   test("interrupted quantifiers are errors") {
     val ctx = TestContext.empty
-    val evaluator = RecursiveEvaluator(program, ctx)
+    val evaluator = mkEvaluator(program, ctx)
     ctx.interruptManager.interrupt()
     val empty = "empty" :: noValues
     for (expr <- Seq(
@@ -97,12 +100,12 @@ class SolvingEvaluatorSuite extends AnyFunSuite {
     val m = "m" :: IntegerType()
     val g = FreshIdentifier("g")
     val other = Model(program)(Map.empty, Map((g, Seq.empty[Type]) -> Lambda(Seq(m), m.toVariable)))
-    val evaluator = RecursiveEvaluator(program, TestContext.empty)
+    val evaluator = mkEvaluator(program, TestContext.empty)
     assert(!evaluator.eval(callF(IntegerLiteral(5)), other).isInstanceOf[EvaluationResults.Successful[?]])
   }
 
   test("uninterpreted calls that the model interprets") {
-    val evaluator = RecursiveEvaluator(program, TestContext.empty)
+    val evaluator = mkEvaluator(program, TestContext.empty)
     val m = "m" :: IntegerType()
     val model = Model(program)(Map.empty, Map((f, Seq.empty[Type]) -> Lambda(Seq(m), Plus(m.toVariable, IntegerLiteral(1)))))
     assert(evaluator.eval(callF(IntegerLiteral(5)), model) == EvaluationResults.Successful(IntegerLiteral(6)))

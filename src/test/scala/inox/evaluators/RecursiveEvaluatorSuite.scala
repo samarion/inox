@@ -14,11 +14,14 @@ import org.scalatest.funsuite.AnyFunSuite
   * failures of well-typed ones (division by zero, failed assumptions, exhausted steps) as runtime errors.
   */
 class RecursiveEvaluatorSuite extends AnyFunSuite {
+  def mkEvaluator(p: InoxProgram, c: Context): RecursiveEvaluator { val program: p.type } =
+    RecursiveEvaluator(p, c)
+
   import inox.trees._
 
   val ctx = TestContext.empty
   val program = InoxProgram(NoSymbols)
-  val evaluator = RecursiveEvaluator(program, ctx)
+  val evaluator = mkEvaluator(program, ctx)
 
   def eval(expr: Expr): Expr = evaluator.eval(expr) match {
     case EvaluationResults.Successful(res) => res
@@ -27,7 +30,7 @@ class RecursiveEvaluatorSuite extends AnyFunSuite {
 
   test("Evaluation stops when its context is interrupted") {
     val interruptible = ctx.copy(interruptManager = new utils.InterruptManager(ctx.reporter))
-    val e = RecursiveEvaluator(program, interruptible)
+    val e = mkEvaluator(program, interruptible)
     val sum = Plus(IntegerLiteral(1), IntegerLiteral(1))
     assert(e.eval(sum).result == Some(IntegerLiteral(2)))
     interruptible.interruptManager.interrupt()
@@ -188,7 +191,7 @@ class RecursiveEvaluatorSuite extends AnyFunSuite {
     val x = ValDef.fresh("x", IntegerType())
     val loop = new FunDef(fid, Seq(), Seq(x), IntegerType(), FunctionInvocation(fid, Seq(), Seq(x.toVariable)), Seq())
     val p = InoxProgram(NoSymbols.withFunctions(Seq(loop)))
-    val e = RecursiveEvaluator(p, TestContext(Options(Seq(optMaxCalls(10)))))
+    val e = mkEvaluator(p, TestContext(Options(Seq(optMaxCalls(10)))))
     e.eval(FunctionInvocation(fid, Seq(), Seq(i))) match {
       case EvaluationResults.RuntimeError(msg) => assert(msg.contains("Exceeded number of allocated methods calls"))
       case res => fail(s"Unexpected result $res")
@@ -213,7 +216,7 @@ class RecursiveEvaluatorSuite extends AnyFunSuite {
     // they only differ on the inputs on which loopPos diverges
     val undecided = Equals(loops, lambda(y => IfExpr(GreaterThan(y, IntegerLiteral(0)), IntegerLiteral(1), y)))
     for (steps <- Seq(10, 50000, 10000000)) {
-      val e = RecursiveEvaluator(p, TestContext(Options(Seq(optMaxCalls(steps), optFunctionEquality(FunctionEquality.Extensional)))))
+      val e = mkEvaluator(p, TestContext(Options(Seq(optMaxCalls(steps), optFunctionEquality(FunctionEquality.Extensional)))))
       e.eval(differ) match {
         case EvaluationResults.Successful(BooleanLiteral(false)) =>
         case res => fail(s"Unexpected result $res with $steps steps")
@@ -236,7 +239,7 @@ class RecursiveEvaluatorSuite extends AnyFunSuite {
 
     for (assumeChecked <- Seq(false, true)) {
       // Compares lambdas, which needs a function equality
-      val ev = RecursiveEvaluator(program, ctx.withOpts(solvers.optAssumeChecked(assumeChecked),
+      val ev = mkEvaluator(program, ctx.withOpts(solvers.optAssumeChecked(assumeChecked),
         solvers.unrolling.optFunctionEquality(solvers.unrolling.FunctionEquality.Intensional)))
       def evalOk(expr: Expr): Expr = ev.eval(expr) match {
         case EvaluationResults.Successful(res) => res
@@ -298,7 +301,7 @@ class RecursiveEvaluatorSuite extends AnyFunSuite {
     val ft = FunctionType(Seq(pos), IntegerType())
 
     for (fe <- Seq(solvers.unrolling.FunctionEquality.Intensional, solvers.unrolling.FunctionEquality.Extensional)) {
-      val ev = RecursiveEvaluator(program, ctx.withOpts(solvers.unrolling.optFunctionEquality(fe)))
+      val ev = mkEvaluator(program, ctx.withOpts(solvers.unrolling.optFunctionEquality(fe)))
       // Hand-built, with other parameter names and types, and a ground subexpression the evaluator simplifies
       val f = ValDef.fresh("f", ft)
       val s = ValDef.fresh("s", SetType(ft))
@@ -334,7 +337,7 @@ class RecursiveEvaluatorSuite extends AnyFunSuite {
         (nilID, Seq()))
     }
     val p = InoxProgram(NoSymbols.withSorts(Seq(list)))
-    val ev = RecursiveEvaluator(p, ctx)
+    val ev = mkEvaluator(p, ctx)
 
     def pos = {
       val vd = ValDef.fresh("v", IntegerType())

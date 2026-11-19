@@ -9,7 +9,7 @@ import java.nio.file.{Files, Path}
   * `Codegen [<semantics.md> [<scala-output>]]`, from the `proofs` directory by default. */
 object Codegen {
   val source = "semantics.md"
-  val scalaOutput = "src/test/scala/inox/semantics/generated/Semantics.scala"
+  val scalaOutput = "../src/main/scala/inox/semantics/generated/Semantics.scala"
   val scalaPackage = "inox.semantics.generated"
 
   /** The generated Scala source of the semantics file at `path`. */

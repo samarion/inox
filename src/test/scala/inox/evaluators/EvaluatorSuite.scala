@@ -6,12 +6,15 @@ package evaluators
 import org.scalatest.funsuite.AnyFunSuite
 
 class EvaluatorSuite extends AnyFunSuite {
+  def mkEvaluator(p: InoxProgram, c: Context): RecursiveEvaluator { val program: p.type } =
+    RecursiveEvaluator(p, c)
+
   import inox.trees._
 
   val ctx = TestContext.empty
   val program = InoxProgram(NoSymbols)
   def evaluator(ctx: Context): DeterministicEvaluator { val program: InoxProgram } = {
-    RecursiveEvaluator(program, ctx)
+    mkEvaluator(program, ctx)
   }
 
   test("Literals") {
@@ -706,7 +709,7 @@ class EvaluatorSuite extends AnyFunSuite {
     import solvers.unrolling.{optFunctionEquality, FunctionEquality}
     // uses the recursive evaluator directly, as subclasses of this suite test other evaluators
     // (eg. Stainless's code generator) that don't implement these semantics
-    def recursive(semantics: FunctionEquality) = RecursiveEvaluator(program, ctx.withOpts(optFunctionEquality(semantics)))
+    def recursive(semantics: FunctionEquality) = mkEvaluator(program, ctx.withOpts(optFunctionEquality(semantics)))
 
     def lambda(body: Expr => Expr): Lambda = {
       val x = ValDef.fresh("x", IntegerType())

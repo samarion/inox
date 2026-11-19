@@ -7,9 +7,11 @@ states is that no values of the free variables make the query evaluate to
 
 Its fenced `inox-sem` blocks are read by `inox.semantics.Codegen`, which writes
 the semantics for each tool that needs it. Today that is a Scala evaluator,
-[`src/test/scala/inox/semantics/generated/Semantics.scala`](src/test/scala/inox/semantics/generated/Semantics.scala),
-which `SemanticsSuite` compares with Inox's `RecursiveEvaluator` on the
-functions of the regression files. Lean and Eunoia backends come next.
+[`../src/main/scala/inox/semantics/generated/Semantics.scala`](../src/main/scala/inox/semantics/generated/Semantics.scala),
+which is part of Inox: `inox.evaluators.SemanticsEvaluator` runs it on Inox's
+trees, and is Inox's default evaluator. `SemanticsSuite` compares it with
+`RecursiveEvaluator` on the functions of the regression files. Lean and Eunoia
+backends come next.
 
 This directory is the sbt project `proofs`, which depends on Inox but is not
 part of it: it is not published, and Inox's jars don't contain it. `sbt test`

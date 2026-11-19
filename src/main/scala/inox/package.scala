@@ -92,7 +92,7 @@ package object inox {
 
       protected def createEvaluator(ctx: Context): evaluators.DeterministicEvaluator {
         val program: self.program.type
-      } = evaluators.RecursiveEvaluator(self.program, ctx)
+      } = evaluators.SemanticsEvaluator(self.program, ctx)
     }.asInstanceOf[p.Semantics]
   }
   given givenInoxSemantics: inoxSemantics.type = inoxSemantics
