@@ -17,7 +17,7 @@ trait VikTarget extends SMTLIBTarget with SMTLIBDebugger {
   def targetName = "vik"
 
   protected def interpreterOpts: Seq[String] =
-    Seq("-in") ++ (if (options.findOptionOrDefault(optLeanProofs).nonEmpty) Seq("--proofs") else Seq())
+    Seq("-in") ++ (if (options.findOptionOrDefault(optProofs).nonEmpty) Seq("--proofs") else Seq())
 
   override protected val interpreter: ProcessInterpreter = {
     val opts = interpreterOpts
