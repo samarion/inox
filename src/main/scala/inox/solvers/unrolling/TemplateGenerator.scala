@@ -6,6 +6,7 @@ package unrolling
 
 import utils._
 import scala.collection.mutable.{Map => MutableMap, Set => MutableSet}
+import scala.collection.immutable.{ListSet, VectorMap}
 
 trait TemplateGenerator { self: Templates =>
   import context.{given, _}
@@ -30,10 +31,10 @@ trait TemplateGenerator { self: Templates =>
     condVars: Map[Variable, Encoded] = Map.empty,
     exprVars: Map[Variable, Encoded] = Map.empty,
     condTree: Map[Variable, Set[Variable]] = Map.empty,
-    guardedExprs: Map[Variable, Seq[Expr]] = Map.empty,
+    guardedExprs: Map[Variable, Seq[Expr]] = VectorMap.empty,
     equations: Seq[Expr] = Seq.empty,
-    types: Types = Map.empty,
-    equalities: Equalities = Map.empty,
+    types: Types = VectorMap.empty,
+    equalities: Equalities = VectorMap.empty,
     lambdas: Seq[LambdaTemplate] = Seq.empty,
     quantifications: Seq[QuantificationTemplate] = Seq.empty
   ) {
@@ -177,35 +178,39 @@ trait TemplateGenerator { self: Templates =>
 
     // Clear all guardedExprs in builder since we're going to transform them by merging calls.
     // The transformed guardedExprs will be added to builder at the end of the function.
-    builder.guardedExprs = Map.empty
+    builder.guardedExprs = VectorMap.empty
 
-    def collectCalls(expr: Expr): Set[FunctionInvocation] =
-      exprOps.collect { case fi: FunctionInvocation => Set(fi) case _ => Set.empty[FunctionInvocation] }(expr)
+    def collectCalls(expr: Expr): Seq[FunctionInvocation] =
+      exprOps.collectPreorder { case fi: FunctionInvocation => Seq(fi) case _ => Seq.empty[FunctionInvocation] }(expr)
     def countCalls(expr: Expr): Int =
       exprOps.count { case fi: FunctionInvocation => 1 case _ => 0}(expr)
     def replaceCall(call: FunctionInvocation, newExpr: Expr)(e: Expr): Expr =
       exprOps.replace(Map(call -> newExpr), e)
 
-    def getCalls(guardedExprs: Map[Variable, Seq[Expr]]): Map[TypedFunDef, Seq[(FunctionInvocation, Set[Variable])]] =
-      (for { (b, es) <- guardedExprs.toSeq; e <- es; fi <- collectCalls(e) } yield (b -> fi))
-      .groupBy(_._2)
-      .view.mapValues(_.map(_._1).toSet)
-      .toSeq
-      .groupBy(_._1.tfd)
-      .view.mapValues(_.toList.distinct.sortBy(p => countCalls(p._1)))  // place inner calls first
-      .toMap
+    // The calls are ordered by their first occurrence, with the blockers in insertion order, rather
+    // than by hash codes, which depend on the global ids of the identifiers
+    def getCalls(guardedExprs: Map[Variable, Seq[Expr]]): Seq[(TypedFunDef, Seq[(FunctionInvocation, Set[Variable])])] = {
+      val occurrences = for {
+        (b, es) <- guardedExprs.toSeq; e <- es; fi <- collectCalls(e)
+      } yield (b -> fi)
+      val blockers = occurrences.groupMap(_._2)(_._1)
+      val calls = occurrences.map(_._2).distinct.map(fi => (fi, ListSet.from(blockers(fi)): Set[Variable]))
+      val tfds = calls.map(_._1.tfd).distinct
+      val byTfd = calls.groupBy(_._1.tfd)
+      tfds.map(tfd => tfd -> byTfd(tfd).sortBy(p => countCalls(p._1)))  // place inner calls first
+    }
 
     var thenGuarded = thenClauses.guardedExprs
     var elseGuarded = elseClauses.guardedExprs
 
     val thenCalls = getCalls(thenGuarded)
-    val elseCalls = getCalls(elseGuarded)
+    val elseCalls = getCalls(elseGuarded).toMap
 
     // We sort common function calls in order to merge nested calls first.
     var toMerge: Seq[((FunctionInvocation, Set[Variable]), (FunctionInvocation, Set[Variable]))] =
-      (thenCalls.keySet & elseCalls.keySet)
-        .flatMap(tfd => thenCalls(tfd) zip elseCalls(tfd))
-        .toSeq
+      thenCalls
+        .collect { case (tfd, calls) if elseCalls.contains(tfd) => calls zip elseCalls(tfd) }
+        .flatten
         .sortBy(p => countCalls(p._1._1) + countCalls(p._2._1))
 
     while (toMerge.nonEmpty) {
@@ -218,8 +223,8 @@ trait TemplateGenerator { self: Templates =>
       val replaceThen = replaceCall(thenCall, newExpr)
       val replaceElse = replaceCall(elseCall, newExpr)
 
-      thenGuarded = thenGuarded.view.mapValues(_.map(replaceThen)).toMap
-      elseGuarded = elseGuarded.view.mapValues(_.map(replaceElse)).toMap
+      thenGuarded = VectorMap.from(thenGuarded).map { case (b, es) => b -> es.map(replaceThen) }
+      elseGuarded = VectorMap.from(elseGuarded).map { case (b, es) => b -> es.map(replaceElse) }
       toMerge = toMerge.map(p => (
         (replaceThen(p._1._1).asInstanceOf[FunctionInvocation], p._1._2),
         (replaceElse(p._2._1).asInstanceOf[FunctionInvocation], p._2._2)
@@ -331,7 +336,7 @@ trait TemplateGenerator { self: Templates =>
 
     // Represents clauses of the form:
     //    id => expr && ... && expr
-    var guardedExprs = Map[Variable, Seq[Expr]]()
+    var guardedExprs: Map[Variable, Seq[Expr]] = VectorMap.empty
     def storeGuarded(guardVar: Variable, expr: Expr): Unit = {
       assert(expr.getType == BooleanType(), expr.asString + " is not of type Boolean. " + explainTyping(expr))
 
@@ -349,7 +354,8 @@ trait TemplateGenerator { self: Templates =>
       equations :+= Implies(fail, guardVar)
     }
 
-    var types = Map[Encoded, Set[Typing]]()
+    // The typings and equalities are kept in the order in which they are stored (see [[Items]])
+    var types: Map[Encoded, Set[Typing]] = VectorMap.empty
     def storeType(pathVar: Variable, tpe: Type, arg: Expr, inDomain: Boolean = false, ground: Boolean = false)
                  (using generator: TypingGenerator): Expr = {
       val b = encodedCond(pathVar)
@@ -378,7 +384,7 @@ trait TemplateGenerator { self: Templates =>
           (BooleanLiteral(true), Typing(tpe.getType, encoder(arg), Capture(container, containerType)))
       }
 
-      types += b -> (types.getOrElse(b, Set.empty) + typing)
+      types = types `merge` (b -> typing)
       result
     }
 
@@ -396,7 +402,7 @@ trait TemplateGenerator { self: Templates =>
         val readsCall: Variable = Variable.fresh("tp", BooleanType(), true)
         storeExpr(readsCall)
         val typing = Typing(tpe, encoder(arg), Collection(exprVars(readsCall), closures, generator == FreeGenerator))
-        types += b -> (types.getOrElse(b, Set.empty) + typing)
+        types = types `merge` (b -> typing)
         readsCall
       }
 
@@ -411,12 +417,11 @@ trait TemplateGenerator { self: Templates =>
     @inline def registerQuantification(quantification: QuantificationTemplate): Unit =
       quantifications :+= quantification
 
-    var equalities = Map[Encoded, Set[Equality]]()
+    var equalities: Map[Encoded, Set[Equality]] = VectorMap.empty
     @inline def storeEquality(guardVar: Variable, e1: Expr, e2: Expr): Unit = {
       val b = encodedCond(guardVar)
-      val prev: Set[Equality] = equalities.getOrElse(b, Set.empty)
       val encoder: Expr => Encoded = mkEncoder(localSubst)
-      equalities += b -> (prev + Equality(e1.getType, encoder(e1), encoder(e2)))
+      equalities = equalities `merge` (b -> Equality(e1.getType, encoder(e1), encoder(e2)))
     }
 
     @inline def localSubst: Map[Variable, Encoded] =

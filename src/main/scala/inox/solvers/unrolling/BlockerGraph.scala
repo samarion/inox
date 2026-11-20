@@ -6,6 +6,8 @@ package unrolling
 
 import utils._
 
+import scala.collection.immutable.ListSet
+
 /** The implications and equalities between the blockers of the unrolling: the condition variables
   * of instantiated templates, their start blockers and the conjunctions of blockers that
   * [[encodeBlockers]] introduces. The quantifier instantiation and the blocker promotion of the
@@ -20,15 +22,17 @@ trait BlockerGraph { self: Templates =>
   import blockerGraph._
 
   private[unrolling] object blockerGraph extends IncrementalStateWrapper {
+    // The sets of blockers keep their insertion order, so that the conjunctions of blockers along
+    // paths don't depend on hash codes (see [[Items]])
     // implication tree that we're sure about: if  (b1, b2) is in the tree, then
     // we have the precise semantics of b1 ==> b2 in the resulting clause set
-    private[BlockerGraph] val condImplies = new IncrementalMap[Encoded, Set[Encoded]].withDefaultValue(Set.empty)
-    private[BlockerGraph] val condImplied = new IncrementalMap[Encoded, Set[Encoded]].withDefaultValue(Set.empty)
+    private[BlockerGraph] val condImplies = new IncrementalMap[Encoded, Set[Encoded]].withDefaultValue(ListSet.empty)
+    private[BlockerGraph] val condImplied = new IncrementalMap[Encoded, Set[Encoded]].withDefaultValue(ListSet.empty)
 
     // implication tree that isn't quite ensured in the resulting clause set
     // this can happen due to defBlocker caching in unrolling
-    private[BlockerGraph] val potImplies = new IncrementalMap[Encoded, Set[Encoded]].withDefaultValue(Set.empty)
-    private[BlockerGraph] val potImplied = new IncrementalMap[Encoded, Set[Encoded]].withDefaultValue(Set.empty)
+    private[BlockerGraph] val potImplies = new IncrementalMap[Encoded, Set[Encoded]].withDefaultValue(ListSet.empty)
+    private[BlockerGraph] val potImplied = new IncrementalMap[Encoded, Set[Encoded]].withDefaultValue(ListSet.empty)
 
     private[BlockerGraph] val condEquals  = new IncrementalBijection[Encoded, Set[Encoded]]
 
@@ -73,13 +77,16 @@ trait BlockerGraph { self: Templates =>
     ) => (b, Seq.empty)
 
     case _ =>
-      val flatBs = fixpoint((bs: Set[Encoded]) => bs.flatMap(b => condEquals.getBorElse(b, Set(b))))(bs)
+      // the conjuncts keep the order of `bs` rather than hash order, so that the clause doesn't depend
+      // on hash codes (see [[Items]])
+      val flatBs: Set[Encoded] =
+        fixpoint((bs: Set[Encoded]) => ListSet.from(bs.iterator.flatMap(b => condEquals.getBorElse(b, Set(b)))))(ListSet.from(bs))
       condEquals.getA(flatBs) match {
         case Some(b) => (b, Seq.empty)
         case None =>
           val b = encodeSymbol(sym)
           condEquals += (b -> flatBs)
-          (b, Seq(mkEquals(b, if (flatBs.isEmpty) trueT else mkAnd(flatBs.toSeq*))))
+          (b, Rule.Define(None, b, if (flatBs.isEmpty) trueT else mkAnd(flatBs.toSeq*)).clauses)
       }
   }
 
@@ -103,8 +110,8 @@ trait BlockerGraph { self: Templates =>
   /* This set is guaranteed finite and won't expand beyond the limit of a function's
    * definition as aVar ==> defBlocker is NOT a strict implication (ie. won't be in
    * the condImplied map) */
-  protected def blockerPath(bs: Set[Encoded]): Set[Encoded] = fixpoint((bs: Set[Encoded]) => bs.flatMap { b =>
+  protected def blockerPath(bs: Set[Encoded]): Set[Encoded] = fixpoint((bs: Set[Encoded]) => ListSet.from(bs.iterator.flatMap { b =>
     val equal = condEquals.getBorElse(b, Set.empty)
     if (equal.nonEmpty) equal else (condImplied(b) + b)
-  })(bs).filter(_ != trueT)
+  }))(ListSet.from(bs)).filter(_ != trueT)
 }
