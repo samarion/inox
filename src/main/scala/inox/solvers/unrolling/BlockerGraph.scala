@@ -6,6 +6,8 @@ package unrolling
 
 import utils._
 
+import scala.collection.immutable.ListSet
+
 /** The implications and equalities between the blockers of the unrolling: the condition variables
   * of instantiated templates, their start blockers and the conjunctions of blockers that
   * [[encodeBlockers]] introduces. The quantifier instantiation and the blocker promotion of the
@@ -73,13 +75,16 @@ trait BlockerGraph { self: Templates =>
     ) => (b, Seq.empty)
 
     case _ =>
-      val flatBs = fixpoint((bs: Set[Encoded]) => bs.flatMap(b => condEquals.getBorElse(b, Set(b))))(bs)
+      // the conjuncts keep the order of `bs` rather than hash order, so that the clause doesn't depend
+      // on hash codes (see [[Items]])
+      val flatBs: Set[Encoded] =
+        fixpoint((bs: Set[Encoded]) => ListSet.from(bs.iterator.flatMap(b => condEquals.getBorElse(b, Set(b)))))(ListSet.from(bs))
       condEquals.getA(flatBs) match {
         case Some(b) => (b, Seq.empty)
         case None =>
           val b = encodeSymbol(sym)
           condEquals += (b -> flatBs)
-          (b, Seq(mkEquals(b, if (flatBs.isEmpty) trueT else mkAnd(flatBs.toSeq*))))
+          (b, Rule.Define(None, b, if (flatBs.isEmpty) trueT else mkAnd(flatBs.toSeq*)).clauses)
       }
   }
 

@@ -123,12 +123,17 @@ trait SMTLIBTarget extends SMTLIBParser with Interruptible with ADTManagers {
 
   protected val adtManager = new ADTManager
 
-  protected def id2sym(id: Identifier): SSymbol = {
-    SSymbol(id.uniqueNameDelimited("!")
+  // The symbols are numbered by the target rather than with the identifiers' global ids
+  private val symbolNames = new SymbolNames
+
+  /** The part of the symbols of `id` before their number */
+  protected def symbolBase(id: Identifier): String =
+    id.name
       .replace("|", "$pipe")
       .replace(":", "$colon")
-      .replace("\\", "$backslash"))
-  }
+      .replace("\\", "$backslash")
+
+  protected def id2sym(id: Identifier): SSymbol = SSymbol(symbolNames(id, symbolBase(id)))
 
   protected def freshSym(id: Identifier): SSymbol = freshSym(id.name)
   protected def freshSym(name: String): SSymbol = id2sym(FreshIdentifier(name))
