@@ -8,6 +8,7 @@ import utils._
 
 import scala.collection.generic.CanBuildFrom
 import scala.collection.mutable.{Set => MutableSet}
+import scala.collection.immutable.VectorMap
 
 trait Templates
   extends TemplateGenerator
@@ -21,6 +22,7 @@ trait Templates
      with PartialFunctions
      with OpenJunctions
      with RuleKernel
+     with RuleChecker
      with SolverFacades
      with IncrementalStateWrapper {
 
@@ -126,6 +128,36 @@ trait Templates
     }
   }
 
+  /** The pending unfoldings of a manager, as an immutable value: the items to unfold under each
+    * key, and the generation at which they are unfolded, in the order in which the keys were first
+    * registered. It behaves as an [[UnrollingQueue]], whose operations return the new value. */
+  final case class Pending[K, I](entries: VectorMap[K, (Int, Set[I])]) {
+    def isEmpty: Boolean = entries.isEmpty
+    def keys: Iterable[K] = entries.keys
+
+    /** The earliest generation of the pending keys, if any. */
+    def generation: Option[Int] = if (entries.isEmpty) None else Some(entries.values.map(_._1).min)
+
+    def register(key: K, gen: Int, items: Set[I]): Pending[K, I] = entries.get(key) match {
+      case Some((exGen, exItems)) => Pending(entries.updated(key, (gen min exGen, exItems ++ items)))
+      case None => Pending(entries.updated(key, (gen, items)))
+    }
+
+    /** The pending items with `key` moved to the current generation, if `key` is pending. */
+    def promote(key: K): Option[Pending[K, I]] =
+      entries.get(key).map { case (_, items) => Pending(entries.updated(key, (currentGeneration, items))) }
+
+    /** The keys that are due at the current generation, with their items, and the keys left. */
+    def dequeue: (Seq[(K, Int, Set[I])], Pending[K, I]) = {
+      val (due, rest) = entries.partition(_._2._1 <= currentGeneration)
+      (due.toSeq.map { case (k, (gen, items)) => (k, gen, items) }, Pending(rest))
+    }
+  }
+
+  object Pending {
+    def empty[K, I]: Pending[K, I] = Pending(VectorMap.empty)
+  }
+
   /** A queue of the items that blockers guard, whose blockers the model checks assume false. */
   class BlockerQueue[I] extends UnrollingQueue[Encoded, I] {
     // lazy, as the constructor of [[UnrollingQueue]] collects it
@@ -163,7 +195,8 @@ trait Templates
   // Set of variables that have already been declared in this solver
   private val declared = new IncrementalSet[(Variable, Encoded)]
 
-  val incrementals: Seq[IncrementalState] = managers ++ Seq(witnessState, blockerGraph, partialFunctionState, declared)
+  val incrementals: Seq[IncrementalState] =
+    managers ++ Seq(witnessState, blockerGraph, partialFunctionState, declared, ruleCheckerState)
 
   protected def promoteBlocker(b: Encoded, force: Boolean = false): Boolean = {
     var seen: Set[Encoded] = Set.empty
@@ -359,9 +392,10 @@ trait Templates
 
   extension [A,B](map: Map[A,Seq[B]]) {
     @annotation.targetName("mergeMapSeqMap")
-    def merge(that: Map[A,Seq[B]]): Map[A,Seq[B]] = (map.keys ++ that.keys).map { k =>
-      k -> (map.getOrElse(k, Seq.empty) ++ that.getOrElse(k, Seq.empty)).distinct
-    }.toMap
+    // Keeps the keys in insertion order, so that the clauses don't depend on hash codes
+    def merge(that: Map[A,Seq[B]]): Map[A,Seq[B]] = that.foldLeft(VectorMap.from(map)) {
+      case (acc, (k, bs)) => acc.updated(k, (acc.getOrElse(k, Seq.empty) ++ bs).distinct)
+    }
 
     @annotation.targetName("mergeMapSeqTuple")
     def merge(that: (A,B)): Map[A,Seq[B]] = map + (that._1 -> (map.getOrElse(that._1, Seq.empty) :+ that._2))
@@ -546,7 +580,7 @@ trait Templates
       */
     lazy val (key, instantiation, locals, instantiationSubst) = {
       val inst = contents.instantiation(contents.pathVar._2, Map.empty[Encoded, Arg])
-      val instantiation = inst.clauses()
+      val instantiation = Rule.Instance(inst, InstanceOf.Expression(_ => false)).clauses
       val substMap = inst.substMap
 
       val deps = dependencies.map(inst.substituter)
@@ -742,7 +776,7 @@ trait Templates
       val idToTrId : Map[Variable, Encoded] =
         condVars ++ exprVars + pathVar ++ arguments ++ substMap ++
         lambdas.map(_.ids) ++ quants.flatMap(_.mapping) ++ equals.flatMap(_._2.map(_.symbols)) ++
-        typesManager.tpSubst ++ uninterpretedSubst
+        typeCaches.tpSubst ++ uninterpretedSubst
       val encoder: Expr => Encoded = mkEncoder(idToTrId)
 
       val optIdCall = optCall.map { callee => (callee, arguments.map(p => Left(p._2))) }
@@ -771,7 +805,7 @@ trait Templates
           pointers ++= resultPointers(encoder)(e)
         }
 
-        clauses ++= (for ((b,es) <- guardedExprs; e <- es) yield encoder(Implies(b, e)))
+        clauses ++= (for ((b,es) <- guardedExprs.toSeq; e <- es) yield encoder(Implies(b, e)))
         clauses ++= eqs.map(encoder)
 
         // The failure literals of the body of a function or lambda define whether it fails (see
@@ -962,8 +996,8 @@ trait Templates
       val literals = contents.failures.getOrElse(Seq.empty)
 
       val allClauses = new scala.collection.mutable.ListBuffer[Encoded]
-      if (failure.isEmpty) allClauses ++= literals.map(f => mkNot(substituter(f)))
-      allClauses ++= contents.clauses.map(substituter)
+      if (failure.isEmpty) allClauses ++= literals.flatMap(f => Rule.Unreachable(substituter(f)).clauses)
+      allClauses ++= generated(contents.clauses.map(substituter))
 
       // Applies `f` to the items that `select` picks, under their substituted blockers
       def each[I](select: PartialFunction[Item, I])(f: (Encoded, I) => Unit): Unit =
@@ -972,7 +1006,7 @@ trait Templates
       // The calls and applications that may fail, under their blockers
       val failing = new scala.collection.mutable.ListBuffer[Encoded]
       def mayFail(b: Encoded, fails: => Encoded): Unit = if (modes.partialFunctions) {
-        if (failure.isDefined) failing += mkAnd(b, fails) else allClauses += mkImplies(b, mkNot(fails))
+        if (failure.isDefined) failing += mkAnd(b, fails) else allClauses ++= Rule.Unreachable(fails, Some(b)).clauses
       }
 
       each { case c: Call => c } { (bp, fi) =>
@@ -996,7 +1030,7 @@ trait Templates
           case Seq(source) => source
           case _ => mkOr(sources.toSeq*)
         }
-        allClauses += mkImplies(substituter(contents.pathVar._2), mkEquals(self, fails))
+        allClauses ++= Rule.Define(Some(substituter(contents.pathVar._2)), self, fails).clauses
       }
       allClauses ++= newFailureDefinitions()
 
@@ -1016,10 +1050,13 @@ trait Templates
     }
   }
 
+  /** The clauses of the expression that `gen` gives, under a fresh start blocker, which `root`
+    * gives the clauses of. */
   private def instantiate(
     bindings: Map[Variable, Encoded],
     gen: (Variable, Encoded) => TemplateClauses,
-    exempt: App => Boolean = _ => false
+    exempt: App => Boolean = _ => false,
+    root: Encoded => Clauses = Rule.Root(_).clauses
   ): Clauses = {
     val start = Variable.fresh("start", BooleanType(), true)
     val encodedStart = encodeSymbol(start)
@@ -1027,8 +1064,9 @@ trait Templates
     val tmplClauses = gen(start, encodedStart)
 
     val (contents, _) = Template.contents(start -> encodedStart, bindings.toSeq, tmplClauses)
-    val allClauses = encodedStart +:
-      contents.instantiation(encodedStart, Map.empty[Encoded, Arg]).clauses(exempt = exempt)
+    val instance =
+      Rule.Instance(contents.instantiation(encodedStart, Map.empty[Encoded, Arg]), InstanceOf.Expression(exempt)).clauses
+    val allClauses = root(encodedStart) ++ instance
 
     for (cl <- allClauses) {
       reporter.debug("  . " + cl)
@@ -1080,6 +1118,13 @@ trait Templates
     def isWitnessApp(app: App): Boolean = partial &&
       (app.caller == f1 || app.caller == f2) && app.tpe == tpe && app.args.map(_.encoded) == wsT
 
+    // the witness condition starts the instantiation, where the query would be its root
+    def root(encodedStart: Encoded): Clauses = {
+      val (err1, err2) = (appFailure(f1, tpe, wsT), appFailure(f2, tpe, wsT))
+      Rule.Define(None, encodedStart, mkAnd(guard, mkNot(mkEquals(f1, f2)))).clauses ++
+        Rule.Witness(encodedStart, differT, if (partial) Some((err1, err2)) else None).clauses
+    }
+
     val clauses = instantiate(bindings + (differ -> differT), { (start, encodedStart) =>
       val substMap = bindings + (differ -> differT) + (start -> encodedStart)
       val tmplClauses = mkClauses0(start,
@@ -1090,14 +1135,9 @@ trait Templates
       }
 
       tpeClauses.foldLeft(tmplClauses)(_ ++ _)
-    }, isWitnessApp)
+    }, isWitnessApp, root)
 
-    // `instantiate` asserts the start blocker, which we replace with the witness condition
-    val encodedStart +: rest = clauses: @unchecked
-    val (err1, err2) = (appFailure(f1, tpe, wsT), appFailure(f2, tpe, wsT))
-    val distinguished = if (!partial) differT else mkOr(mkNot(mkEquals(err1, err2)), mkAnd(mkNot(err1), mkNot(err2), differT))
-    (mkEquals(encodedStart, mkAnd(guard, mkNot(mkEquals(f1, f2)))) +: mkImplies(encodedStart, distinguished) +: rest) ++
-      newFailureDefinitions()
+    clauses ++ newFailureDefinitions()
   }
 
   protected def instantiateExpr(expr: Expr, bindings: Map[Variable, Encoded]): Clauses = {
