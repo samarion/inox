@@ -180,7 +180,7 @@ trait TypeTemplates { self: Templates =>
               (instantiate: => Clauses): Clauses = {
       val key = (tpe, arg, closures, generator, inDomain, ground, blocker)
       results.get(key) match {
-        case Some(res) => Seq(mkEquals(result, res))
+        case Some(res) => Rule.Define(None, result, res).clauses
         case None =>
           results += key -> result
           instantiate
@@ -245,7 +245,8 @@ trait TypeTemplates { self: Templates =>
       val guard = mkAnd(readBlocker, mkEquals(collection, read), cond)
       val typeBlocker = encodeSymbol(Variable.fresh("rb", BooleanType(), true))
       val result = encodeSymbol(Variable.fresh("result", BooleanType(), true))
-      val (next, definition) = typesManager.readsTypings(typing).extend(Seq(mkImplies(guard, result)))
+      val reads = typesManager.readsTypings(typing)
+      val next = reads.next
       typesManager.readTypings += ((blocker, collection, read, key))
       typesManager.readsTypings += typing -> next
 
@@ -253,10 +254,9 @@ trait TypeTemplates { self: Templates =>
       val elemClosures = typeOps.variablesOf(elemTpe).toSeq.sortBy(_.id).map(subst)
 
       registerImplication(blocker, typeBlocker)
-      Seq(
-        mkImplies(mkAnd(blocker, guard), typeBlocker),
-        mkImplies(blocker, definition)
-      ) ++ instantiateType(typeBlocker, Typing(elemTpe, value, Constraint(result, elemClosures, free)))
+      Rule.Enables(mkAnd(blocker, guard), typeBlocker).clauses ++
+        reads.link(next, Seq(mkImplies(guard, result)), Some(blocker)) ++
+        instantiateType(typeBlocker, Typing(elemTpe, value, Constraint(result, elemClosures, free)))
     }
   }
 
@@ -301,7 +301,7 @@ trait TypeTemplates { self: Templates =>
     }
 
     registerImplication(blocker, readBlocker)
-    readClauses :+ mkImplies(blocker, readBlocker)
+    readClauses ++ Rule.Enables(blocker, readBlocker).clauses
   }
 
   /** A collection, whose reads typing is the conjunction that its `typing` result stands for (see
@@ -317,9 +317,9 @@ trait TypeTemplates { self: Templates =>
     }
 
     def holds: Clauses = typing.instantiator match {
-      case Constraint(res, _, _, _, _) => Seq(mkImplies(blocker, mkEquals(res, trueT)))
-      case Membership(res, _) => Seq(mkImplies(blocker, mkEquals(res, trueT)))
-      case Collection(res, _, _) => Seq(mkImplies(blocker, mkEquals(res, trueT)))
+      case Constraint(res, _, _, _, _) => Rule.Define(Some(blocker), res, trueT).clauses
+      case Membership(res, _) => Rule.Define(Some(blocker), res, trueT).clauses
+      case Collection(res, _, _) => Rule.Define(Some(blocker), res, trueT).clauses
       case _ => Seq.empty
     }
 
@@ -331,7 +331,8 @@ trait TypeTemplates { self: Templates =>
       case _ if deferTyping(typing) =>
         trackWitnessDepth(blocker)
         deferredTypings += ((blocker, typing))
-        holds
+        val Constraint(result, _, _, _, _) = typing.instantiator: @unchecked
+        Rule.Typed(blocker, result).clauses
 
       // In certain non-recursive cases, we want to instantiate the typing
       // immediately to improve unrolling performance
@@ -356,7 +357,7 @@ trait TypeTemplates { self: Templates =>
   /** Template used to unfold free symbols in the input expression. */
   class ConstraintTemplate private[TypeTemplates] (val contents: TemplateContents) extends Template {
     def instantiate(blocker: Encoded, result: Encoded, arg: Encoded, closures: Seq[Arg]): Clauses = {
-      instantiate(blocker, Seq(Left(result), Left(arg)) ++ closures)
+      Rule.Unfold(this, blocker, Seq(Left(result), Left(arg)) ++ closures, None).clauses
     }
   }
 
@@ -393,7 +394,7 @@ trait TypeTemplates { self: Templates =>
     val Seq((_, container), _) = contents.arguments
 
     def instantiate(blocker: Encoded, container: Encoded, arg: Encoded): Clauses = {
-      instantiate(blocker, Seq(Left(container), Left(arg)))
+      Rule.Unfold(this, blocker, Seq(Left(container), Left(arg)), None).clauses
     }
 
     override protected def instantiate(instantiation: Instantiation): Clauses = {
@@ -458,7 +459,7 @@ trait TypeTemplates { self: Templates =>
       for ((b, tps) <- types; tp <- tps) tp match {
         case Typing(t @ (_: FunctionType | _: PiType), arg, Capture(containerT, containerType)) =>
           val ft = t.getType.asInstanceOf[FunctionType]
-          funClauses :+= mkImplies(b, lessThan(order(ft)(arg), order(containerType)(containerT)))
+          funClauses ++= Rule.Decreases(b, lessThan(order(ft)(arg), order(containerType)(containerT)), None).clauses
           functions += arg
         case _ => typeBlockers += b -> (typeBlockers.getOrElse(b, Set.empty) + tp)
       }
