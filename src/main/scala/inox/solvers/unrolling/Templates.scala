@@ -8,6 +8,7 @@ import utils._
 
 import scala.collection.generic.CanBuildFrom
 import scala.collection.mutable.{Set => MutableSet}
+import scala.collection.immutable.{ListSet, VectorMap}
 
 trait Templates
   extends TemplateGenerator
@@ -21,6 +22,7 @@ trait Templates
      with PartialFunctions
      with OpenJunctions
      with RuleKernel
+     with RuleChecker
      with SolverFacades
      with IncrementalStateWrapper {
 
@@ -84,61 +86,43 @@ trait Templates
     def promoteBlocker(b: Encoded): Boolean
   }
 
-  /** The pending unfoldings of a manager: the items to unfold under each key (a blocker, or an
-    * application whose unfolding a blocker guards), and the generation at which they are unfolded.
-    * Items registered under a pending key join it, at the earliest of their generations, and a
-    * promoted key is unfolded at the current generation. */
-  class UnrollingQueue[K, I] extends IncrementalStateWrapper {
-    private val pending = new IncrementalMap[K, (Int, Set[I])]
-    protected def extraIncrementals: Seq[IncrementalState] = Seq.empty
-    protected val incrementals: Seq[IncrementalState] = pending +: extraIncrementals
-
-    def isEmpty: Boolean = pending.isEmpty
-    def contains(key: K): Boolean = pending.contains(key)
-    def keys: Iterable[K] = pending.map(_._1)
-    def entries: Seq[(K, Int, Set[I])] = pending.toSeq.map { case (k, (gen, items)) => (k, gen, items) }
+  /** The pending unfoldings of a manager, as an immutable value: the items to unfold under each
+    * key (a blocker, or an application whose unfolding a blocker guards), and the generation at
+    * which they are unfolded, in the order in which the keys were first registered. Items registered
+    * under a pending key join it, at the earliest of their generations, and a promoted key is
+    * unfolded at the current generation. */
+  final case class Pending[K, I](entries: VectorMap[K, (Int, Set[I])]) {
+    def isEmpty: Boolean = entries.isEmpty
+    def keys: Iterable[K] = entries.keys
+    def contains(key: K): Boolean = entries.contains(key)
 
     /** The earliest generation of the pending keys, if any. */
-    def generation: Option[Int] = if (pending.isEmpty) None else Some(pending.values.map(_._1).min)
+    def generation: Option[Int] = if (entries.isEmpty) None else Some(entries.values.map(_._1).min)
 
-    def register(key: K, gen: Int, items: Set[I]): Unit = pending.get(key) match {
-      case Some((exGen, exItems)) => pending += key -> (gen min exGen, exItems ++ items)
-      case None => pending += key -> (gen, items)
+    def register(key: K, gen: Int, items: Set[I]): Pending[K, I] = entries.get(key) match {
+      case Some((exGen, exItems)) => Pending(entries.updated(key, (gen min exGen, exItems ++ items)))
+      case None => Pending(entries.updated(key, (gen, items)))
     }
 
     /** Replaces the items of the pending `key`, which keeps its generation. */
-    def replace(key: K, items: Set[I]): Unit =
-      for ((gen, _) <- pending.get(key)) pending += key -> (gen, items)
-
-    def promote(key: K): Boolean = pending.get(key) match {
-      case Some((_, items)) =>
-        pending += key -> (currentGeneration, items)
-        true
-      case None =>
-        false
+    def replace(key: K, items: Set[I]): Pending[K, I] = entries.get(key) match {
+      case Some((gen, _)) => Pending(entries.updated(key, (gen, items)))
+      case None => this
     }
 
-    /** Removes the keys that are due at the current generation, and returns them with their items. */
-    def dequeue(): Seq[(K, Int, Set[I])] = {
-      val due = pending.toSeq.filter(_._2._1 <= currentGeneration)
-      pending --= due.map(_._1)
-      due.map { case (k, (gen, items)) => (k, gen, items) }
+    /** The pending items with `key` moved to the current generation, if `key` is pending. */
+    def promote(key: K): Option[Pending[K, I]] =
+      entries.get(key).map { case (_, items) => Pending(entries.updated(key, (currentGeneration, items))) }
+
+    /** The keys that are due at the current generation, with their items, and the keys left. */
+    def dequeue: (Seq[(K, Int, Set[I])], Pending[K, I]) = {
+      val (due, rest) = entries.partition(_._2._1 <= currentGeneration)
+      (due.toSeq.map { case (k, (gen, items)) => (k, gen, items) }, Pending(rest))
     }
   }
 
-  /** A queue of the items that blockers guard, whose blockers the model checks assume false. */
-  class BlockerQueue[I] extends UnrollingQueue[Encoded, I] {
-    // lazy, as the constructor of [[UnrollingQueue]] collects it
-    private lazy val negations = new IncrementalMap[Encoded, Encoded]
-    override protected def extraIncrementals: Seq[IncrementalState] = Seq(negations)
-
-    override def register(blocker: Encoded, gen: Int, items: Set[I]): Unit = {
-      if (!negations.contains(blocker)) negations += blocker -> mkNot(blocker)
-      super.register(blocker, gen, items)
-    }
-
-    /** The negations of the pending blockers. */
-    def satisfactionAssumptions: Seq[Encoded] = keys.toSeq.map(negations)
+  object Pending {
+    def empty[K, I]: Pending[K, I] = Pending(VectorMap.empty)
   }
 
   private val managers: Seq[Manager] = Seq(
@@ -163,7 +147,8 @@ trait Templates
   // Set of variables that have already been declared in this solver
   private val declared = new IncrementalSet[(Variable, Encoded)]
 
-  val incrementals: Seq[IncrementalState] = managers ++ Seq(witnessState, blockerGraph, partialFunctionState, declared)
+  val incrementals: Seq[IncrementalState] =
+    managers ++ Seq(witnessState, blockerGraph, partialFunctionState, declared, ruleCheckerState)
 
   protected def promoteBlocker(b: Encoded, force: Boolean = false): Boolean = {
     var seen: Set[Encoded] = Set.empty
@@ -350,18 +335,21 @@ trait Templates
 
   extension [A,B](map: Map[A,Set[B]]) {
     @annotation.targetName("mergeMapSetMap")
-    def merge(that: Map[A,Set[B]]): Map[A,Set[B]] = (map.keys ++ that.keys).map { k =>
-      k -> (map.getOrElse(k, Set.empty) ++ that.getOrElse(k, Set.empty))
-    }.toMap
+    // Keeps the keys and the elements in insertion order, so that the clauses don't depend on hash codes
+    def merge(that: Map[A,Set[B]]): Map[A,Set[B]] = that.foldLeft(VectorMap.from(map)) {
+      case (acc, (k, bs)) => acc.updated(k, ListSet.from(acc.getOrElse(k, ListSet.empty)) ++ bs)
+    }
     @annotation.targetName("mergeMapSetTuple")
-    def merge(that: (A,B)): Map[A,Set[B]] = map + (that._1 -> (map.getOrElse(that._1, Set.empty) + that._2))
+    def merge(that: (A,B)): Map[A,Set[B]] =
+      VectorMap.from(map).updated(that._1, ListSet.from(map.getOrElse(that._1, ListSet.empty)) + that._2)
   }
 
   extension [A,B](map: Map[A,Seq[B]]) {
     @annotation.targetName("mergeMapSeqMap")
-    def merge(that: Map[A,Seq[B]]): Map[A,Seq[B]] = (map.keys ++ that.keys).map { k =>
-      k -> (map.getOrElse(k, Seq.empty) ++ that.getOrElse(k, Seq.empty)).distinct
-    }.toMap
+    // Keeps the keys in insertion order, so that the clauses don't depend on hash codes
+    def merge(that: Map[A,Seq[B]]): Map[A,Seq[B]] = that.foldLeft(VectorMap.from(map)) {
+      case (acc, (k, bs)) => acc.updated(k, (acc.getOrElse(k, Seq.empty) ++ bs).distinct)
+    }
 
     @annotation.targetName("mergeMapSeqTuple")
     def merge(that: (A,B)): Map[A,Seq[B]] = map + (that._1 -> (map.getOrElse(that._1, Seq.empty) :+ that._2))
@@ -383,13 +371,16 @@ trait Templates
   type Equalities = Map[Encoded, Set[Equality]]
   type Pointers   = Map[Encoded, Encoded]
 
-  /** The items of a template under their blockers. */
+  /** The items of a template under their blockers. The blockers and the items under each blocker
+    * are kept in the order in which they were found (as [[VectorMap]]s and [[ListSet]]s), so that the
+    * order in which they are instantiated, and thus the order of the clauses, doesn't depend on the
+    * hash codes of the encoded terms. */
   type Items      = Map[Encoded, Set[Item]]
 
   extension (items: Items) {
     /** The items that `select` picks, under their blockers. */
-    def ofKind[I](select: PartialFunction[Item, I]): Map[Encoded, Set[I]] = items.flatMap { case (b, is) =>
-      val selected = is.collect(select)
+    def ofKind[I](select: PartialFunction[Item, I]): Map[Encoded, Set[I]] = VectorMap.from(items).flatMap { case (b, is) =>
+      val selected = ListSet.from(is.iterator.collect(select))
       if (selected.isEmpty) None else Some(b -> selected)
     }
 
@@ -402,7 +393,8 @@ trait Templates
   }
 
   /** The items of a map from blockers to items of one kind. */
-  def asItems[I <: Item](guarded: Map[Encoded, Set[I]]): Items = guarded.map { case (b, is) => b -> is.toSet[Item] }
+  def asItems[I <: Item](guarded: Map[Encoded, Set[I]]): Items =
+    VectorMap.from(guarded).map { case (b, is) => b -> (ListSet.from(is): Set[Item]) }
 
   object TemplateContents {
     def empty(pathVar: (Variable, Encoded), args: Seq[(Variable, Encoded)]) =
@@ -438,7 +430,7 @@ trait Templates
         pathVar._1 -> substituter(pathVar._2),
         arguments, condVars, exprVars, condTree,
         clauses.map(substituter),
-        items.map { case (b, is) => substituter(b) -> is.map(_.substitute(substituter, msubst)) },
+        VectorMap.from(items).map { case (b, is) => substituter(b) -> ListSet.from(is.iterator.map(_.substitute(substituter, msubst))) },
         lambdas.map(_.substitute(substituter, msubst)),
         quantifications.map(_.substitute(substituter, msubst)),
         pointers.map(p => substituter(p._1) -> substituter(p._2)),
@@ -546,7 +538,7 @@ trait Templates
       */
     lazy val (key, instantiation, locals, instantiationSubst) = {
       val inst = contents.instantiation(contents.pathVar._2, Map.empty[Encoded, Arg])
-      val instantiation = inst.clauses()
+      val instantiation = Rule.Instance(inst, InstanceOf.Expression(_ => false)).clauses
       val substMap = inst.substMap
 
       val deps = dependencies.map(inst.substituter)
@@ -656,24 +648,25 @@ trait Templates
         case None => Left(encoder(arg))
       }
 
-      val calls = exprOps.collect[Call] {
+      // The items are collected in their order of occurrence rather than in hash order (see [[Items]])
+      val calls = exprOps.collectPreorder[Call] {
         case FunctionInvocation(id, tps, args) =>
           val tpVars = tps.flatMap(variableSeq).distinct
-          Set(Call(Defined(getFunction(id, tps)), args.map(encodeArg), tpVars.map(encodeArg)))
+          Seq(Call(Defined(getFunction(id, tps)), args.map(encodeArg), tpVars.map(encodeArg)))
         // The applications of the free functions of interpreted uninterpreted functions unfold their
         // interpretations
         case Application(f: Variable, args) => interpretedFunctions.get(f) match {
-          case Some(callee) => Set(Call(callee, args.map(encodeArg), Seq.empty))
-          case None => Set.empty
+          case Some(callee) => Seq(Call(callee, args.map(encodeArg), Seq.empty))
+          case None => Seq.empty
         }
-        case _ => Set.empty
+        case _ => Seq.empty
       } (expr).filter { case Call(callee, args, _) =>
         !optCall.exists(p => p._1 == callee && p._2 == args)
       }
 
-      val apps = exprOps.collect[Application] {
-        case app: Application => Set(app)
-        case _ => Set.empty
+      val apps = exprOps.collectPreorder[Application] {
+        case app: Application => Seq(app)
+        case _ => Seq.empty
       } (expr).filter {
         case Application(c, Seq(e1, e2)) => c != equalitySymbol(e1.getType)._1
         case _ => true
@@ -682,7 +675,7 @@ trait Templates
         App(encoder(c), tpe, args.map(encodeArg), encoder(app))
       }.filter(i => Some(i) != optApp)
 
-      val matchers = exprToMatcher.values.toSet
+      val matchers = exprOps.collectPreorder[Matcher](e => exprToMatcher.get(e).toSeq)(expr)
         .filter(i => Some(i.encoded) != optApp.map(_.encoded))
         .filter {
           case Matcher(Right(tfd), args, _) => !optCall.exists(p => p._1 == Defined(tfd) && p._2 == args)
@@ -710,17 +703,17 @@ trait Templates
       // A collection is read where the formula looks it up, and where it is built at the keys it
       // defines, so that a free collection that equals a built one types these keys. The collections
       // that type decompositions build are left out (see [[decompositionKeys]]).
-      val reads = exprOps.collect[Read] {
-        case MapApply(m, k) => Set(Read(m.getType, encoder(m), encoder(k)))
-        case ElementOfSet(e, s) => Set(Read(s.getType, encoder(s), encoder(e)))
-        case MultiplicityInBag(e, b) => Set(Read(b.getType, encoder(b), encoder(e)))
+      val reads = exprOps.collectPreorder[Read] {
+        case MapApply(m, k) => Seq(Read(m.getType, encoder(m), encoder(k)))
+        case ElementOfSet(e, s) => Seq(Read(s.getType, encoder(s), encoder(e)))
+        case MultiplicityInBag(e, b) => Seq(Read(b.getType, encoder(b), encoder(e)))
         case c @ (_: FiniteMap | _: MapUpdated | _: FiniteSet | _: SetAdd | _: SetUnion | _: SetIntersection |
                   _: SetDifference | _: FiniteBag | _: BagAdd | _: BagUnion | _: BagIntersection | _: BagDifference) =>
-          definedKeys(c).filterNot(decompositionKeys).map(k => Read(c.getType, encoder(c), encoder(k))).toSet
-        case _ => Set.empty
+          definedKeys(c).filterNot(decompositionKeys).map(k => Read(c.getType, encoder(c), encoder(k)))
+        case _ => Seq.empty
       } (expr)
 
-      ExtractedCalls(calls.toSet[Item] ++ apps ++ matchers ++ reads, pointers)
+      ExtractedCalls(ListSet.from[Item](calls ++ apps ++ matchers ++ reads), pointers)
     }
 
     /** The failure literals among the expression variables of a template (see [[failureSymbols]]). */
@@ -742,7 +735,7 @@ trait Templates
       val idToTrId : Map[Variable, Encoded] =
         condVars ++ exprVars + pathVar ++ arguments ++ substMap ++
         lambdas.map(_.ids) ++ quants.flatMap(_.mapping) ++ equals.flatMap(_._2.map(_.symbols)) ++
-        typesManager.tpSubst ++ uninterpretedSubst
+        typeCaches.tpSubst ++ uninterpretedSubst
       val encoder: Expr => Encoded = mkEncoder(idToTrId)
 
       val optIdCall = optCall.map { callee => (callee, arguments.map(p => Left(p._2))) }
@@ -757,7 +750,7 @@ trait Templates
 
         val pv = pathVar._1
         for ((b,es) <- guardedExprs `merge` Map(pv -> eqs)) {
-          var bItems : Set[Item] = Set.empty
+          var bItems : Set[Item] = ListSet.empty
           for (e <- es) {
             val extracted = extractCalls(e, idToTrId, optIdCall, optIdApp)
             bItems ++= extracted.items
@@ -771,7 +764,7 @@ trait Templates
           pointers ++= resultPointers(encoder)(e)
         }
 
-        clauses ++= (for ((b,es) <- guardedExprs; e <- es) yield encoder(Implies(b, e)))
+        clauses ++= (for ((b,es) <- guardedExprs.toSeq; e <- es) yield encoder(Implies(b, e)))
         clauses ++= eqs.map(encoder)
 
         // The failure literals of the body of a function or lambda define whether it fails (see
@@ -962,8 +955,8 @@ trait Templates
       val literals = contents.failures.getOrElse(Seq.empty)
 
       val allClauses = new scala.collection.mutable.ListBuffer[Encoded]
-      if (failure.isEmpty) allClauses ++= literals.map(f => mkNot(substituter(f)))
-      allClauses ++= contents.clauses.map(substituter)
+      if (failure.isEmpty) allClauses ++= literals.flatMap(f => Rule.Unreachable(substituter(f)).clauses)
+      allClauses ++= generated(contents.clauses.map(substituter))
 
       // Applies `f` to the items that `select` picks, under their substituted blockers
       def each[I](select: PartialFunction[Item, I])(f: (Encoded, I) => Unit): Unit =
@@ -972,7 +965,7 @@ trait Templates
       // The calls and applications that may fail, under their blockers
       val failing = new scala.collection.mutable.ListBuffer[Encoded]
       def mayFail(b: Encoded, fails: => Encoded): Unit = if (modes.partialFunctions) {
-        if (failure.isDefined) failing += mkAnd(b, fails) else allClauses += mkImplies(b, mkNot(fails))
+        if (failure.isDefined) failing += mkAnd(b, fails) else allClauses ++= Rule.Unreachable(fails, Some(b)).clauses
       }
 
       each { case c: Call => c } { (bp, fi) =>
@@ -996,7 +989,7 @@ trait Templates
           case Seq(source) => source
           case _ => mkOr(sources.toSeq*)
         }
-        allClauses += mkImplies(substituter(contents.pathVar._2), mkEquals(self, fails))
+        allClauses ++= Rule.Define(Some(substituter(contents.pathVar._2)), self, fails).clauses
       }
       allClauses ++= newFailureDefinitions()
 
@@ -1016,10 +1009,13 @@ trait Templates
     }
   }
 
+  /** The clauses of the expression that `gen` gives, under a fresh start blocker, which `root`
+    * gives the clauses of. */
   private def instantiate(
     bindings: Map[Variable, Encoded],
     gen: (Variable, Encoded) => TemplateClauses,
-    exempt: App => Boolean = _ => false
+    exempt: App => Boolean = _ => false,
+    root: Encoded => Clauses = Rule.Root(_).clauses
   ): Clauses = {
     val start = Variable.fresh("start", BooleanType(), true)
     val encodedStart = encodeSymbol(start)
@@ -1027,8 +1023,9 @@ trait Templates
     val tmplClauses = gen(start, encodedStart)
 
     val (contents, _) = Template.contents(start -> encodedStart, bindings.toSeq, tmplClauses)
-    val allClauses = encodedStart +:
-      contents.instantiation(encodedStart, Map.empty[Encoded, Arg]).clauses(exempt = exempt)
+    val instance =
+      Rule.Instance(contents.instantiation(encodedStart, Map.empty[Encoded, Arg]), InstanceOf.Expression(exempt)).clauses
+    val allClauses = root(encodedStart) ++ instance
 
     for (cl <- allClauses) {
       reporter.debug("  . " + cl)
@@ -1080,6 +1077,13 @@ trait Templates
     def isWitnessApp(app: App): Boolean = partial &&
       (app.caller == f1 || app.caller == f2) && app.tpe == tpe && app.args.map(_.encoded) == wsT
 
+    // the witness condition starts the instantiation, where the query would be its root
+    def root(encodedStart: Encoded): Clauses = {
+      val (err1, err2) = (appFailure(f1, tpe, wsT), appFailure(f2, tpe, wsT))
+      Rule.Define(None, encodedStart, mkAnd(guard, mkNot(mkEquals(f1, f2)))).clauses ++
+        Rule.Witness(encodedStart, differT, if (partial) Some((err1, err2)) else None).clauses
+    }
+
     val clauses = instantiate(bindings + (differ -> differT), { (start, encodedStart) =>
       val substMap = bindings + (differ -> differT) + (start -> encodedStart)
       val tmplClauses = mkClauses0(start,
@@ -1090,14 +1094,9 @@ trait Templates
       }
 
       tpeClauses.foldLeft(tmplClauses)(_ ++ _)
-    }, isWitnessApp)
+    }, isWitnessApp, root)
 
-    // `instantiate` asserts the start blocker, which we replace with the witness condition
-    val encodedStart +: rest = clauses: @unchecked
-    val (err1, err2) = (appFailure(f1, tpe, wsT), appFailure(f2, tpe, wsT))
-    val distinguished = if (!partial) differT else mkOr(mkNot(mkEquals(err1, err2)), mkAnd(mkNot(err1), mkNot(err2), differT))
-    (mkEquals(encodedStart, mkAnd(guard, mkNot(mkEquals(f1, f2)))) +: mkImplies(encodedStart, distinguished) +: rest) ++
-      newFailureDefinitions()
+    clauses ++ newFailureDefinitions()
   }
 
   protected def instantiateExpr(expr: Expr, bindings: Map[Variable, Encoded]): Clauses = {
