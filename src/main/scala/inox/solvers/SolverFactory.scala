@@ -345,6 +345,7 @@ object SolverFactory {
 
       case "smt-cvc5" => create(p)(finalName, {
         val ev = sem.getEvaluator(using ctx)
+        val programConverts = smtlib.CVC5Solver.convertsBVsAndInts(p)
         class SMTCVC5Impl(override val program: p.type)
                          (override val enc: transformers.ProgramTransformer {
                            val sourceProgram: program.type
@@ -357,7 +358,9 @@ object SolverFactory {
 
           class Underlying(override val program: targetProgram.type)
             extends smtlib.SMTLIBSolver(program, ctx)
-              with smtlib.CVC5Solver
+              with smtlib.CVC5Solver {
+            override protected def bvIntConversions: Boolean = programConverts
+          }
 
           protected val underlying = nonIncrementalWrap(ctx, nonIncremental)(targetProgram)(finalName, targetSemantics, () => new Underlying(targetProgram))
 
