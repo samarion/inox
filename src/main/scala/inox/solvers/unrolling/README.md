@@ -49,6 +49,7 @@ between the two:
 | Template contents, guarded items and their instantiation (`Instantiation`) | `Templates.scala` |
 | The rules that build the clauses, each with why its clauses hold for every solution (`Rule`) | `RuleKernel.scala` |
 | The run-time check that the solver asserts only the clauses of the rules, and only refutes under the assumptions that refutations may make (`optCheckRules`, set in the tests) | `RuleChecker.scala` |
+| The informal argument that proofs are sound: the theorem, the intended interpretation, and one lemma for each rule and open junction | [`soundness-argument.md`](soundness-argument.md) |
 | Implications and equalities between blockers | `BlockerGraph.scala` |
 | Conjunctions and disjunctions that grow with the unrolling (`OpenAnd`, `OpenOr`), and the assumptions that they are complete | `OpenJunctions.scala` |
 | Partial functions: the failure literals of calls and applications | `PartialFunctions.scala` |
