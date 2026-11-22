@@ -217,8 +217,10 @@ body and equal closures are equal, and lambdas that differ may still be
 equal. *Thesis*: Chapter 2.
 
 **ArglessEquality** (`blocker && isFree && start && lambda() == f() ==>
-lambda == f`), where `f` is a free function with no parameters and `lambda`
-a pure lambda with no parameters (one that returns a value it captures).
+lambda == f`, with `!fails` among the premises when functions are partial,
+where `fails` is the failure literal of `f()`), where `f` is a free function
+with no parameters and `lambda` a pure lambda with no parameters (one that
+returns a value it captures).
 
 - Under intensional equality, Iᵢ interprets `isFree` as "`f` is `() => f()`,
   the lambda that returns its result, and none of the lambdas found so far".
@@ -228,11 +230,13 @@ a pure lambda with no parameters (one that returns a value it captures).
   normalized body and closures.
 - With function witnesses, function equality is extensional or unobservable,
   and Iᵢ interprets `isFree` as "`f` equals none of the lambdas found so far".
-  `f` and `lambda` are equal when their results are.
-
-*Open*: the second case when `f` fails. Iᵢ may give `f()` a value distinct
-from `lambda()`, as no solution reaches it, but that value must agree with the
-other clauses about `f()`, such as congruences.
+  When `f()` doesn't fail, `f` and `lambda` are equal when their results are.
+  When it fails, `f` differs from `lambda` under extensional equality, even
+  though Iᵢ may have to give `f()` the value of `lambda()`, as on `Unit`, where
+  all values are equal. With partial functions, the `!fails` premise is false
+  then, as Iᵢ interprets `fails` as whether `f()` fails in σ. Without them
+  (unobservable equality, or `optAssumeChecked`), functions don't fail, or
+  their failures aren't observed.
 
 ## Open junctions
 
@@ -269,8 +273,15 @@ reaches `b_and`: it is checked at fresh grounds instead
 when `ground` holds, and `TypeTemplates` doesn't send ground typings to
 `registerFunction`). Reads typings (`r_and`) are made for contracts only
 outside quantifier domains, but for free values in domains too
-(`TemplateGenerator.storeReads`), which is listed under the open
-obligations.
+(`TemplateGenerator.storeReads`). These are the skolems of quantifiers under
+negative polarity and the fresh grounds of quantifiers
+(`QuantificationTemplates`, where an instance on a fresh ground has the
+ground's typing as a premise). Both are fresh symbols, so Iᵢ picks their
+values: a value of the type when the type is inhabited, where reads typings
+hold. Set and bag types hold the empty collection, and a map type is empty
+only when its value type is. The typing of a map conjoins the typing of its
+default (`TemplateGenerator.mkTypeClauses`), which then gives false for every
+value, whatever the reads typing means.
 
 ## Assumptions
 
@@ -278,7 +289,9 @@ The theorem holds under these assumptions, which no code checks:
 
 1. Function definitions terminate, or the front-end checked it
    (`optAssumeChecked`), for `Decreases` without `unless`.
-2. Custom equalities are equivalence relations, and functions respect them.
+2. Custom equalities are equivalence relations, functions respect them, and
+   they terminate on every pair of values that the query compares, so that
+   Iᵢ can interpret the custom equality symbols by them.
 3. The template generator is correct (part 1 of `Unfold`).
 4. The encoder and the SMT solver are correct: a clause set they call
    unsatisfiable has no model.
@@ -303,11 +316,5 @@ as the trusted base.
 
 ## Open obligations
 
-- `ArglessEquality` with function witnesses, when `f` fails (see above).
-- `r_and` for a free map, set or bag typed in the domain of a quantifier
-  (`FreeGenerator` with `inDomain`), where the reads typing is a premise of
-  the instances and its partial meaning is weaker than the type.
 - `Unfold` part 1, the generator, is only argued expression by expression in
   `TemplateGenerator`.
-- The intended interpretation of the custom equality symbols needs the custom
-  equality to terminate on every pair of values the query compares.
