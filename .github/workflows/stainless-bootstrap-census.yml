@@ -109,10 +109,13 @@ jobs:
       run: |
         sbt -batch stainless-dotty/universal:stage
         # The classpath of Inox and its dependencies, for the files that are not given as sources
-        sbt -batch "export stainless-core/Runtime/fullClasspath" | tail -n 1 | tr ':' '\n' \
+        # (the line of the export that holds Inox's classes: sbt ends its output with terminal codes)
+        sbt -batch -Dsbt.color=false -Dsbt.supershell=false "export stainless-core/Runtime/fullClasspath" \
+          | grep '/inox/target/' | tail -n 1 | sed 's/^\[info\] //' | tr ':' '\n' \
           | grep -E '/inox/target/|scalaz3|smtlib|commons-lang|princess|eldarica|parser-combinators|antlr|java-cup|stringtemplate' \
           | paste -sd: > "$RUNNER_TEMP/inox-classpath"
-        cat "$RUNNER_TEMP/inox-classpath" | tr ':' '\n'
+        tr ':' '\n' < "$RUNNER_TEMP/inox-classpath"
+        grep -q '/inox/target/' "$RUNNER_TEMP/inox-classpath" || { echo "::error::Could not read the classpath of Inox"; exit 1; }
     - name: Run Stainless on Inox
       env:
         # One Stainless per core in the file-by-file runs, on a 16 GB runner
