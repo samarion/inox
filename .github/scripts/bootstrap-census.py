@@ -126,6 +126,10 @@ def main():
                                'exception': r['exception'], 'verification': r['verification'], 'seconds': r['seconds'],
                                'unpositioned': r['unpositioned'][:3], 'dependency_error_kinds': dict(collections.Counter(kind(u) for u in r['unpositioned']).most_common(5))}
 
+    # The compiler reports a plugin crash without the exception, which the file's own run (with --debug=stack) has
+    for c in crashes:
+        if not c['exception'] and c['file'] in per_file: c['exception'] = per_file[c['file']]['exception']
+
     by_file = collections.Counter(e['file'] for e in whole_errors)
     by_kind = collections.Counter(kind(e['msg']) for e in whole_errors)
     by_phase = collections.Counter(e['phase'] for e in whole_errors)
