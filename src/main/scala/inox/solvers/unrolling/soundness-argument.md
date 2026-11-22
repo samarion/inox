@@ -265,8 +265,10 @@ value, whatever the reads typing means.
 
 The theorem holds under these assumptions, which no code checks:
 
-1. Function definitions terminate, or the front-end checked it
-   (`optAssumeChecked`), for `Decreases` without `unless`.
+1. Under `optAssumeChecked`, the front-end has checked that every call
+   terminates and that nothing fails, which `Decreases` without `unless` and
+   the calls without domain checks rely on. Without it, nothing is assumed:
+   a call that doesn't return satisfies `diverges`.
 2. Custom equalities are equivalence relations, functions respect them, and
    they terminate on every pair of values that the query compares, so that
    Iᵢ can interpret the custom equality symbols by them.
