@@ -216,28 +216,6 @@ lambdas with different bodies are distinct. Otherwise, lambdas with the same
 body and equal closures are equal, and lambdas that differ may still be
 equal. *Thesis*: Chapter 2.
 
-**ArglessEquality** (`blocker && isFree && start && lambda() == f() ==>
-lambda == f`, with `!fails` among the premises when functions are partial,
-where `fails` is the failure literal of `f()`), where `f` is a free function
-with no parameters and `lambda` a pure lambda with no parameters (one that
-returns a value it captures).
-
-- Under intensional equality, Iᵢ interprets `isFree` as "`f` is `() => f()`,
-  the lambda that returns its result, and none of the lambdas found so far".
-  When `f`'s value is another lambda, such as `() => if (false) error else
-  y`, `isFree` is false, and the `rest` of the `b_next` disjunction that
-  defines it is true. Then `lambda` and `f` are both `() => v`, the same
-  normalized body and closures.
-- With function witnesses, function equality is extensional or unobservable,
-  and Iᵢ interprets `isFree` as "`f` equals none of the lambdas found so far".
-  When `f()` doesn't fail, `f` and `lambda` are equal when their results are.
-  When it fails, `f` differs from `lambda` under extensional equality, even
-  though Iᵢ may have to give `f()` the value of `lambda()`, as on `Unit`, where
-  all values are equal. With partial functions, the `!fails` premise is false
-  then, as Iᵢ interprets `fails` as whether `f()` fails in σ. Without them
-  (unobservable equality, or `optAssumeChecked`), functions don't fail, or
-  their failures aren't observed.
-
 ## Open junctions
 
 An open conjunction `op1 ∧ ... ∧ opN ∧ rest` or disjunction
@@ -256,7 +234,7 @@ assumed (`AssumedComplete`):
 | Junction | Kind | Assumed complete | Why it is sound |
 |---|---|---|---|
 | `b_lambda`, the dispatch of an application (`LambdaTemplates.instantiateApp`) | `OpenOr` | `ForModels` | Iᵢ makes the head "the caller is some function value", true whenever the application is reached, so `Dispatched` holds. Assuming it complete in a refutation would rule out lambdas still to come. |
-| `b_next`, the lambdas that a free function equals (`LambdaTemplates.registerFunction`) | `OpenOr` | `Always` with function witnesses, `ForModels` under intensional equality | See `ArglessEquality`: under intensional equality, Iᵢ needs the last `rest` true when `f` is a lambda that isn't `() => f()`. With witnesses, `isFree` with the operands found so far satisfies `ArglessEquality`, and the other clauses about `isFree` only dispatch `f`'s applications to `f` itself. |
+| `b_next`, the lambdas that a free function equals (`LambdaTemplates.registerFunction`) | `OpenOr` | `Always` | Iᵢ interprets `isFree` as "`f` equals none of the lambdas found so far". The clauses about `isFree` only dispatch `f`'s applications to `f` itself, which leaves them uninterpreted, and that holds whatever `f` is. |
 | `b_and`, the typings of a free function's application results (`LambdaTemplates.registerFunction`) | `OpenAnd` | `Always` | The typing result means "the results of the applications found so far lie in the codomain". The solution's functions lie in their types, so each conjunct holds whenever the full typing does. This keeps quantifying over an empty function type from leading to invalid proofs. |
 | `r_and`, the typings of the reads of a collection (`TypeTemplates.registerCollection`) | `OpenAnd` | `Always` | The same, for the keys and elements that the query reads. |
 
