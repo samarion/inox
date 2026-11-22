@@ -261,6 +261,82 @@ only when its value type is. The typing of a map conjoins the typing of its
 default (`TemplateGenerator.mkTypeClauses`), which then gives false for every
 value, whatever the reads typing means.
 
+## Down to SMT terms
+
+The theorem is about the clauses as Inox expressions. Two more steps lie
+between a query and the terms that the SMT solver refutes:
+
+1. **The theory encoders** (`solvers/theories`) rewrite the program before
+   the unrolling, for the backends that lack a theory: strings as lists of
+   bit-vector characters (`StringEncoder`), bags and sets as datatype terms
+   whose multiplicities or memberships a recursive function computes
+   (`BagEncoder`, `SetEncoder`), map merges as a map refined by its
+   definition (`MapMergeEncoder`) and reals as fractions of integers
+   (`RealEncoder`). Z3 needs
+   none of them, cvc4 and cvc5 the bag and merge encoders, and Princess all of
+   them (`theories.Z3`, `CVC`, `Princess`).
+2. **The translation** turns the clauses into backend terms: `SMTLIBTarget`
+   and its subclasses for the SMT-LIB solvers (`Z3Target`, `CVCTarget`,
+   `BitwuzlaTarget`, `EldaricaTarget`), `Z3Native` for the native Z3 API and
+   `AbstractPrincessSolver` for Princess.
+
+With σ a solution of the query, the chain is: the encoded σ is a solution of
+the encoded query (E1), the theorem gives Iᵢ for the encoded query, and the
+translation of Iᵢ satisfies the translated clauses (E2). The SMT solver's
+answer is then only trusted for SMT-LIB's semantics (assumption 4).
+
+**E1 (theory encoders).** Each encoder maps values to values (a `Bijection`
+for strings, and the encoding of the theory's values as datatypes or maps),
+and evaluation commutes with it: evaluating the encoded expression under the
+encoded assignment gives the encoding of the result, and fails iff the source
+evaluation fails. Each encoder needs an invariant on the values in its range:
+
+- `StringEncoder`: characters are at most `maxChar`, which the sort's
+  invariant states when they need 18 bits;
+- `BagEncoder` and `SetEncoder`: a bag or a set is any term whose `get` or
+  `contains` gives its multiplicities or members, so their sorts have a custom
+  equality (assumption 2), and the elements of a bag have non-negative
+  multiplicities (the sort's invariant), as non-positive ones mean absent in
+  the evaluator;
+- `MapMergeEncoder`: a merge is an uninterpreted map refined by its
+  definition, a refinement that the merged map satisfies;
+- `RealEncoder`: denominators are positive, and divisions are guarded unless
+  the front-end checked them (`optAssumeChecked`), as in the template
+  generator. Otherwise a division by zero gives a value that only depends on
+  the representation of the dividend, which only adds models.
+
+The invariants of the encoders' sorts are checked where values are
+constructed, like those of the program's sorts (see E2), so the encoders
+only construct values that satisfy them.
+
+**E2 (translation).** Values translate to SMT values: booleans, integers,
+reals, bit-vectors and floating points to themselves, characters to 16-bit
+vectors, strings to SMT-LIB strings, ADTs, tuples and `Unit` to datatypes,
+type parameters to uninterpreted sorts, sets, bags and maps to arrays, and
+functions to integers that the application symbols of their type interpret.
+Each operation translates to an SMT term with the same value whenever the
+evaluator defines it. The evaluator follows SMT-LIB where SMT-LIB is total
+(bit-vector division and remainder by zero, euclidean integer division and
+modulo, `str.substr` out of bounds), so the values agree on every input
+except the ones where the evaluator fails.
+
+Those failures are exactly the cases of `SymbolOps.definedness`: divisions,
+remainders and modulos of integers and reals by zero, selectors on another
+constructor, constructions that break the sort's invariant, and conversions
+of non-finite floating points to reals. Where an operation fails, Iᵢ needs no
+particular value for it: a reached failure contradicts σ being a solution,
+unless it is the failure of a function body, which the failure literal of
+`Rule.Define` states (`fail == !definedness`) whatever the operation's value.
+So the SMT solver may give the operation any value. An operation that fails
+in the evaluator but is missing from `definedness` breaks this, as a function
+body that fails would be taken not to fail.
+
+*Checked*: the semantics suites (`src/test/scala/inox/solvers/*SemanticsSuite`)
+compare every operation on every backend with the evaluator, on literals and
+on variables equal to them, so that the translation is exercised and not only
+the simplifier. This tests E2 on points; a proof needs the SMT-LIB semantics
+of each backend's theories.
+
 ## Assumptions
 
 The theorem holds under these assumptions, which no code checks:
@@ -273,8 +349,9 @@ The theorem holds under these assumptions, which no code checks:
    they terminate on every pair of values that the query compares, so that
    Iᵢ can interpret the custom equality symbols by them.
 3. The template generator is correct (part 1 of `Unfold`).
-4. The encoder and the SMT solver are correct: a clause set they call
-   unsatisfiable has no model.
+4. The SMT solvers are correct for SMT-LIB's semantics (and Princess and
+   the native Z3 API for theirs): a term set they call unsatisfiable has no
+   model.
 
 ## What is checked and what is argued
 
@@ -298,3 +375,5 @@ as the trusted base.
 
 - `Unfold` part 1, the generator, is only argued expression by expression in
   `TemplateGenerator`.
+- E1 is argued per encoder above, from the encoders' comments, and E2 per
+  construct: neither is proven against a formal SMT-LIB semantics.
