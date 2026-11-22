@@ -1,0 +1,145 @@
+name: Stainless bootstrap census
+
+# Fork-only. Runs Stainless over Inox's own sources (by default the ast and
+# transformers packages) and reports how far it gets: the errors when the
+# packages are verified as one program, the files the plugin crashes on, and
+# the furthest stage each file reaches on its own. The numbers in the job
+# summary and the summary.json artifact are what the bootstrap effort tracks.
+#
+# Stainless comes from samarion/stainless, by default from the
+# bootstrap-integration branch, which merges the open bootstrap pull requests
+# for measuring only. Stainless reads the sources of the Inox it is built with,
+# so that the sources and the Inox on its classpath are the same: by default
+# the Inox its submodule pins, or with `inox: fork` this repository's main
+# (with the requested PRs merged in), which must then build with that Stainless.
+
+on:
+  workflow_dispatch:
+    inputs:
+      stainless_ref:
+        description: 'Branch, tag or commit of samarion/stainless to run'
+        required: false
+        default: 'bootstrap-integration'
+      inox:
+        description: 'Inox to run on: the one Stainless pins, or this repository main with the PRs below merged in'
+        type: choice
+        options: [pinned, fork]
+        required: false
+        default: pinned
+      prs:
+        description: 'With inox = fork, space-separated Inox PR numbers to merge into main before the run'
+        required: false
+        default: ''
+      packages:
+        description: 'Space-separated packages of src/main/scala/inox to run Stainless on'
+        required: false
+        default: 'ast transformers'
+      per_file:
+        description: 'Also run Stainless on each file alone, with the rest of Inox on the classpath'
+        type: boolean
+        required: false
+        default: true
+  # Changes to the census itself are tried on their pull requests, with the defaults
+  pull_request:
+    paths:
+      - .github/workflows/stainless-bootstrap-census.yml
+      - .github/scripts/bootstrap-census.py
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      JAVA_OPTS: -Xss512M -Xms1024M -Xmx8G -XX:MaxMetaspaceSize=2G
+      INOX_DIR: ${{ github.workspace }}/inox
+      STAINLESS_DIR: ${{ github.workspace }}/stainless
+      STAINLESS_REF: ${{ inputs.stainless_ref || 'bootstrap-integration' }}
+      PACKAGES: ${{ inputs.packages || 'ast transformers' }}
+      PER_FILE: ${{ github.event_name != 'workflow_dispatch' || inputs.per_file }}
+    steps:
+    - name: Checkout Inox
+      uses: actions/checkout@v7
+      with:
+        path: inox
+        fetch-depth: 0
+    - name: Merge requested Inox PRs
+      if: inputs.inox == 'fork' && inputs.prs != ''
+      working-directory: ${{ env.INOX_DIR }}
+      run: |
+        git config user.name "CI" && git config user.email "ci@localhost"
+        for pr in ${{ inputs.prs }}; do
+          git fetch origin "pull/$pr/head:pr-$pr"
+          git merge --no-edit "pr-$pr"
+        done
+        git log --oneline -n 10
+    - name: Checkout Stainless
+      uses: actions/checkout@v7
+      with:
+        repository: samarion/stainless
+        ref: ${{ env.STAINLESS_REF }}
+        path: stainless
+        submodules: recursive
+    - name: Replace the Inox of Stainless with this one
+      if: inputs.inox == 'fork'
+      run: |
+        rm -rf "$STAINLESS_DIR/inox"
+        mkdir -p "$STAINLESS_DIR/inox"
+        rsync -a --delete --exclude='.git' "$INOX_DIR/" "$STAINLESS_DIR/inox/"
+    - name: Setup JDK
+      uses: actions/setup-java@v6
+      with:
+        distribution: temurin
+        java-version: 21
+        cache: sbt
+    - name: Install sbt
+      working-directory: ${{ env.STAINLESS_DIR }}
+      run: |
+        wget -q https://github.com/sbt/sbt/releases/download/v1.10.1/sbt-1.10.1.tgz
+        tar xfz sbt-1.10.1.tgz
+        echo "PATH=$STAINLESS_DIR/sbt/bin:$PATH" >> "$GITHUB_ENV"
+    - name: Install solvers
+      uses: ./inox/.github/actions/install-solvers
+      with:
+        stainless-dir: stainless
+    - name: Build Stainless
+      working-directory: ${{ env.STAINLESS_DIR }}
+      run: |
+        sbt -batch stainless-dotty/universal:stage
+        # The classpath of Inox and its dependencies, for the files that are not given as sources
+        # (the line of the export that holds Inox's classes: sbt ends its output with terminal codes)
+        sbt -batch -Dsbt.color=false -Dsbt.supershell=false "export stainless-core/Runtime/fullClasspath" \
+          | grep '/inox/target/' | tail -n 1 | sed 's/^\[info\] //' | tr ':' '\n' \
+          | grep -E '/inox/target/|scalaz3|smtlib|commons-lang|princess|eldarica|parser-combinators|antlr|java-cup|stringtemplate' \
+          | paste -sd: > "$RUNNER_TEMP/inox-classpath"
+        tr ':' '\n' < "$RUNNER_TEMP/inox-classpath"
+        grep -q '/inox/target/' "$RUNNER_TEMP/inox-classpath" || { echo "::error::Could not read the classpath of Inox"; exit 1; }
+    - name: Run Stainless on Inox
+      env:
+        # One Stainless per core in the file-by-file runs, on a 16 GB runner
+        JAVA_OPTS: -Xss512M -Xmx3G
+      run: |
+        python3 "$INOX_DIR/.github/scripts/bootstrap-census.py" \
+          --stainless "$STAINLESS_DIR/frontends/dotty/target/universal/stage/bin/stainless-dotty" \
+          --src "$STAINLESS_DIR/inox/src/main/scala/inox" \
+          --classpath "$(cat "$RUNNER_TEMP/inox-classpath")" \
+          --out census --jobs "$(nproc)" \
+          $([ "$PER_FILE" = true ] || echo --no-per-file) $PACKAGES
+        {
+          echo "Stainless: samarion/stainless@$(git -C "$STAINLESS_DIR" rev-parse --short HEAD) ($STAINLESS_REF)"
+          if [ "${{ inputs.inox }}" = fork ]; then
+            echo "Inox: samarion/inox@$(git -C "$INOX_DIR" rev-parse --short HEAD)${{ inputs.prs && format(' with PRs {0}', inputs.prs) || '' }}"
+          else
+            echo "Inox: epfl-lara/inox@$(git -C "$STAINLESS_DIR" rev-parse --short HEAD:inox), pinned by Stainless"
+          fi
+          echo
+          cat census/summary.md
+        } >> "$GITHUB_STEP_SUMMARY"
+    - name: Upload the census
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: bootstrap-census
+        path: census/
