@@ -147,6 +147,10 @@ trait LambdaTemplates { self: Templates =>
    * Note that the pair (f, app) uniquely determines b, tpe, and free so these don't need
    * to be part of the cache key.
    *
+   * The clauses of the type are generated once for all the functions `f` of a same type, and
+   * each `f` enables them when it is the caller of `app`. The returned result is the typing of
+   * the application result for `f`: it holds trivially when `f` isn't the caller.
+   *
    * @param b - the blocker under which `f` appeared
    * @param f - the function that is being applied (either a free function from the input, or
    *            a function that was output by some named function in the program)
@@ -163,57 +167,68 @@ trait LambdaTemplates { self: Templates =>
     if (tpeUnrolling.unroll(tpe)) {
       val clauses = new scala.collection.mutable.ListBuffer[Encoded]
 
-      val (typeBlocker, appResult) = cachedTypeBlocker(f -> app) {
+      val (typeBlocker, typedResult) = cachedTypeBlocker(f -> app) {
         val typeBlocker = encodeSymbol(Variable.fresh("t", BooleanType()))
-        val freshBlocker = encodeSymbol(Variable.fresh("tb", BooleanType()))
+
+        // the application result descends from both `f` and the arguments of `app`
+        val depth = witnessDepth max functionDepth(f) max appDepth(app)
+
+        // The typing of the result only depends on `f` through its type, so the functions that
+        // share that type share the typing: each of them enables it when it is the caller.
+        val (freshBlocker, appResult) = cachedTyping((app, tpe, closures, free, depth)) {
+          val freshBlocker = encodeSymbol(Variable.fresh("tb", BooleanType()))
+
+          val vars = typeOps.variablesOf(tpe).toSeq.sortBy(_.id)
+          // A function type `A => B` is the non-dependent Pi type `Pi(x: A). B`, so both are
+          // handled alike: the parameters are bound to the arguments of the application.
+          val (params, to) = tpe match {
+            case PiType(params, to) => (params, to)
+            case FunctionType(from, to) => (from.map(tpe => ValDef.fresh("x", tpe, true)), to)
+            case _ => throw new InternalSolverError("Unexpected function type " + tpe.asString)
+          }
+          val subst = (params.map(_.toVariable) zip app.args).toMap ++ (vars zip closures)
+
+          val toVars = typeOps.variablesOf(to).toSeq.sortBy(_.id)
+          val toClosures = toVars.map(subst)
+          val toResult = encodeSymbol(Variable.fresh("result", BooleanType(), true))
+          clauses ++= withWitnessDepth(depth) {
+            instantiateType(freshBlocker, Typing(to, app.encoded, Constraint(toResult, toClosures, free)))
+          }
+
+          // A function of type `Pi(x: A). B` only maps arguments in `A` to results in `B`, so the
+          // codomain must only be assumed (or checked) for arguments that lie in the domain.
+          // Under `optAssumeChecked`, the front-end has checked that applications only receive
+          // arguments in the domain, so the codomain is assumed directly. This spares a membership
+          // check per application, which is costly when the domain is an ADT with refined fields.
+          val domainResults = if (modes.assumeChecked) Seq.empty else (params zip app.args).collect {
+            case (vd, arg) if ContractUnrolling.unroll(vd.tpe) =>
+              val domResult = encodeSymbol(Variable.fresh("dom", BooleanType(), true))
+              val domClosures = typeOps.variablesOf(vd.tpe).toSeq.sortBy(_.id).map(subst)
+              clauses ++= withWitnessDepth(depth) {
+                instantiateType(freshBlocker, Typing(vd.tpe, arg.encoded, Membership(domResult, domClosures)))
+              }
+              domResult
+          }
+
+          val appResult = if (domainResults.isEmpty) toResult else {
+            val appResult = encodeSymbol(Variable.fresh("result", BooleanType(), true))
+            clauses ++= Rule.Define(Some(freshBlocker), appResult, mkImplies(mkAnd(domainResults*), toResult)).clauses
+            appResult
+          }
+
+          (freshBlocker, appResult)
+        }
 
         registerImplication(typeBlocker, freshBlocker)
         clauses ++= enables(mkAnd(b, mkEquals(f, app.caller), typeBlocker), freshBlocker)
 
-        val vars = typeOps.variablesOf(tpe).toSeq.sortBy(_.id)
-        // A function type `A => B` is the non-dependent Pi type `Pi(x: A). B`, so both are
-        // handled alike: the parameters are bound to the arguments of the application.
-        val (params, to) = tpe match {
-          case PiType(params, to) => (params, to)
-          case FunctionType(from, to) => (from.map(tpe => ValDef.fresh("x", tpe, true)), to)
-          case _ => throw new InternalSolverError("Unexpected function type " + tpe.asString)
-        }
-        val subst = (params.map(_.toVariable) zip app.args).toMap ++ (vars zip closures)
-
-        val toVars = typeOps.variablesOf(to).toSeq.sortBy(_.id)
-        val toClosures = toVars.map(subst)
-        val toResult = encodeSymbol(Variable.fresh("result", BooleanType(), true))
-        // the application result descends from both `f` and the arguments of `app`
-        val depth = witnessDepth max functionDepth(f) max appDepth(app)
-        clauses ++= withWitnessDepth(depth) {
-          instantiateType(freshBlocker, Typing(to, app.encoded, Constraint(toResult, toClosures, free)))
-        }
-
-        // A function of type `Pi(x: A). B` only maps arguments in `A` to results in `B`, so the
-        // codomain must only be assumed (or checked) for arguments that lie in the domain.
-        // Under `optAssumeChecked`, the front-end has checked that applications only receive
-        // arguments in the domain, so the codomain is assumed directly. This spares a membership
-        // check per application, which is costly when the domain is an ADT with refined fields.
-        val domainResults = if (modes.assumeChecked) Seq.empty else (params zip app.args).collect {
-          case (vd, arg) if ContractUnrolling.unroll(vd.tpe) =>
-            val domResult = encodeSymbol(Variable.fresh("dom", BooleanType(), true))
-            val domClosures = typeOps.variablesOf(vd.tpe).toSeq.sortBy(_.id).map(subst)
-            clauses ++= withWitnessDepth(depth) {
-              instantiateType(freshBlocker, Typing(vd.tpe, arg.encoded, Membership(domResult, domClosures)))
-            }
-            domResult
-        }
-
-        val appResult = if (domainResults.isEmpty) toResult else {
-          val appResult = encodeSymbol(Variable.fresh("result", BooleanType(), true))
-          clauses ++= Rule.Define(Some(freshBlocker), appResult, mkImplies(mkAnd(domainResults*), toResult)).clauses
-          appResult
-        }
-
-        (typeBlocker, appResult)
+        // The typing may have been enabled by another function, so its result only counts for
+        // `f` when `f` is the caller
+        val called = if (f == app.caller) typeBlocker else mkAnd(typeBlocker, mkEquals(f, app.caller))
+        (typeBlocker, mkImplies(called, appResult))
       }
 
-      Some((typeBlocker, appResult, clauses.toSeq))
+      Some((typeBlocker, typedResult, clauses.toSeq))
     } else {
       None
     }
@@ -252,11 +267,11 @@ trait LambdaTemplates { self: Templates =>
       val blockedResults = for {
         (bApp, app @ App(caller, _, _, _)) <- applications(ft)
         if canBeEqual(caller, f)
-        (typeBlocker, appResult, appClauses) <- registerApplication(b, f, app, tpe, closures, free)
+        (typeBlocker, typedResult, appClauses) <- registerApplication(b, f, app, tpe, closures, free)
       } yield {
         clauses ++= appClauses
         clauses ++= enables(bApp, typeBlocker)
-        mkImplies(typeBlocker, appResult)
+        typedResult
       }
 
       clauses ++= Rule.Define(Some(b), r, typedResults.withOperands(blockedResults.toSeq)).clauses
@@ -469,7 +484,7 @@ trait LambdaTemplates { self: Templates =>
         for {
           old @ (typedResults, b, tpe, f, closures, free) <- freeBlockers(ft).toList
           if canBeEqual(caller, f)
-          (typeBlocker, appResult, appClauses) <- registerApplication(b, f, app, tpe, closures, free)
+          (typeBlocker, typedResult, appClauses) <- registerApplication(b, f, app, tpe, closures, free)
         } {
           clauses ++= appClauses
 
@@ -478,7 +493,7 @@ trait LambdaTemplates { self: Templates =>
 
           val next = typedResults.next
           state.update(s => s.copy(freeBlockers = s.freeBlockers.updated(ft, freeBlockers(ft) - old + ((next, b, tpe, f, closures, free)))))
-          clauses ++= typedResults.link(next, Seq(mkImplies(typeBlocker, appResult)))
+          clauses ++= typedResults.link(next, Seq(typedResult))
         }
 
         clauses ++= congruenceClauses(blocker, app)
@@ -636,6 +651,10 @@ trait LambdaTemplates { self: Templates =>
     * @param typeBlockers the type blocker and the typing result of the result of each application
     *                     of a free function, keyed by the function and the application (see
     *                     [[registerApplication]])
+    * @param typings the blocker and the result of the typing of the result of each application,
+    *                keyed by the application, the type of the applied function with its closures,
+    *                whether it is free, and the witness depth: the free functions of a same type
+    *                share the typing of an application (see [[registerApplication]])
     * @param freeFunctions the free functions of each type, under their blocker
     * @param instantiated the applications that were instantiated, under their blocker
     * @param resultGuards for function-typed applications, a literal that holds whenever the
@@ -654,6 +673,7 @@ trait LambdaTemplates { self: Templates =>
     freeBlockers: Map[FunctionType, Set[(OpenAnd, Encoded, Type, Encoded, Seq[Arg], Boolean)]],
     nonFreeBlockers: Map[Encoded, (Encoded, OpenOr)],
     typeBlockers: Map[(Encoded, App), (Encoded, Encoded)],
+    typings: Map[(App, Type, Seq[Arg], Boolean, Int), (Encoded, Encoded)],
     freeFunctions: Map[FunctionType, Set[(Encoded, Encoded)]],
     instantiated: Set[(Encoded, App)],
     resultGuards: Map[Encoded, Encoded])
@@ -662,7 +682,7 @@ trait LambdaTemplates { self: Templates =>
     // The maps and the sets that are iterated keep their insertion order, so that the clauses and the
     // assumptions don't depend on hash codes (see [[Items]]), while those only looked up are hashed
     val empty: LambdasState = LambdasState(Pending.empty, VectorMap.empty, VectorMap.empty, VectorMap.empty, VectorMap.empty, VectorMap.empty,
-      VectorMap.empty, VectorMap.empty, VectorMap.empty, VectorMap.empty, VectorMap.empty, VectorMap.empty, Set.empty, VectorMap.empty)
+      VectorMap.empty, VectorMap.empty, VectorMap.empty, VectorMap.empty, VectorMap.empty, VectorMap.empty, VectorMap.empty, Set.empty, VectorMap.empty)
   }
 
   /** The type blocker and the typing result of `key`, which `compute` gives the first time. */
@@ -670,6 +690,14 @@ trait LambdaTemplates { self: Templates =>
     state.get.typeBlockers.getOrElse(key, {
       val res = compute
       state.update(s => s.copy(typeBlockers = s.typeBlockers.updated(key, res)))
+      res
+    })
+
+  /** The blocker and the result of the typing `key`, which `compute` gives the first time. */
+  private def cachedTyping(key: (App, Type, Seq[Arg], Boolean, Int))(compute: => (Encoded, Encoded)): (Encoded, Encoded) =
+    state.get.typings.getOrElse(key, {
+      val res = compute
+      state.update(s => s.copy(typings = s.typings.updated(key, res)))
       res
     })
 
