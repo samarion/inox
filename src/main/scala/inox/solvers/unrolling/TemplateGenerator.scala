@@ -770,7 +770,8 @@ trait TemplateGenerator { self: Templates =>
     expr: Expr,
     substMap: Map[Variable, Encoded],
     inDomain: Boolean = false,
-    ground: Boolean = false
+    ground: Boolean = false,
+    shallow: Boolean = false
   )(using generator: TypingGenerator): (Expr, TemplateClauses) = {
     val builder = new Builder(pathVar, substMap)
     import builder._
@@ -947,7 +948,9 @@ trait TemplateGenerator { self: Templates =>
             .map(_.applied(Seq(expr)))
             .getOrElse(BooleanLiteral(true)),
           if (sort.definition.isInductive && !state.recurseAdt) {
-            storeType(pathVar, tpe, expr, inDomain, ground)
+            // A shallow contract leaves the children of inductive sorts untyped (see [[Constraint]])
+            if (shallow) BooleanLiteral(true)
+            else storeType(pathVar, tpe, expr, inDomain, ground)
           } else {
             val newExpr = Variable.fresh("e", BooleanType(), true)
             storeExpr(newExpr)

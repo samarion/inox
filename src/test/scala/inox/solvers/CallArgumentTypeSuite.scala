@@ -26,7 +26,13 @@ class CallArgumentTypeSuite extends SolverTestSuite {
     if_ (n === E(BigInt(1))) { E(BigInt(1)) } else_ { FunctionInvocation(countID, Seq(), Seq(n - E(BigInt(1)))) + E(BigInt(1)) }
   }) }
 
-  override protected def symbols: Symbols = NoSymbols.withFunctions(Seq(id0, count))
+  // def one(n: BigInt): {y | y == id0(1)} = 1
+  private val oneID = FreshIdentifier("one")
+  private val one = mkFunDef(oneID)() { _ => (Seq("n" :: IntegerType()),
+    refinement("y" :: IntegerType())(_ === FunctionInvocation(id0ID, Seq(), Seq(E(BigInt(1))))),
+    { case Seq(n) => E(BigInt(1)) }) }
+
+  override protected def symbols: Symbols = NoSymbols.withFunctions(Seq(id0, count, one))
   given Symbols = symbols
 
   override protected def options = Seq(optCheckModels(true))
@@ -58,10 +64,19 @@ class CallArgumentTypeSuite extends SolverTestSuite {
     assert(res.isUNSAT, s"expected UNSAT, got $res")
   }
 
-  test("return type of a non-recursive function is given by its body", Integers) { ctx =>
+  test("return type of a non-recursive function is assumed under assume-checked", Integers) { ctx =>
     val s = solver(ctx.withOpts(optAssumeChecked(true)))
-    // only the results of recursive functions are typed by their return types, so id0(1) is 1
-    val res = s.solveSAT(Not(FunctionInvocation(id0ID, Seq(), Seq(E(BigInt(1)))) === E(BigInt(0))))
+    // id0(1) evaluates to 1, while its return type says it is 0
+    val res = s.solveSAT(FunctionInvocation(id0ID, Seq(), Seq(E(BigInt(1)))) === E(BigInt(1)))
+    assert(res.isUNSAT, s"expected UNSAT, got $res")
+  }
+
+  test("return type is not assumed for calls in refinements", Integers) { ctx =>
+    val s = solver(ctx.withOpts(optAssumeChecked(true)))
+    // the return type of one(n) calls id0(1), which is unfolded to 1, but not typed by the return type of id0,
+    // which would contradict it
+    val n = Variable.fresh("n", IntegerType())
+    val res = s.solveSAT(FunctionInvocation(oneID, Seq(), Seq(n)) === E(BigInt(1)))
     assert(res.isSAT, s"expected SAT, got $res")
   }
 }

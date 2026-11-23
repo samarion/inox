@@ -1,6 +1,6 @@
 ; The refinements of the fields of a result: a recursive function's result is typed by its
-; return type (which proves them by induction), and the results of other functions by their
-; bodies, once their calls are unfolded
+; return type (which proves them by induction), and the results of other functions by a shallow
+; contract and by their bodies, once their calls are unfolded
 (set-info :status unsat)
 (set-option :timeout 10)
 (declare-datatypes ((Pos 0)) (((Pos (x (! Int :var v :restrict (> v 0)))))))
