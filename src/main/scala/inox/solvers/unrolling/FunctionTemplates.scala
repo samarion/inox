@@ -85,12 +85,11 @@ trait FunctionTemplates { self: Templates =>
       val contents = contents0.copy(clauses = contents0.clauses ++ rankClauses(tfd, contents0, bodySites))
 
       // The function's return type, as a contract typing of its calls, which enables induction with
-      // refinement types. Recursive functions get their full return type. The calls of the other functions
-      // are unfolded, which gives their results the type of their bodies, so they only get a shallow
-      // contract, which leaves the children of inductive sorts untyped (see [[Constraint]]). Calls in
-      // refinements get no contract (see [[Call.typed]]).
+      // refinement types. Recursive functions get their full return type, and the others a shallow
+      // contract, which leaves the children of inductive sorts untyped (see [[optShallowContracts]]).
+      // Calls in refinements get no contract (see [[Call.typed]]).
       val contract: Option[Template] = Option.when(ContractUnrolling `unroll` tfd.returnType) {
-        val shallow = !isRecursive(tfd.id)
+        val shallow = modes.shallowContracts && !isRecursive(tfd.id)
         // The return type only holds for arguments that lie in the parameter types, so
         // it is assumed only once the arguments' membership in these types is shown.
         // Under `optAssumeChecked`, the front-end has checked the arguments of every call, so

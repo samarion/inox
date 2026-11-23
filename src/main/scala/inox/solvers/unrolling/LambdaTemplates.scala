@@ -155,9 +155,10 @@ trait LambdaTemplates { self: Templates =>
    * @param closures - the closures that are bound in the type `tpe`
    * @param free - whether `f` corresponds to a free function in the program or a result from
    *               a named function
+   * @param shallow - whether the results of `f` get a shallow contract (see [[Constraint]])
    */
   private def registerApplication(
-    b: Encoded, f: Encoded, app: App, tpe: Type, closures: Seq[Arg], free: Boolean
+    b: Encoded, f: Encoded, app: App, tpe: Type, closures: Seq[Arg], free: Boolean, shallow: Boolean
   ): Option[(Encoded, Encoded, Clauses)] = {
     val tpeUnrolling: TypeUnrolling = if (free) FreeUnrolling else ContractUnrolling
     if (tpeUnrolling.unroll(tpe)) {
@@ -186,7 +187,7 @@ trait LambdaTemplates { self: Templates =>
         // the application result descends from both `f` and the arguments of `app`
         val depth = witnessDepth max functionDepth(f) max appDepth(app)
         clauses ++= withWitnessDepth(depth) {
-          instantiateType(freshBlocker, Typing(to, app.encoded, Constraint(toResult, toClosures, free)))
+          instantiateType(freshBlocker, Typing(to, app.encoded, Constraint(toResult, toClosures, free, shallow = shallow)))
         }
 
         // A function of type `Pi(x: A). B` only maps arguments in `A` to results in `B`, so the
@@ -219,7 +220,8 @@ trait LambdaTemplates { self: Templates =>
     }
   }
 
-  def registerFunction(b: Encoded, r: Encoded, tpe: Type, f: Encoded, closures: Seq[Arg], free: Boolean): Clauses = {
+  def registerFunction(b: Encoded, r: Encoded, tpe: Type, f: Encoded, closures: Seq[Arg], free: Boolean,
+                       shallow: Boolean = false): Clauses = {
     reporter.debug(s"-> registering free function $b ==> $f: $tpe")
     val ft @ FunctionType(_, _) = tpe.getType: @unchecked
     state.update(s => s.copy(freeFunctions = s.freeFunctions.updated(ft, freeFunctions(ft) + (b -> f))))
@@ -247,12 +249,12 @@ trait LambdaTemplates { self: Templates =>
     // Add type blocker clause
     locally {
       val typedResults = OpenAnd("b_and", AssumedComplete.Always)
-      state.update(s => s.copy(freeBlockers = s.freeBlockers.updated(ft, freeBlockers(ft) + ((typedResults, b, tpe, f, closures, free)))))
+      state.update(s => s.copy(freeBlockers = s.freeBlockers.updated(ft, freeBlockers(ft) + ((typedResults, b, tpe, f, closures, free, shallow)))))
 
       val blockedResults = for {
         (bApp, app @ App(caller, _, _, _)) <- applications(ft)
         if canBeEqual(caller, f)
-        (typeBlocker, appResult, appClauses) <- registerApplication(b, f, app, tpe, closures, free)
+        (typeBlocker, appResult, appClauses) <- registerApplication(b, f, app, tpe, closures, free, shallow)
       } yield {
         clauses ++= appClauses
         clauses ++= Rule.Enables(bApp, typeBlocker).clauses
@@ -467,9 +469,9 @@ trait LambdaTemplates { self: Templates =>
         /* Make sure that if `app` correspond to an input function, then the ADT
          * invariants are asserted on its return values. */
         for {
-          old @ (typedResults, b, tpe, f, closures, free) <- freeBlockers(ft).toList
+          old @ (typedResults, b, tpe, f, closures, free, shallow) <- freeBlockers(ft).toList
           if canBeEqual(caller, f)
-          (typeBlocker, appResult, appClauses) <- registerApplication(b, f, app, tpe, closures, free)
+          (typeBlocker, appResult, appClauses) <- registerApplication(b, f, app, tpe, closures, free, shallow)
         } {
           clauses ++= appClauses
 
@@ -477,7 +479,7 @@ trait LambdaTemplates { self: Templates =>
           clauses ++= Rule.Enables(blocker, typeBlocker).clauses
 
           val next = typedResults.next
-          state.update(s => s.copy(freeBlockers = s.freeBlockers.updated(ft, freeBlockers(ft) - old + ((next, b, tpe, f, closures, free)))))
+          state.update(s => s.copy(freeBlockers = s.freeBlockers.updated(ft, freeBlockers(ft) - old + ((next, b, tpe, f, closures, free, shallow)))))
           clauses ++= typedResults.link(next, Seq(mkImplies(typeBlocker, appResult)))
         }
 
@@ -651,7 +653,7 @@ trait LambdaTemplates { self: Templates =>
     byType: Map[FunctionType, Map[TemplateStructure, LambdaTemplate]],
     lambdaClasses: Map[(FunctionType, Expr, Seq[(Variable, Encoded)]), Encoded],
     applications: Map[FunctionType, Set[(Encoded, App)]],
-    freeBlockers: Map[FunctionType, Set[(OpenAnd, Encoded, Type, Encoded, Seq[Arg], Boolean)]],
+    freeBlockers: Map[FunctionType, Set[(OpenAnd, Encoded, Type, Encoded, Seq[Arg], Boolean, Boolean)]],
     nonFreeBlockers: Map[Encoded, (Encoded, OpenOr)],
     typeBlockers: Map[(Encoded, App), (Encoded, Encoded)],
     freeFunctions: Map[FunctionType, Set[(Encoded, Encoded)]],
@@ -681,7 +683,7 @@ trait LambdaTemplates { self: Templates =>
       state.get.byType.getOrElse(tpe, VectorMap.empty)
     private[LambdaTemplates] def applications(tpe: FunctionType): Set[(Encoded, App)] =
       state.get.applications.getOrElse(tpe, ListSet.empty)
-    private[LambdaTemplates] def freeBlockers(tpe: FunctionType): Set[(OpenAnd, Encoded, Type, Encoded, Seq[Arg], Boolean)] =
+    private[LambdaTemplates] def freeBlockers(tpe: FunctionType): Set[(OpenAnd, Encoded, Type, Encoded, Seq[Arg], Boolean, Boolean)] =
       state.get.freeBlockers.getOrElse(tpe, ListSet.empty)
     private[LambdaTemplates] def nonFreeBlockers: Map[Encoded, (Encoded, OpenOr)] = state.get.nonFreeBlockers
     private[LambdaTemplates] def freeFunctions(tpe: FunctionType): Set[(Encoded, Encoded)] =

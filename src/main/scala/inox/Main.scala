@@ -129,6 +129,7 @@ trait MainHelpers {
     solvers.unrolling.optCheckRules -> Description(Solvers, "Check the clauses of the unrolling against the rules that build them (slow, for testing)"),
     solvers.unrolling.optUnrollAssumptions -> Description(Solvers, "Use unsat-assumptions to drive unfolding while remaining fair"),
     solvers.unrolling.optModelFinding -> Description(Solvers, "Enhance model-finding capabilities of solvers by given aggressivity"),
+    solvers.unrolling.optShallowContracts -> Description(Solvers, "Only assume the return types of non-recursive functions down to the children of inductive sorts"),
     solvers.unrolling.optFunctionEquality -> Description(Solvers, "Semantics of equality between first-class functions: none (functions can't be compared), intensional or extensional"),
     solvers.smtlib.optCVC4Options -> Description(Solvers, "Pass extra options to CVC4"),
     solvers.smtlib.optCVC5Options -> Description(Solvers, "Pass extra options to CVC5"),

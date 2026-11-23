@@ -356,7 +356,8 @@ trait TemplateGenerator { self: Templates =>
 
     // The typings and equalities are kept in the order in which they are stored (see [[Items]])
     var types: Map[Encoded, Set[Typing]] = VectorMap.empty
-    def storeType(pathVar: Variable, tpe: Type, arg: Expr, inDomain: Boolean = false, ground: Boolean = false)
+    def storeType(pathVar: Variable, tpe: Type, arg: Expr, inDomain: Boolean = false, ground: Boolean = false,
+                  shallow: Boolean = false)
                  (using generator: TypingGenerator): Expr = {
       val b = encodedCond(pathVar)
       val encoder = mkEncoder(localSubst)
@@ -369,7 +370,8 @@ trait TemplateGenerator { self: Templates =>
           // Function types are unfolded by `registerFunction`, which doesn't use the flag, unless they
           // are checked as fresh grounds (see `ensureGrounds`)
           val domain = inDomain && (ground || !tpe.isInstanceOf[FunctionType | PiType])
-          val constraint = Constraint(exprVars(typeCall), closures, generator == FreeGenerator, domain, ground && domain)
+          val constraint = Constraint(exprVars(typeCall), closures, generator == FreeGenerator, domain, ground && domain,
+            shallow)
           (typeCall, Typing(tpe, encoder(arg), constraint))
 
         case MembershipGenerator =>
@@ -896,7 +898,7 @@ trait TemplateGenerator { self: Templates =>
         storeGuarded(w, GreaterThan(MultiplicityInBag(elem, expr), IntegerLiteral(0)))
         implies(w, rec(w, base, elem, state))
 
-      case (_: FunctionType | _: PiType) => storeType(pathVar, tpe, expr, inDomain, ground)
+      case (_: FunctionType | _: PiType) => storeType(pathVar, tpe, expr, inDomain, ground, shallow)
 
       case tp: TypeParameter if generator == FreeGenerator => typesManager.storeTypeParameter(tp)
 
@@ -950,7 +952,7 @@ trait TemplateGenerator { self: Templates =>
           if (sort.definition.isInductive && !state.recurseAdt) {
             // A shallow contract leaves the children of inductive sorts untyped (see [[Constraint]])
             if (shallow) BooleanLiteral(true)
-            else storeType(pathVar, tpe, expr, inDomain, ground)
+            else storeType(pathVar, tpe, expr, inDomain, ground, shallow)
           } else {
             val newExpr = Variable.fresh("e", BooleanType(), true)
             storeExpr(newExpr)
@@ -998,7 +1000,7 @@ trait TemplateGenerator { self: Templates =>
 
       case MapType(from, to) =>
         if (!state.recurseMap) {
-          storeType(pathVar, tpe, expr, inDomain, ground)
+          storeType(pathVar, tpe, expr, inDomain, ground, shallow)
         } else {
           val newBool1 : Variable = Variable.fresh("mapIsEmpty", BooleanType(), true)
           val newBool2 : Variable = Variable.fresh("mapNonEmpty", BooleanType(), true)
@@ -1036,7 +1038,7 @@ trait TemplateGenerator { self: Templates =>
 
       case SetType(base) =>
         if (!state.recurseSet) {
-          storeType(pathVar, tpe, expr, inDomain, ground)
+          storeType(pathVar, tpe, expr, inDomain, ground, shallow)
         } else {
           val newBool1 : Variable = Variable.fresh("setIsEmpty", BooleanType(), true)
           val newBool2 : Variable = Variable.fresh("setNonEmpty", BooleanType(), true)
@@ -1069,7 +1071,7 @@ trait TemplateGenerator { self: Templates =>
 
       case BagType(base) =>
         if (!state.recurseBag) {
-          storeType(pathVar, tpe, expr, inDomain, ground)
+          storeType(pathVar, tpe, expr, inDomain, ground, shallow)
         } else {
           val newBool1 : Variable = Variable.fresh("bagIsEmpty", BooleanType(), true)
           val newBool2 : Variable = Variable.fresh("bagNonEmpty", BooleanType(), true)

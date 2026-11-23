@@ -4,6 +4,13 @@ package inox
 package solvers
 package unrolling
 
+/** Whether the calls of non-recursive functions only get a shallow contract, which leaves the children of
+  * inductive sorts untyped, rather than their full return type (see [[FunctionTemplates.FunctionTemplate.contract]]).
+  * Their calls are unfolded, which gives their results the type of their bodies, while a full contract types
+  * the results of every call, field by field, which is costly when the fields have refinements that call
+  * other functions. */
+object optShallowContracts extends FlagOptionDef("shallow-contracts", true)
+
 /** The modes of the unfolding that the options select, derived once (see [[Templates.modes]]). */
 class UnfoldingModes(options: Options) {
 
@@ -13,6 +20,9 @@ class UnfoldingModes(options: Options) {
   /** Whether the front-end has checked that nothing fails (see `optAssumeChecked`). Calls then
     * don't unfold their domains, and measures only need to decrease. */
   val assumeChecked: Boolean = options.findOptionOrDefault(optAssumeChecked)
+
+  /** Whether non-recursive functions only get shallow contracts (see [[optShallowContracts]]). */
+  val shallowContracts: Boolean = options.findOptionOrDefault(optShallowContracts)
 
   /** Unless the front-end has checked them, the partial operations that may fail make their path
     * infeasible when they do, like errors, so that the solver agrees with the evaluator (see

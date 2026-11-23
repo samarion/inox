@@ -201,7 +201,7 @@ trait TypeTemplates { self: Templates =>
           tpe match {
             // a fresh ground of a function type is checked to lie in its type (see `mkTypeClauses`)
             case (_: FunctionType | _: PiType) if !ground =>
-              registerFunction(blocker, result, tpe, arg, closures, free)
+              registerFunction(blocker, result, tpe, arg, closures, free, shallow)
             case _ =>
               ConstraintTemplate(tpe, generator, inDomain, ground, shallow).instantiate(blocker, result, arg, closures)
           }
