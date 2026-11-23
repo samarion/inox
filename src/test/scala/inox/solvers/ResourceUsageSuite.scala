@@ -27,17 +27,20 @@ class ResourceUsageSuite extends AnyFunSuite {
     x * x * x + y * y * y === z * z * z
   ))
 
-  private case class SmtSolver(name: String, available: () => Boolean, rlimit: IntOptionDef)
+  /** @param ownProcess whether the solver runs in a process of its own (see the test of a check
+    *                   that spent less than the limit)
+    */
+  private case class SmtSolver(name: String, available: () => Boolean, rlimit: IntOptionDef, ownProcess: Boolean)
 
   private def requireSolver(name: String, available: Boolean): Unit =
     if (SolverTestSuite.requiredSolvers(name)) assert(available, s"Solver $name is required but isn't available")
     else assume(available, s"$name is not available")
 
   private val smtSolvers = Seq(
-    SmtSolver("smt-z3", () => SolverFactory.hasZ3, smtlib.optZ3Rlimit),
-    SmtSolver("nativez3", () => SolverFactory.hasNativeZ3, smtlib.optZ3Rlimit),
-    SmtSolver("unrollz3", () => SolverFactory.hasNativeZ3, smtlib.optZ3Rlimit),
-    SmtSolver("smt-cvc5", () => SolverFactory.hasCVC5, smtlib.optCVC5Rlimit)
+    SmtSolver("smt-z3", () => SolverFactory.hasZ3, smtlib.optZ3Rlimit, ownProcess = true),
+    SmtSolver("nativez3", () => SolverFactory.hasNativeZ3, smtlib.optZ3Rlimit, ownProcess = false),
+    SmtSolver("unrollz3", () => SolverFactory.hasNativeZ3, smtlib.optZ3Rlimit, ownProcess = false),
+    SmtSolver("smt-cvc5", () => SolverFactory.hasCVC5, smtlib.optCVC5Rlimit, ownProcess = true)
   )
 
   private val million = 1000000L
@@ -86,6 +89,29 @@ class ResourceUsageSuite extends AnyFunSuite {
         val spent = s.resourceUsage.usage.get
         // cvc5 only notices that it is over its limit after a few more units
         assert(spent >= million && spent <= million + million / 10)
+      }
+    }
+
+    // What native z3 spends on a query depends on the other native z3 solvers of the JVM: its
+    // tactic for nonlinear integer arithmetic gives up on bit-blasting once z3's memory, counted
+    // over the whole process, is above 100 MB, and falls back on a solver that spends differently.
+    // With suites running in parallel, two native solvers can then spend 1,000 and 20,000 units on
+    // the same query, so the native solvers aren't compared.
+    if (solver.ownProcess) test(s"${solver.name}: a check that spent less than the limit answers under that limit") {
+      requireSolver(solver.name, solver.available())
+      val formula = andJoin(Seq(x > E(BigInt(3)), y > x, x * y === E(BigInt(221))))
+      val spent = withSolver(solver.name) { s =>
+        s.assertCnstr(formula)
+        assert(s.check(Simple) == Sat)
+        s.resourceUsage.usage.get
+      }
+      assert(spent < million)
+      withSolver(solver.name, solver.rlimit(1)) { s =>
+        s.assertCnstr(formula)
+        assert(s.check(Simple) == Sat)
+        val limited = s.resourceUsage.usage.get
+        assert(limited < million)
+        assert(math.abs(limited - spent) <= spent / 10, s"spent $limited under the limit, $spent without")
       }
     }
   }
