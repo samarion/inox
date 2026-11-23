@@ -231,8 +231,12 @@ trait Templates
     def substitute(substituter: Encoded => Encoded, msubst: Map[Encoded, Matcher]): Item
   }
 
-  /** Represents a named function call in the unfolding procedure */
-  case class Call(callee: Callee, args: Seq[Arg], tpSubst: Seq[Arg]) extends Item {
+  /** Represents a named function call in the unfolding procedure.
+    *
+    * @param typed whether the result of the call is typed by the return type of its function (see
+    *              [[FunctionTemplates.FunctionTemplate.contract]]). The calls in refinements aren't, so
+    *              that typings don't cascade through the functions that refinements call. */
+  case class Call(callee: Callee, args: Seq[Arg], tpSubst: Seq[Arg], typed: Boolean = true) extends Item {
     override def toString: String = {
       def pArgs(args: Seq[Arg]): String = args.map {
         case Right(m) => m.toString
@@ -612,7 +616,8 @@ trait Templates
       expr: Expr,
       substMap: Map[Variable, Encoded] = Map.empty[Variable, Encoded],
       optCall: Option[(Callee, Seq[Arg])] = None,
-      optApp: Option[App] = None
+      optApp: Option[App] = None,
+      typedCalls: Boolean = true
     ): ExtractedCalls = {
       val encoder : Expr => Encoded = mkEncoder(substMap)
 
@@ -653,15 +658,15 @@ trait Templates
       val calls = exprOps.collectPreorder[Call] {
         case FunctionInvocation(id, tps, args) =>
           val tpVars = tps.flatMap(variableSeq).distinct
-          Seq(Call(Defined(getFunction(id, tps)), args.map(encodeArg), tpVars.map(encodeArg)))
+          Seq(Call(Defined(getFunction(id, tps)), args.map(encodeArg), tpVars.map(encodeArg), typedCalls))
         // The applications of the free functions of interpreted uninterpreted functions unfold their
         // interpretations
         case Application(f: Variable, args) => interpretedFunctions.get(f) match {
-          case Some(callee) => Seq(Call(callee, args.map(encodeArg), Seq.empty))
+          case Some(callee) => Seq(Call(callee, args.map(encodeArg), Seq.empty, typedCalls))
           case None => Seq.empty
         }
         case _ => Seq.empty
-      } (expr).filter { case Call(callee, args, _) =>
+      } (expr).filter { case Call(callee, args, _, _) =>
         !optCall.exists(p => p._1 == callee && p._2 == args)
       }
 
@@ -728,7 +733,8 @@ trait Templates
       substMap: Map[Variable, Encoded] = Map.empty[Variable, Encoded],
       optCall: Option[Callee] = None,
       optApp: Option[(Encoded, FunctionType)] = None,
-      partial: Boolean = false
+      partial: Boolean = false,
+      typedCalls: Boolean = true
     ): Encoding = {
       import tmplClauses.{condVars, exprVars, guardedExprs, equations => eqs, lambdas, quantifications => quants}
       val equals = tmplClauses.equalities
@@ -753,7 +759,7 @@ trait Templates
         for ((b,es) <- guardedExprs `merge` Map(pv -> eqs)) {
           var bItems : Set[Item] = ListSet.empty
           for (e <- es) {
-            val extracted = extractCalls(e, idToTrId, optIdCall, optIdApp)
+            val extracted = extractCalls(e, idToTrId, optIdCall, optIdApp, typedCalls)
             bItems ++= extracted.items
             pointers ++= extracted.pointers
           }
@@ -813,11 +819,13 @@ trait Templates
       substMap: Map[Variable, Encoded] = Map.empty,
       optCall: Option[Callee] = None,
       optApp: Option[(Encoded, FunctionType)] = None,
-      partial: Boolean = false
+      partial: Boolean = false,
+      typedCalls: Boolean = true
     ): (TemplateContents, () => String) = {
 
       val encoding = Template.encode(
-        pathVar, arguments, tmplClauses, substMap = substMap, optCall = optCall, optApp = optApp, partial = partial)
+        pathVar, arguments, tmplClauses, substMap = substMap, optCall = optCall, optApp = optApp, partial = partial,
+        typedCalls = typedCalls)
 
       val contents = TemplateContents(
         pathVar, arguments, tmplClauses.condVars, tmplClauses.exprVars, tmplClauses.condTree,
@@ -957,7 +965,7 @@ trait Templates
 
       val allClauses = new scala.collection.mutable.ListBuffer[Encoded]
       if (failure.isEmpty) allClauses ++= literals.flatMap(f => Rule.Unreachable(substituter(f)).clauses)
-      allClauses ++= generated(contents.clauses.map(substituter))
+      allClauses ++= generated(contents, substMap.view.mapValues(_.encoded).toMap, contents.clauses.map(substituter))
 
       // Applies `f` to the items that `select` picks, under their substituted blockers
       def each[I](select: PartialFunction[Item, I])(f: (Encoded, I) => Unit): Unit =

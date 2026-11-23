@@ -11,17 +11,19 @@ class DefinitionsSuite extends AnyFunSuite {
   import inox.trees.dsl._
 
   val tp = TypeParameter.fresh("A")
+  // Annotation arguments are expressions, so an empty set carries the types that instantiation changes
+  def at(tpe: Type): Expr = FiniteSet(Seq(), tpe)
   val boxId = FreshIdentifier("Box")
   val consId = FreshIdentifier("MkBox")
   val fieldId = FreshIdentifier("content")
-  val annotated = ValDef(fieldId, tp, Seq(Annotation("field", Seq(tp, IntegerLiteral(1)))))
+  val annotated = ValDef(fieldId, tp, Seq(Annotation("field", Seq(at(tp), IntegerLiteral(1)))))
   val box = new ADTSort(boxId, Seq(TypeParameterDef(tp)), Seq(new ADTConstructor(consId, boxId, Seq(annotated))),
-    Seq(Annotation("sort", Seq(tp))))
+    Seq(Annotation("sort", Seq(at(tp)))))
 
   val idFd = {
     val ftp = TypeParameter.fresh("T")
-    val x = ValDef(FreshIdentifier("x"), ftp, Seq(Annotation("param", Seq(ftp))))
-    new FunDef(FreshIdentifier("id"), Seq(TypeParameterDef(ftp)), Seq(x), ftp, x.toVariable, Seq(Annotation("fun", Seq(ftp))))
+    val x = ValDef(FreshIdentifier("x"), ftp, Seq(Annotation("param", Seq(at(ftp)))))
+    new FunDef(FreshIdentifier("id"), Seq(TypeParameterDef(ftp)), Seq(x), ftp, x.toVariable, Seq(Annotation("fun", Seq(at(ftp)))))
   }
 
   given symbols: Symbols = NoSymbols.withSorts(Seq(box)).withFunctions(Seq(idFd))
@@ -117,6 +119,61 @@ class DefinitionsSuite extends AnyFunSuite {
     val dInv = invariant(dID)(_ => forall("t" :: T(tID)())(_ => E(true)))
     val tPlain = mkSort(tID)() { _ => Seq((FreshIdentifier("T"), Seq(ValDef(FreshIdentifier("x"), IntegerType())))) }
     assert(wellFormed(Seq(refined(dID, dInv, Some(T(tID)())), tPlain), Seq(dInv)))
+
+    // an uninterpreted call stands for some value of its type, as Stainless's `choose` does:
+    // case class T(x: BigInt) { require(choose((t: T) => true) != this) }
+    val tChoose = invariant(tID)(t => Not(Equals(UninterpretedCall(FreshIdentifier("choose"), Seq(), Seq(), FunctionType(Seq(), T(tID)())), t)))
+    assert(!wellFormed(Seq(refined(tID, tChoose)), Seq(tChoose)))
+    // also in a function that the invariant calls, as for the body of an abstract function
+    val some = mkFunDef(FreshIdentifier("some"))() { _ =>
+      (Seq(), T(tID)(), { case Seq() => UninterpretedCall(FreshIdentifier("some"), Seq(), Seq(), FunctionType(Seq(), T(tID)())) })
+    }
+    val tSome = invariant(tID)(t => Not(Equals(FunctionInvocation(some.id, Seq(), Seq()), t)))
+    assert(!wellFormed(Seq(refined(tID, tSome)), Seq(tSome, some)))
+    // and over other values, it is fine
+    val tInt = invariant(tID)(t => Equals(UninterpretedCall(FreshIdentifier("n"), Seq(), Seq(), FunctionType(Seq(), IntegerType())), E(BigInt(0))))
+    assert(wellFormed(Seq(refined(tID, tInt)), Seq(tInt)))
+  }
+
+  test("Field refinements can't quantify over values that depend on their sort") {
+    // a sort `id` with a field `x: BigInt` and a field `y: { v: BigInt | pred(v) }`
+    val sel = FreshIdentifier("x")
+    def withField(id: Identifier, consId: Identifier, pred: Variable => Expr): ADTSort = {
+      val v = Variable.fresh("v", IntegerType())
+      mkSort(id)() { _ =>
+        Seq((consId, Seq(ValDef(sel, IntegerType()),
+          ValDef(FreshIdentifier("y"), RefinementType(v.toVal, pred(v))))))
+      }
+    }
+    def wellFormed(sorts: Seq[ADTSort], functions: Seq[FunDef]): Boolean =
+      scala.util.Try(NoSymbols.withSorts(sorts).withFunctions(functions).ensureWellFormed).isSuccess
+
+    // case class T(x: BigInt, y: { v: BigInt | forall((t: T) => t.x != v) })
+    val tID = FreshIdentifier("T")
+    val tCons = FreshIdentifier("T")
+    val paradox = withField(tID, tCons, v => forall("t" :: T(tID)())(t => Not(Equals(t.getField(sel), v))))
+    val ex = intercept[NotWellFormedException](NoSymbols.withSorts(Seq(paradox)).ensureWellFormed)
+    assert(ex.getMessage.contains("the refinement of one of its field types quantifies over the values of"))
+
+    // the same, through a function that the refinement calls
+    val none = mkFunDef(FreshIdentifier("none"))() { _ =>
+      (Seq("n" :: IntegerType()), BooleanType(), { case Seq(n) => forall("t" :: T(tID)())(_ => E(false)) })
+    }
+    assert(!wellFormed(Seq(withField(tID, tCons, v => FunctionInvocation(none.id, Seq(), Seq(v)))), Seq(none)))
+    // through a choice
+    def some(name: String) = UninterpretedCall(FreshIdentifier(name), Seq(), Seq(), FunctionType(Seq(), T(tID)()))
+    assert(!wellFormed(Seq(withField(tID, tCons, _ => Equals(some("choose"), some("other")))), Seq()))
+    // and through another sort whose field refinement quantifies over it
+    val aID = FreshIdentifier("A")
+    val bID = FreshIdentifier("B")
+    val a = withField(aID, FreshIdentifier("A"), _ => forall("b" :: T(bID)())(_ => E(false)))
+    val b = withField(bID, FreshIdentifier("B"), _ => Not(forall("a" :: T(aID)())(_ => E(false))))
+    assert(!wellFormed(Seq(a, b), Seq()))
+
+    // refinements that only inspect the field are fine
+    assert(wellFormed(Seq(withField(tID, tCons, v => GreaterEquals(v, E(BigInt(0))))), Seq()))
+    // as are quantifiers over other values
+    assert(wellFormed(Seq(withField(tID, tCons, v => forall("n" :: IntegerType())(n => Equals(n, n)))), Seq()))
   }
 
   test("Type parameter definitions") {
@@ -150,11 +207,11 @@ class DefinitionsSuite extends AnyFunSuite {
     assert(intercept[RuntimeException](cons.selectorID2Index(FreshIdentifier("nope"))).getMessage.contains("Could not find"))
 
     val typed = box.typed(Seq(IntegerType()))
-    assert(typed.flags == Seq(Annotation("sort", Seq(IntegerType()))))
+    assert(typed.flags == Seq(Annotation("sort", Seq(at(IntegerType())))))
     val v = Variable.fresh("v", tp)
     assert(typed.instantiate(v).getType == IntegerType())
     val tcons = typed.constructors.head
-    assert(tcons.fields.head.flags == Seq(Annotation("field", Seq(IntegerType(), IntegerLiteral(1)))))
+    assert(tcons.fields.head.flags == Seq(Annotation("field", Seq(at(IntegerType()), IntegerLiteral(1)))))
     assert(tcons.fields.head.tpe == IntegerType())
 
     val tupleSort = mkSort(FreshIdentifier("Pairs"))() { _ =>
@@ -169,11 +226,11 @@ class DefinitionsSuite extends AnyFunSuite {
     assert(idFd.getTpe(stripRefinements = false) == idFd.returnType)
     assert(idFd.copy(fullBody = idFd.fullBody).fullBody == idFd.fullBody)
     val typed = idFd.typed(Seq(IntegerType()))
-    assert(typed.flags == Seq(Annotation("fun", Seq(IntegerType()))))
-    assert(typed.params.head.flags == Seq(Annotation("param", Seq(IntegerType()))))
+    assert(typed.flags == Seq(Annotation("fun", Seq(at(IntegerType())))))
+    assert(typed.params.head.flags == Seq(Annotation("param", Seq(at(IntegerType())))))
     assert(typed.getTpe(stripRefinements = false) == IntegerType())
-    assert(typed.instantiate(Annotation("f", Seq(idFd.tparams.head.tp))) == Annotation("f", Seq(IntegerType())))
-    assert(box.typed(Seq(BooleanType())).instantiate(Annotation("s", Seq(tp))) == Annotation("s", Seq(BooleanType())))
+    assert(typed.instantiate(Annotation("f", Seq(at(idFd.tparams.head.tp)))) == Annotation("f", Seq(at(IntegerType()))))
+    assert(box.typed(Seq(BooleanType())).instantiate(Annotation("s", Seq(at(tp)))) == Annotation("s", Seq(at(BooleanType()))))
   }
 
   test("Types") {

@@ -78,47 +78,49 @@ trait FunctionTemplates { self: Templates =>
           invocations(p).map(start -> _)).distinct
       }
 
-      val tmplClauses: TemplateClauses = {
-        val clauses = bodyClauses + (start -> Equals(call, p))
-
-        // Register the function's return as a contract typing to enable
-        // induction with refinement types
-        if (ContractUnrolling `unroll` tfd.returnType) {
-          // The return type only holds for arguments that lie in the parameter types, so
-          // it is assumed only once the arguments' membership in these types is shown.
-          // Under `optAssumeChecked`, the front-end has checked the arguments of every call, so
-          // the return type is assumed directly.
-          val (domains, domClauses) = if (modes.assumeChecked) (Seq.empty[Expr], TemplateClauses()) else
-            tfd.params.foldLeft((Seq.empty[Expr], TemplateClauses())) { case ((domains, domClauses), vd) =>
-              mkTypeClauses(start, vd.tpe, vd.toVariable, substMap, inDomain = true)(using MembershipGenerator) match {
-                case (BooleanLiteral(true), _) => (domains, domClauses)
-                case (p, pClauses) => (domains :+ p, domClauses ++ pClauses)
-              }
-            }
-
-          val allClauses = clauses ++ domClauses
-          val closures = typeOps.variablesOf(tfd.returnType).toSeq.sortBy(_.id).map(v => Left(substMap(v)))
-          val call = mkCall(tfd, arguments.map(_._2))
-          if (domains.isEmpty) {
-            val typing = Typing(tfd.returnType, call, Constraint(trueT, closures, false))
-            allClauses.copy(types = allClauses.types `merge` Map(pathVar._2 -> Set(typing)))
-          } else {
-            val result = Variable.fresh("result", BooleanType(), true)
-            val resultT = encodeSymbol(result)
-            val typing = Typing(tfd.returnType, call, Constraint(resultT, closures, false))
-            allClauses.copy(
-              exprVars = allClauses.exprVars + (result -> resultT),
-              guardedExprs = allClauses.guardedExprs `merge` (start -> Implies(andJoin(domains), result)),
-              types = allClauses.types `merge` Map(pathVar._2 -> Set(typing)))
-          }
-        } else {
-          clauses
-        }
-      }
+      val tmplClauses = bodyClauses + (start -> Equals(call, p))
 
       val (contents0, str) = Template.contents(
         pathVar, arguments, tmplClauses, optCall = Some(Defined(tfd)), partial = true)
       val contents = contents0.copy(clauses = contents0.clauses ++ rankClauses(tfd, contents0, bodySites))
+
+      // The function's return type, as a contract typing of its calls, which enables induction with
+      // refinement types. Recursive functions get their full return type, and the others a shallow
+      // contract, which leaves the children of inductive sorts untyped (see [[optShallowContracts]]).
+      // Calls in refinements get no contract (see [[Call.typed]]).
+      val contract: Option[Template] = Option.when(ContractUnrolling `unroll` tfd.returnType) {
+        val shallow = modes.shallowContracts && !isRecursive(tfd.id)
+        // The return type only holds for arguments that lie in the parameter types, so
+        // it is assumed only once the arguments' membership in these types is shown.
+        // Under `optAssumeChecked`, the front-end has checked the arguments of every call, so
+        // the return type is assumed directly.
+        val (domains, domClauses) = if (modes.assumeChecked) (Seq.empty[Expr], TemplateClauses()) else
+          tfd.params.foldLeft((Seq.empty[Expr], TemplateClauses())) { case ((domains, domClauses), vd) =>
+            mkTypeClauses(start, vd.tpe, vd.toVariable, substMap, inDomain = true)(using MembershipGenerator) match {
+              case (BooleanLiteral(true), _) => (domains, domClauses)
+              case (p, pClauses) => (domains :+ p, domClauses ++ pClauses)
+            }
+          }
+
+        val closures = typeOps.variablesOf(tfd.returnType).toSeq.sortBy(_.id).map(v => Left(substMap(v)))
+        val call = mkCall(tfd, arguments.map(_._2))
+        val contractClauses = if (domains.isEmpty) {
+          val typing = Typing(tfd.returnType, call, Constraint(trueT, closures, false, shallow = shallow))
+          domClauses.copy(types = domClauses.types `merge` Map(pathVar._2 -> Set(typing)))
+        } else {
+          val result = Variable.fresh("result", BooleanType(), true)
+          val resultT = encodeSymbol(result)
+          val typing = Typing(tfd.returnType, call, Constraint(resultT, closures, false, shallow = shallow))
+          domClauses.copy(
+            exprVars = domClauses.exprVars + (result -> resultT),
+            guardedExprs = domClauses.guardedExprs `merge` (start -> Implies(andJoin(domains), result)),
+            types = domClauses.types `merge` Map(pathVar._2 -> Set(typing)))
+        }
+
+        val (contractContents, _) = Template.contents(
+          pathVar, arguments, contractClauses, optCall = Some(Defined(tfd)), partial = true)
+        new Template { val contents = contractContents }
+      }
 
       val funString : () => String = () => {
         "Template for def " + tfd.signature +
@@ -126,7 +128,7 @@ trait FunctionTemplates { self: Templates =>
         tfd.getType + " is :\n" + str()
       }
 
-      val res = new FunctionTemplate(contents, funString)
+      val res = new FunctionTemplate(contents, funString, contract)
       functionCaches.templates(tfd) = res
       res
     })
@@ -204,15 +206,18 @@ trait FunctionTemplates { self: Templates =>
       val tmplClauses = clauses + (start -> Equals(Application(callee.function, args), p))
 
       val (contents, str) = Template.contents(pathVar, arguments, tmplClauses, optCall = Some(callee), partial = true)
-      val res = new FunctionTemplate(contents, () => "Template for the interpretation of " + callee.signature + " is :\n" + str())
+      val res = new FunctionTemplate(contents, () => "Template for the interpretation of " + callee.signature + " is :\n" + str(), None)
       functionCaches.interpreted(callee) = res
       res
     })
   }
 
+  /** The template of a function's body, and the template of its contract, which [[Call.typed]] calls
+    * also instantiate. */
   class FunctionTemplate private[FunctionTemplates](
     val contents: TemplateContents,
-    stringRepr: () => String) extends Template {
+    stringRepr: () => String,
+    val contract: Option[Template]) extends Template {
 
     private lazy val str : String = stringRepr()
     override def toString : String = str
@@ -306,10 +311,11 @@ trait FunctionTemplates { self: Templates =>
     * @param calls the calls that each blocker guards, which are unfolded with it
     * @param defBlockers the definition blocker of each unfolded call, under which its body is
     *                    instantiated, in the order in which the calls were unfolded */
-  private[unrolling] case class FunctionsState(calls: Pending[Encoded, Call], defBlockers: VectorMap[Call, Encoded])
+  private[unrolling] case class FunctionsState(calls: Pending[Encoded, Call], defBlockers: VectorMap[Call, Encoded],
+                                               contracted: Set[Call])
 
   private[unrolling] object functionsManager extends Manager {
-    private[FunctionTemplates] val state = new Snapshots(FunctionsState(Pending.empty, VectorMap.empty))
+    private[FunctionTemplates] val state = new Snapshots(FunctionsState(Pending.empty, VectorMap.empty, Set.empty))
 
     private lazy val evaluator = semantics.getEvaluator(using context.withOpts(evaluators.optEvalQuantifiers(false)))
 
@@ -340,8 +346,10 @@ trait FunctionTemplates { self: Templates =>
       // an interruption stops the unrolling between blockers, never within the calls of one
       for ((blocker, gen, calls) <- thisCallInfos if calls.nonEmpty && !interrupted;
            _ = remainingBlockers -= blocker;
-           call @ Call(callee, args, tpSubst) <- calls) {
+           typedCall @ Call(callee, args, tpSubst, typed) <- calls) {
         val newCls = new scala.collection.mutable.ListBuffer[Encoded]
+        // calls are unfolded once, whether typed or not, and their contract once a typed call is
+        val call = typedCall.copy(typed = false)
 
         val defBlocker = state.get.defBlockers.get(call) match {
           case Some(defBlocker) =>
@@ -410,6 +418,14 @@ trait FunctionTemplates { self: Templates =>
             }
 
             defBlocker
+        }
+
+        callee match {
+          case Defined(tfd) if typed && !state.get.contracted(call) =>
+            state.update(s => s.copy(contracted = s.contracted + call))
+            for (contract <- FunctionTemplate(tfd).contract)
+              newCls ++= Rule.Unfold(contract, defBlocker, args ++ tpSubst, None).clauses
+          case _ =>
         }
 
         // We connect it to the defBlocker: blocker => defBlocker

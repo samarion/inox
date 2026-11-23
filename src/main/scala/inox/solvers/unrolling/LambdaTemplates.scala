@@ -155,9 +155,10 @@ trait LambdaTemplates { self: Templates =>
    * @param closures - the closures that are bound in the type `tpe`
    * @param free - whether `f` corresponds to a free function in the program or a result from
    *               a named function
+   * @param shallow - whether the results of `f` get a shallow contract (see [[Constraint]])
    */
   private def registerApplication(
-    b: Encoded, f: Encoded, app: App, tpe: Type, closures: Seq[Arg], free: Boolean
+    b: Encoded, f: Encoded, app: App, tpe: Type, closures: Seq[Arg], free: Boolean, shallow: Boolean
   ): Option[(Encoded, Encoded, Clauses)] = {
     val tpeUnrolling: TypeUnrolling = if (free) FreeUnrolling else ContractUnrolling
     if (tpeUnrolling.unroll(tpe)) {
@@ -186,7 +187,7 @@ trait LambdaTemplates { self: Templates =>
         // the application result descends from both `f` and the arguments of `app`
         val depth = witnessDepth max functionDepth(f) max appDepth(app)
         clauses ++= withWitnessDepth(depth) {
-          instantiateType(freshBlocker, Typing(to, app.encoded, Constraint(toResult, toClosures, free)))
+          instantiateType(freshBlocker, Typing(to, app.encoded, Constraint(toResult, toClosures, free, shallow = shallow)))
         }
 
         // A function of type `Pi(x: A). B` only maps arguments in `A` to results in `B`, so the
@@ -219,7 +220,8 @@ trait LambdaTemplates { self: Templates =>
     }
   }
 
-  def registerFunction(b: Encoded, r: Encoded, tpe: Type, f: Encoded, closures: Seq[Arg], free: Boolean): Clauses = {
+  def registerFunction(b: Encoded, r: Encoded, tpe: Type, f: Encoded, closures: Seq[Arg], free: Boolean,
+                       shallow: Boolean = false): Clauses = {
     reporter.debug(s"-> registering free function $b ==> $f: $tpe")
     val ft @ FunctionType(_, _) = tpe.getType: @unchecked
     state.update(s => s.copy(freeFunctions = s.freeFunctions.updated(ft, freeFunctions(ft) + (b -> f))))
@@ -247,12 +249,12 @@ trait LambdaTemplates { self: Templates =>
     // Add type blocker clause
     locally {
       val typedResults = OpenAnd("b_and", AssumedComplete.Always)
-      state.update(s => s.copy(freeBlockers = s.freeBlockers.updated(ft, freeBlockers(ft) + ((typedResults, b, tpe, f, closures, free)))))
+      state.update(s => s.copy(freeBlockers = s.freeBlockers.updated(ft, freeBlockers(ft) + ((typedResults, b, tpe, f, closures, free, shallow)))))
 
       val blockedResults = for {
         (bApp, app @ App(caller, _, _, _)) <- applications(ft)
         if canBeEqual(caller, f)
-        (typeBlocker, appResult, appClauses) <- registerApplication(b, f, app, tpe, closures, free)
+        (typeBlocker, appResult, appClauses) <- registerApplication(b, f, app, tpe, closures, free, shallow)
       } yield {
         clauses ++= appClauses
         clauses ++= Rule.Enables(bApp, typeBlocker).clauses
@@ -261,12 +263,6 @@ trait LambdaTemplates { self: Templates =>
 
       clauses ++= Rule.Define(Some(b), r, typedResults.withOperands(blockedResults.toSeq)).clauses
     }
-
-    if (ft.from.isEmpty) clauses ++= (for {
-      template <- byType(ft).values.toList
-      if canBeEqual(template.ids._2, f) && isPureTemplate(template)
-      clause <- arglessEquality(b, isFree, f, ft, template)
-    } yield clause)
 
     lazy val gen = nextGeneration(currentGeneration)
     for (app @ (_, App(caller, _, args, _)) <- applications(ft)) {
@@ -318,10 +314,6 @@ trait LambdaTemplates { self: Templates =>
     val clauses = new scala.collection.mutable.ListBuffer[Encoded]
 
     for ((b, g) <- freeFunctions(ft) if g == f) {
-      if (ft.from.isEmpty && isPureTemplate(template)) {
-        clauses ++= arglessEquality(b, nonFreeBlockers(f)._1, f, ft, template)
-      }
-
       val (isFree, equalLambdas) = nonFreeBlockers(f)
       val next = equalLambdas.next
       state.update(s => s.copy(nonFreeBlockers = s.nonFreeBlockers.updated(f, (isFree, next))))
@@ -335,24 +327,6 @@ trait LambdaTemplates { self: Templates =>
 
     clauses.toSeq
   }
-
-  private def isPureTemplate(template: LambdaTemplate): Boolean = template.structure.body match {
-    case Lambda(_, _: Variable) => true
-    case _ => false
-  }
-
-  /** Equates the free function `f` with the pure, argument-less lambda of `template` when they
-    * return the same value (see [[Rule.ArglessEquality]]).
-    *
-    * A free function's model is the lambda that returns its value (`() => f()`), which is
-    * structurally equal to the pure lambda's model when the values agree, so the solver must not
-    * consider them distinct. This only holds while `f` is free: when `f` is equal to another lambda,
-    * the model of `f` is that lambda, and agreeing on their value doesn't make the two lambdas
-    * equal. Without the `isFree` guard, `f == () => g(x)` and `() => Uu` (both of type `() => Unit`)
-    * would force `() => g(x) == () => Uu`, which is UNSAT although both lambdas exist.
-    */
-  private def arglessEquality(b: Encoded, isFree: Encoded, f: Encoded, ft: FunctionType, template: LambdaTemplate): Clauses =
-    Rule.ArglessEquality(b, isFree, f, ft, template.start, template.ids._2).clauses
 
   private def registerAppInfo(gen: Int, key: (Encoded, App), template: Either[LambdaTemplate, Encoded], equals: Encoded, args: Seq[Arg]): Unit = {
     state.update(s => s.copy(appInfos = s.appInfos.register(key, gen, Set(TemplateAppInfo(template, equals, args)))))
@@ -412,14 +386,6 @@ trait LambdaTemplates { self: Templates =>
         case (v, dep) if v.getType.isInstanceOf[FunctionType] => dep
       })
 
-      // make sure we introduce sound equality constraints between closures that take no arguments
-      val arglessEqClauses: Clauses = if (newTemplate.tpe.from.nonEmpty || !isPureTemplate(newTemplate)) {
-        Seq.empty
-      } else {
-        for ((b,f) <- freeFunctions(newTemplate.tpe).toSeq if canBeEqual(idT, f);
-             clause <- arglessEquality(b, nonFreeBlockers(f)._1, f, newTemplate.tpe, newTemplate)) yield clause
-      }
-
       val nonFreeClauses = (for ((b,f) <- freeFunctions(newTemplate.tpe).toSeq if canBeEqual(idT, f)) yield {
         val (isFree, equalLambdas) = nonFreeBlockers(f)
         val next = equalLambdas.next
@@ -432,7 +398,6 @@ trait LambdaTemplates { self: Templates =>
       val clauses = newTemplate.structure.instantiation ++
         equalityClauses(newTemplate) ++
         orderingClauses ++
-        arglessEqClauses ++
         nonFreeClauses
 
       state.update(s => s.copy(byID = s.byID.updated(idT, newTemplate)))
@@ -504,9 +469,9 @@ trait LambdaTemplates { self: Templates =>
         /* Make sure that if `app` correspond to an input function, then the ADT
          * invariants are asserted on its return values. */
         for {
-          old @ (typedResults, b, tpe, f, closures, free) <- freeBlockers(ft).toList
+          old @ (typedResults, b, tpe, f, closures, free, shallow) <- freeBlockers(ft).toList
           if canBeEqual(caller, f)
-          (typeBlocker, appResult, appClauses) <- registerApplication(b, f, app, tpe, closures, free)
+          (typeBlocker, appResult, appClauses) <- registerApplication(b, f, app, tpe, closures, free, shallow)
         } {
           clauses ++= appClauses
 
@@ -514,7 +479,7 @@ trait LambdaTemplates { self: Templates =>
           clauses ++= Rule.Enables(blocker, typeBlocker).clauses
 
           val next = typedResults.next
-          state.update(s => s.copy(freeBlockers = s.freeBlockers.updated(ft, freeBlockers(ft) - old + ((next, b, tpe, f, closures, free)))))
+          state.update(s => s.copy(freeBlockers = s.freeBlockers.updated(ft, freeBlockers(ft) - old + ((next, b, tpe, f, closures, free, shallow)))))
           clauses ++= typedResults.link(next, Seq(mkImplies(typeBlocker, appResult)))
         }
 
@@ -666,14 +631,14 @@ trait LambdaTemplates { self: Templates =>
     *                        equalities to the lambdas of its type found so far: `isFree` holds iff
     *                        the function equals none of them (see [[registerFunction]]), so that the
     *                        applications of a free function that equals a lambda are dispatched to
-    *                        its body. The disjunction is extended with each new lambda, and is
-    *                        assumed complete in every check, so that `isFree` means "equal to none of
-    *                        the lambdas unrolled so far".
+    *                        its body. The disjunction is extended with each new lambda, and
+    *                        assumed complete, so that `isFree` means "equal to none of the lambdas
+    *                        unrolled so far": the applications of `f` are then left uninterpreted,
+    *                        which holds whatever `f` is.
     * @param typeBlockers the type blocker and the typing result of the result of each application
     *                     of a free function, keyed by the function and the application (see
     *                     [[registerApplication]])
-    * @param freeFunctions the free functions of each type, under their blocker, which make models
-    *                      of functions that take no arguments sound
+    * @param freeFunctions the free functions of each type, under their blocker
     * @param instantiated the applications that were instantiated, under their blocker
     * @param resultGuards for function-typed applications, a literal that holds whenever the
     *                     application is reached. Results of applications are registered as free
@@ -688,7 +653,7 @@ trait LambdaTemplates { self: Templates =>
     byType: Map[FunctionType, Map[TemplateStructure, LambdaTemplate]],
     lambdaClasses: Map[(FunctionType, Expr, Seq[(Variable, Encoded)]), Encoded],
     applications: Map[FunctionType, Set[(Encoded, App)]],
-    freeBlockers: Map[FunctionType, Set[(OpenAnd, Encoded, Type, Encoded, Seq[Arg], Boolean)]],
+    freeBlockers: Map[FunctionType, Set[(OpenAnd, Encoded, Type, Encoded, Seq[Arg], Boolean, Boolean)]],
     nonFreeBlockers: Map[Encoded, (Encoded, OpenOr)],
     typeBlockers: Map[(Encoded, App), (Encoded, Encoded)],
     freeFunctions: Map[FunctionType, Set[(Encoded, Encoded)]],
@@ -718,7 +683,7 @@ trait LambdaTemplates { self: Templates =>
       state.get.byType.getOrElse(tpe, VectorMap.empty)
     private[LambdaTemplates] def applications(tpe: FunctionType): Set[(Encoded, App)] =
       state.get.applications.getOrElse(tpe, ListSet.empty)
-    private[LambdaTemplates] def freeBlockers(tpe: FunctionType): Set[(OpenAnd, Encoded, Type, Encoded, Seq[Arg], Boolean)] =
+    private[LambdaTemplates] def freeBlockers(tpe: FunctionType): Set[(OpenAnd, Encoded, Type, Encoded, Seq[Arg], Boolean, Boolean)] =
       state.get.freeBlockers.getOrElse(tpe, ListSet.empty)
     private[LambdaTemplates] def nonFreeBlockers: Map[Encoded, (Encoded, OpenOr)] = state.get.nonFreeBlockers
     private[LambdaTemplates] def freeFunctions(tpe: FunctionType): Set[(Encoded, Encoded)] =
