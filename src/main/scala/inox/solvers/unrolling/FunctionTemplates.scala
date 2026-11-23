@@ -82,8 +82,11 @@ trait FunctionTemplates { self: Templates =>
         val clauses = bodyClauses + (start -> Equals(call, p))
 
         // Register the function's return as a contract typing to enable
-        // induction with refinement types
-        if (ContractUnrolling `unroll` tfd.returnType) {
+        // induction with refinement types. Only recursive functions need it: the calls of
+        // the others are unfolded, which gives their results the type of their bodies, while
+        // the contract would type the results of every call, field by field, which is costly
+        // when the fields have refinements that call other functions
+        if ((ContractUnrolling `unroll` tfd.returnType) && isRecursive(tfd.id)) {
           // The return type only holds for arguments that lie in the parameter types, so
           // it is assumed only once the arguments' membership in these types is shown.
           // Under `optAssumeChecked`, the front-end has checked the arguments of every call, so
