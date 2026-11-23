@@ -32,6 +32,12 @@ trait PortfolioSolver extends Solver { self =>
 
   override def unrollBoundReached: Boolean = boundHit
 
+  // The resources spent by the solver that answered the last check, if one did: those of the
+  // other solvers depend on when they were interrupted, and are counted in other units
+  private var winnerUsage: ResourceUsage = ResourceUsage.empty
+
+  override def resourceUsage: ResourceUsage = winnerUsage
+
   protected var resultSolver: Option[Solver] = None
 
   private var tasks: Future[Unit] = Future(())
@@ -77,21 +83,39 @@ trait PortfolioSolver extends Solver { self =>
       }
     }
 
+    // with proofs, an unsat answer without a proof lets the other solvers keep working
+    def proved(r: config.Response[Model, Assumptions]): Boolean = !config.withProof || !r.isUNSAT || (r match {
+      case UnsatWithProof(Right(_)) => true
+      case _ => false
+    })
+
+    def answer(s: SubSolver, r: config.Response[Model, Assumptions]) = {
+      resultSolver = s.getResultSolver
+      winnerUsage = s.resourceUsage
+      resultSolver.foreach { solv =>
+        reporter.debug("Solved with "+solv)
+      }
+      r
+    }
+
     val res =
-      inox.utils.FutureUtils.findFirst(fs)(_._2 != Unknown) match {
+      inox.utils.FutureUtils.findFirst(fs)(a => a._2 != Unknown && proved(a._2)) match {
         case Some((s, r)) =>
-          resultSolver = s.getResultSolver
-          resultSolver.foreach { solv =>
-            reporter.debug("Solved with "+solv)
-          }
           solvers.foreach(_.interrupt())
-          r
+          answer(s, r)
         case None =>
-          reporter.debug("No solver succeeded")
-          // Every check has completed, so the solvers' reasons describe this check
-          resourceOut = solvers.exists(_.resourceLimitReached)
-          boundHit = solvers.exists(_.unrollBoundReached)
-          config.cast(Unknown)
+          // Every check has completed: either a solver answered without a proof, or none answered
+          fs.flatMap(_.value).collectFirst { case scala.util.Success(a) if a._2 != Unknown => a } match {
+            case Some((s, r)) =>
+              answer(s, r)
+            case None =>
+              reporter.debug("No solver succeeded")
+              // The solvers' reasons describe this check
+              resourceOut = solvers.exists(_.resourceLimitReached)
+              boundHit = solvers.exists(_.unrollBoundReached)
+              winnerUsage = ResourceUsage.empty
+              config.cast(Unknown)
+          }
       }
 
     // Wait for all the solvers to stop: a solver that is still running when its next check or its

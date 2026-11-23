@@ -132,6 +132,44 @@ trait PipelinedInterpreter extends ProcessInterpreter {
     res
   }
 
+  /** Evaluates `command`, and returns its answer as the solver prints it, the next s-expression of
+    * its output, such as for answers that the parser doesn't read (the proofs of cvc5). */
+  def raw(command: String): String = {
+    flush()
+    in.write(command)
+    in.write("\n")
+    in.flush()
+
+    val answer = new StringBuilder
+    var depth = 0
+    var done = false
+    def next(): Char = {
+      val c = out.read()
+      if (c < 0) throw new java.io.IOException("The solver's output ended")
+      answer += c.toChar
+      c.toChar
+    }
+    // skips the whitespace before the answer
+    var c = out.read()
+    while (c >= 0 && c.toChar.isWhitespace) c = out.read()
+    if (c < 0) throw new java.io.IOException("The solver's output ended")
+    answer += c.toChar
+    var ch = c.toChar
+    while (!done) {
+      ch match {
+        case '(' => depth += 1
+        case ')' => depth -= 1
+        case '|' => while (next() != '|') {}
+        case '"' => while (next() != '"') {}
+        case ';' => while (next() != '\n') {}
+        case _ =>
+      }
+      if (depth == 0 && (ch == ')' || ch.isWhitespace)) done = true
+      else ch = next()
+    }
+    answer.toString.trim
+  }
+
   override def eval(cmd: SExpr): SExpr = {
     flush()
     // a reset forgets the commands that were sent, and their errors with them: the process can
@@ -209,7 +247,32 @@ class PipelinedCVC4Interpreter(executable: String, args: Array[String])
   extends CVC4Interpreter(executable, args) with PipelinedInterpreter
 
 class PipelinedCVC5Interpreter(executable: String, args: Array[String])
-  extends CVC5Interpreter(executable, args) with PipelinedInterpreter
+  extends CVC5Interpreter(executable, args) with PipelinedInterpreter {
+
+  /** The resource units that the process spent so far (what `--rlimit-per` bounds), if it tells.
+    *
+    * cvc5 only gives this counter among all its statistics, which it answers on one line and
+    * which aren't valid SMT-LIB s-expressions (`{ }`, `0ms`): the line is read as text rather than
+    * parsed.
+    */
+  def resourceUnitsUsed(): Option[Long] = {
+    flush()
+    try {
+      in.write("(get-info :all-statistics)\n")
+      in.flush()
+      // the end of the line of the previous answer may not have been read yet
+      val answer = Iterator.continually(out.readLine()).dropWhile(line => line != null && line.isBlank).next()
+      Option(answer).flatMap(PipelinedCVC5Interpreter.resourceUnits.findFirstMatchIn).map(_.group(1).toLong)
+    } catch {
+      // for instance once the process was killed by an interrupt
+      case _: Exception => None
+    }
+  }
+}
+
+object PipelinedCVC5Interpreter {
+  private val resourceUnits = """"resource::resourceUnitsUsed" (\d+)""".r
+}
 
 class PipelinedBitwuzlaInterpreter(executable: String, args: Array[String])
   extends BitwuzlaInterpreter(executable, args) with PipelinedInterpreter

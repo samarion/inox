@@ -70,7 +70,22 @@ class UnrollingSolverSuite extends TestSuite with DatastructureUtils {
     })
   }
 
-  given symbols: Symbols = baseSymbols.withFunctions(Seq(down, lengthFd, constant, pick))
+  /** `force(k) = k()`, which applies the argument-less function it is given. */
+  val forceID = FreshIdentifier("force")
+  val force = mkFunDef(forceID)() { _ => (
+    Seq("k" :: FunctionType(Seq(), I)), I, { case Seq(k) => Application(k, Seq()) })
+  }
+
+  /** `guarded(z) = () => if (z > 0) error else z`, a lambda that only exists once `guarded` is
+    * unfolded, and whose body may fail, so that it isn't normalized to `() => z`. */
+  val guardedID = FreshIdentifier("guarded")
+  val guarded = mkFunDef(guardedID)() { _ => (
+    Seq("z" :: I), FunctionType(Seq(), I), { case Seq(z) =>
+      Lambda(Seq(), IfExpr(z > int(0), Error(I, "positive"), z))
+    })
+  }
+
+  given symbols: Symbols = baseSymbols.withFunctions(Seq(down, lengthFd, constant, pick, force, guarded))
   val program = InoxProgram(symbols)
 
   /** Checks `expr` under `config`, with the options of the test and `opts`. */
@@ -287,6 +302,24 @@ class UnrollingSolverSuite extends TestSuite with DatastructureUtils {
     }
   }
 
+  // A free function that returns the value of a pure lambda isn't that lambda when it is another
+  // lambda, such as `() => if (false) error else y`, even once the pure lambda is applied. The
+  // solver may not find such a model, but it must not refute these queries.
+  test("argument-less functions may return the value of a pure lambda without being equal to it") {
+    val f = Variable.fresh("f", FunctionType(Seq(), I))
+    val ly = arglessLambda
+    assert(check(Application(f, Seq()) === y && !(f === ly) && E(forceID)(ly) === y, Simple) != Unsat)
+    // `f` is a lambda that the unrolling only finds later
+    val later = Application(f, Seq()) === y && !(f === ly) && E(forceID)(ly) === y && f === E(guardedID)(y)
+    check(later, Model, optCheckModels(true)) match {
+      case SatWithModel(model) => assert(value(model, y) match {
+        case IntegerLiteral(n) => n <= 0
+        case _ => false
+      })
+      case res => fail(s"Expected a model, got $res")
+    }
+  }
+
   // Argument-less free functions are extracted from the value of their application, here as
   // `() => 1`, which equals `() => y` when `y` is 1. Their models must still differ from the
   // lambdas they are distinct from, or they contradict the query.
@@ -306,6 +339,23 @@ class UnrollingSolverSuite extends TestSuite with DatastructureUtils {
           assert(evaluated.result == Some(BooleanLiteral(true)), clause)
         case res => fail(s"Expected a model for $clause, got $res")
       }
+    }
+  }
+
+  // Functions on `Unit` agree with a lambda on every input once they agree on `()`, like functions
+  // with no parameters: distinguishing inputs relate them under extensional equality, and models
+  // keep them structurally distinct under intensional equality.
+  test("functions on Unit are compared with the lambdas of their type like argument-less ones") {
+    val fu = Variable.fresh("fu", FunctionType(Seq(UnitType()), RefinementType(posVd, posVd.toVariable > int(0))))
+    val lu = Lambda(Seq(ValDef.fresh("u", UnitType())), y)
+    val clause = Application(fu, Seq(UnitLiteral())) === y && !(fu === lu)
+    assert(check(clause, Simple, optFunctionEquality(FunctionEquality.Extensional)) == Unsat)
+    check(clause, Model, optCheckModels(true)) match {
+      case SatWithModel(model) =>
+        val bindings = model.vars.toSeq.map { case (vd, v) => vd -> v }
+        val evaluated = program.getEvaluator.eval(bindings.foldRight(clause) { case ((vd, v), e) => Let(vd, v, e) }, model)
+        assert(evaluated.result == Some(BooleanLiteral(true)))
+      case res => fail(s"Expected a model, got $res")
     }
   }
 

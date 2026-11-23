@@ -231,15 +231,51 @@ trait RuleKernel { self: Templates =>
     case LambdaEquality(blocker: Encoded, lambda1: Encoded, lambda2: Encoded, closuresEqual: Option[Encoded],
                         intensional: Boolean)
 
-    /** `blocker && isFree && start && lambda() == f() ==> lambda == f`, where `f` is a free function
-      * with no parameters, `isFree` holds iff it is equal to none of the lambdas of its type, and
-      * `lambda` is a pure lambda with no parameters, i.e. one that returns a value it captures,
-      * created under `start`.
-      *
-      * The value of a free function that is equal to no lambda is the lambda that returns its
-      * result, and lambdas are equal when their normalized bodies and closures are. Without
-      * `isFree`, `f` may be equal to another lambda, whose body differs. */
-    case ArglessEquality(blocker: Encoded, isFree: Encoded, f: Encoded, tpe: FunctionType, start: Encoded, lambda: Encoded)
+    /** The arguments that the clauses of this rule are built from, by name, as the certificates of
+      * the solver's answers give them (see [[certificates.Certificates]]). An argument that the
+      * rule doesn't have is left out, and one that only states a case has no terms. A type is
+      * given by its equality symbol, with the applications that the clauses have, and a template
+      * by the instance that is logged with the rule (see [[RuleChecker.generated]]). */
+    def arguments: Seq[(String, Seq[Encoded])] = {
+      def one(name: String, e: Encoded) = Seq(name -> Seq(e))
+      def opt(name: String, e: Option[Encoded]) = e.toSeq.map(name -> Seq(_))
+      def flag(name: String, set: Boolean) = if (set) Seq(name -> Seq.empty[Encoded]) else Seq()
+      this match {
+        case Define(guard, literal, value) => opt("guard", guard) ++ one("literal", literal) ++ one("value", value)
+        case Enables(blocker, target) => one("blocker", blocker) ++ one("target", target)
+        case Hypothesis(literal, condition, fact) => one("literal", literal) ++ one("condition", condition) ++ one("fact", fact)
+        case Unfold(_, blocker, _, failure) => one("blocker", blocker) ++ opt("failure", failure)
+        case Instance(_, of) => of match {
+          case InstanceOf.Expression(_) => flag("expression", true)
+          case InstanceOf.OfAxiom => flag("axiom", true)
+          case InstanceOf.Counterexample => flag("counterexample", true)
+        }
+        case Root(start) => one("start", start)
+        case Typed(blocker, typing) => one("blocker", blocker) ++ one("typing", typing)
+        case Holds(blocker, quantification) => one("blocker", blocker) ++ one("quantification", quantification)
+        case Unreachable(literal, under) => one("literal", literal) ++ opt("under", under)
+        case Decreases(blocker, decrease, unless) => one("blocker", blocker) ++ one("decrease", decrease) ++ opt("unless", unless)
+        case Congruence(premises, resultEq) => Seq("premises" -> premises) ++ one("result", resultEq)
+        case Witness(start, differ, failures) =>
+          one("start", start) ++ one("differ", differ) ++ failures.toSeq.map { case (err1, err2) => "failures" -> Seq(err1, err2) }
+        case Reflexivity(tpe, e1, e2, guard) =>
+          opt("guard", guard) ++ one("eq", equalitySymbol(tpe)._2) ++ Seq("terms" -> Seq(e1, e2)) ++ one("eq12", equality(tpe, e1, e2))
+        case Symmetry(tpe, blocker, e1, e2) =>
+          one("blocker", blocker) ++ one("eq", equalitySymbol(tpe)._2) ++ Seq("terms" -> Seq(e1, e2)) ++
+            one("eq12", equality(tpe, e1, e2)) ++ one("eq21", equality(tpe, e2, e1))
+        case Transitivity(tpe, guard, e1, e2, e3) =>
+          one("guard", guard) ++ one("eq", equalitySymbol(tpe)._2) ++ Seq("terms" -> Seq(e1, e2, e3)) ++
+            one("eq12", equality(tpe, e1, e2)) ++ one("eq23", equality(tpe, e2, e3)) ++ one("eq13", equality(tpe, e1, e3))
+        case Dispatched(blocker, dispatch) => one("blocker", blocker) ++ one("rest", dispatch.rest)
+        case DispatchFailure(enabler, appFailure, bodyFailure) =>
+          one("enabler", enabler) ++ one("application", appFailure) ++ one("body", bodyFailure)
+        case SameLambda(start, lambda, representative) =>
+          one("start", start) ++ one("lambda", lambda) ++ one("representative", representative)
+        case LambdaEquality(blocker, lambda1, lambda2, closuresEqual, intensional) =>
+          one("blocker", blocker) ++ Seq("lambdas" -> Seq(lambda1, lambda2)) ++ opt("closures", closuresEqual) ++
+            flag("intensional", intensional)
+      }
+    }
 
     /** The clauses of this rule. This is the only code that builds them. */
     def clauses: Clauses = applying(this)(build)
@@ -319,14 +355,11 @@ trait RuleKernel { self: Templates =>
           case (None, false) => Seq.empty
         }
 
-      case ArglessEquality(blocker, isFree, f, tpe, start, lambda) =>
-        val (lambdaApp, fApp) = (mkApp(lambda, tpe, Seq.empty), mkApp(f, tpe, Seq.empty))
-        Seq(mkImplies(mkAnd(blocker, isFree, start, mkEquals(lambdaApp, fApp)), mkEquals(lambda, f)))
     }
   }
 
   /** The application of the equality symbol of `tpe` to `e1` and `e2`. */
-  private def equality(tpe: Type, e1: Encoded, e2: Encoded): Encoded =
+  private[unrolling] def equality(tpe: Type, e1: Encoded, e2: Encoded): Encoded =
     mkApp(equalitySymbol(tpe)._2, FunctionType(Seq(tpe, tpe), BooleanType()), Seq(e1, e2))
 
   /** The equality of `e1` and `e2` at `tpe`, which is only related to their structural equality

@@ -232,26 +232,72 @@ trait FunctionTemplates { self: Templates =>
       exprOps.exists { case _: UninterpretedCall => true case _ => false } (fd.fullBody)
     })
 
-  /** The [[Rule.Congruence]] of the calls `call1` and `call2` of the same function, when some of
-    * its parameters or its result need equality unrolling. Otherwise, the solver already knows that
-    * the calls are functions of their arguments.
+  /** Records that the equality symbol of `tpe` is constrained on some terms, by an unfolded equality
+    * or by the conclusion of a congruence, so that it can hold of distinct terms. */
+  private[unrolling] def constrainEquality(tpe: Type): Unit =
+    state.update(s => s.copy(constrained = s.constrained + tpe))
+
+  /** The pairs of unfolded calls of a function that have no [[Rule.Congruence]] yet and for which it
+    * can tell the solver something, with their blockers and the arguments on which they differ.
     *
-    * These clauses only shortcut the unfolding of both calls, so their equalities are not unrolled. */
-  private def purityClauses(call1: Call, blocker1: Encoded, call2: Call, blocker2: Encoded): Clauses = call1.callee match {
-    // The calls of an interpreted function are applications of the same free function
-    case _: Interpreted => Seq.empty
-    case Defined(tfd) =>
-      if (tfd.params.exists(vd => unrollEquality(vd.getType)) || unrollEquality(tfd.getType)) {
-        val (equalities, equalityClauses) = (tfd.params.map(_.getType) zip (call1.args zip call2.args)).map {
-          case (tpe, (e1, e2)) => guardedEquality(blocker1, tpe, e1.encoded, e2.encoded)
-        }.unzip
+    * The solver already knows that calls are functions of their arguments, so the rule only adds
+    * to that when the calls differ on arguments whose type needs equality unrolling, and only once
+    * the equality symbols of these types are constrained. The pairs are in the order in which the
+    * calls were unfolded, so that the clauses don't depend on hash codes. */
+  private def waitingCongruences: Iterator[(TypedFunDef, (Call, Encoded), (Call, Encoded), Seq[(Type, Encoded, Encoded)])] = {
+    val constrained = state.get.constrained
+    if (constrained.isEmpty) Iterator.empty else {
+      val calls = state.get.defBlockers.toSeq.collect {
+        case (call @ Call(Defined(tfd), _, _), blocker) if tfd.params.exists(vd => constrained(vd.getType)) => (tfd, call, blocker)
+      }
 
-        val (entail, entailClauses) = guardedEquality(blocker1, tfd.getType,
-          mkCall(tfd, call1.args.map(_.encoded)), mkCall(tfd, call2.args.map(_.encoded)))
+      for {
+        ((tfd, call1, blocker1), i) <- calls.iterator.zipWithIndex
+        (_, call2, blocker2) <- calls.iterator.drop(i + 1)
+        if call2.callee == call1.callee && !state.get.congruent(call1 -> call2)
+        differing = (tfd.params zip (call1.args zip call2.args)).collect {
+          case (vd, (e1, e2)) if e1.encoded != e2.encoded && unrollEquality(vd.getType) => (vd.getType, e1.encoded, e2.encoded)
+        }
+        if differing.nonEmpty && differing.forall(d => constrained(d._1))
+      } yield (tfd, call1 -> blocker1, call2 -> blocker2, differing)
+    }
+  }
 
-        equalityClauses.flatten ++ entailClauses ++
-          Rule.Congruence(blocker1 +: blocker2 +: equalities, entail).clauses
-      } else Seq.empty
+  /** Whether a model of a proof check can call for congruences (see [[modelCongruences]]). */
+  protected def hasWaitingCongruences: Boolean = waitingCongruences.hasNext
+
+  /** The [[Rule.Congruence]] of the pairs of unfolded calls that the model of a proof check reaches
+    * and whose differing arguments it makes equal, where `holds` tells whether the model satisfies
+    * a literal. Such a model breaks the congruence, or doesn't depend on it.
+    *
+    * Each pair of calls of a function on values with a custom equality (e.g. bags on Princess)
+    * would otherwise get its own clauses, and formulas would grow quadratically with the number of
+    * calls. The clauses only shortcut the unfolding of both calls, so their equalities are not
+    * unrolled. */
+  protected def modelCongruences(holds: Encoded => Boolean): Clauses = {
+    val cache = MutableMap.empty[Encoded, Boolean]
+    def cached(e: Encoded): Boolean = cache.getOrElseUpdate(e, holds(e))
+
+    val pairs = waitingCongruences.filter { case (_, (_, blocker1), (_, blocker2), differing) =>
+      cached(blocker1) && cached(blocker2) && differing.forall { case (tpe, e1, e2) => cached(equality(tpe, e1, e2)) }
+    }.toSeq
+
+    pairs.flatMap { case (tfd, (call1, blocker1), (call2, blocker2), _) =>
+      state.update(s => s.copy(congruent = s.congruent + (call1 -> call2)))
+
+      val (equalities, equalityClauses) = (tfd.params.map(_.getType) zip (call1.args zip call2.args)).map {
+        case (tpe, (e1, e2)) => guardedEquality(blocker1, tpe, e1.encoded, e2.encoded)
+      }.unzip
+
+      val (entail, entailClauses) = guardedEquality(blocker1, tfd.getType,
+        mkCall(tfd, call1.args.map(_.encoded)), mkCall(tfd, call2.args.map(_.encoded)))
+
+      // the rule constrains the equality of the results
+      if (unrollEquality(tfd.getType)) constrainEquality(tfd.getType)
+
+      equalityClauses.flatten ++ entailClauses ++
+        Rule.Congruence(blocker1 +: blocker2 +: equalities, entail).clauses
+    }
   }
 
   /** The template of the call `tfd(args)` under `blocker`, as the value that the evaluator computed
@@ -272,23 +318,6 @@ trait FunctionTemplates { self: Templates =>
     new Template { val contents = valueContents }
   }
 
-  /** The purity clauses between the calls unrolled so far, which [[equalitiesInstantiated]] delays.
-    *
-    * Until a first equality is instantiated, the equality symbols of distinct terms are left
-    * unconstrained, so the purity clauses can't constrain the results of calls. Each pair of calls of a function on values with a custom equality (e.g. bags
-    * on cvc5) gets its own clauses, so delaying them keeps formulas that never compare such values
-    * from growing quadratically with the number of calls.
-    */
-  private[unrolling] def delayedPurityClauses: Clauses = {
-    val calls = state.get.defBlockers.toSeq.groupBy(_._1.callee)
-    for {
-      (_, tfdCalls) <- calls.toSeq
-      ((call1, blocker1), i) <- tfdCalls.zipWithIndex
-      (call2, blocker2) <- tfdCalls.drop(i + 1)
-      clause <- purityClauses(call1, blocker1, call2, blocker2)
-    } yield clause
-  }
-
   private[unrolling] def mkCall(tfd: TypedFunDef, args: Seq[Encoded]): Encoded = {
     val (asT, call) = functionCaches.calls.getOrElse(tfd, {
       val as = tfd.params.map(vd => Variable.fresh("x", vd.getType, true))
@@ -305,11 +334,18 @@ trait FunctionTemplates { self: Templates =>
     *
     * @param calls the calls that each blocker guards, which are unfolded with it
     * @param defBlockers the definition blocker of each unfolded call, under which its body is
-    *                    instantiated, in the order in which the calls were unfolded */
-  private[unrolling] case class FunctionsState(calls: Pending[Encoded, Call], defBlockers: VectorMap[Call, Encoded])
+    *                    instantiated, in the order in which the calls were unfolded
+    * @param constrained the types whose equality symbol is constrained (see [[constrainEquality]])
+    * @param congruent the pairs of calls whose congruence was built (see [[modelCongruences]]), the
+    *                  call that was unfolded first coming first */
+  private[unrolling] case class FunctionsState(
+    calls: Pending[Encoded, Call],
+    defBlockers: VectorMap[Call, Encoded],
+    constrained: Set[Type],
+    congruent: Set[(Call, Call)])
 
   private[unrolling] object functionsManager extends Manager {
-    private[FunctionTemplates] val state = new Snapshots(FunctionsState(Pending.empty, VectorMap.empty))
+    private[FunctionTemplates] val state = new Snapshots(FunctionsState(Pending.empty, VectorMap.empty, Set.empty, Set.empty))
 
     private lazy val evaluator = semantics.getEvaluator(using context.withOpts(evaluators.optEvalQuantifiers(false)))
 
@@ -352,13 +388,6 @@ trait FunctionTemplates { self: Templates =>
             // we need to define this defBlocker and link it to definition
             val defBlocker = encodeSymbol(Variable.fresh("d", BooleanType(), true))
             state.update(s => s.copy(defBlockers = s.defBlockers.updated(call, defBlocker)))
-
-            // we generate helper equality clauses that stem from purity (see [[purityClauses]])
-            if (equalitiesInstantiated) {
-              for ((pcall, pblocker) <- state.get.defBlockers if pcall.callee == callee && pcall != call) {
-                newClauses ++= purityClauses(pcall, pblocker, call, defBlocker)
-              }
-            }
 
             callee match {
               case interpreted: Interpreted =>
@@ -415,7 +444,7 @@ trait FunctionTemplates { self: Templates =>
         // We connect it to the defBlocker: blocker => defBlocker
         if (defBlocker != blocker) {
           registerImplication(blocker, defBlocker)
-          newCls ++= Rule.Enables(blocker, defBlocker).clauses
+          newCls ++= enables(blocker, defBlocker)
         }
 
         reporter.debug("Unrolling behind "+call+" ("+newCls.size+")")
