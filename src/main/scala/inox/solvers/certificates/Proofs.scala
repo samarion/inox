@@ -164,10 +164,13 @@ final case class Template(params: Seq[SExpr], asserts: Seq[Int], source: Option[
 /** What a template is of (see [[unrolling.Templates.Source]]): the expression `expr` that its
   * clauses are the clauses of, and for the template of a function, the `call` that it is the
   * value of. */
-final case class Source(call: Option[SExpr], expr: SExpr) {
-  override def toString: String = call match {
-    case Some(c) => s"(function $c $expr)"
-    case None => s"(expression $expr)"
+final case class Source(call: Option[SExpr], expr: SExpr, where: Seq[(SExpr, SExpr)] = Seq()) {
+  override def toString: String = {
+    val defs = if (where.isEmpty) "" else where.map((l, r) => s"($l $r)").mkString(" (where ", " ", ")")
+    call match {
+      case Some(c) => s"(function $c $expr$defs)"
+      case None => s"(expression $expr$defs)"
+    }
   }
 }
 
@@ -196,7 +199,8 @@ final case class Assumptions(query: Seq[Int], complete: Seq[Int])
   * its check, the rules that gave the clauses, and the templates that rules instantiate, whose
   * clauses `templateScript` declares and asserts (see [[Certificates.certificate]]). */
 final case class Certificate(proof: ScriptProof, templateScript: Seq[SExpr], templates: Seq[Template],
-                             rules: Seq[Rule], assumptions: Assumptions) extends Proof {
+                             rules: Seq[Rule], assumptions: Assumptions, sourceDeclarations: Seq[SExpr] = Seq(),
+                             sorts: Map[Ref, SExpr] = Map()) extends Proof {
   /** What the symbols of the solver's session stand for, by their text and in its order. */
   def solverSymbols: Seq[(String, Ref)] =
     (proof.script ++ templateScript ++ proof.cpc).flatMap(_.symbols).map(s => s.text -> s.ref).distinct.sortBy(_._1)
@@ -204,7 +208,11 @@ final case class Certificate(proof: ScriptProof, templateScript: Seq[SExpr], tem
   /** What the symbols of the sources of the templates stand for, by their text and in its order:
     * those of the printer that printed them, and the variables of the session. */
   def sourceSymbols: Seq[(String, Ref)] =
-    templates.flatMap(_.source.toSeq.flatMap(s => s.call.toSeq :+ s.expr)).flatMap(_.symbols).map(s => s.text -> s.ref).distinct.sortBy(_._1)
+    (templates.flatMap(_.source.toSeq.flatMap(s => (s.call.toSeq :+ s.expr) ++ s.where.flatMap((l, r) => Seq(l, r)))) ++
+      sourceDeclarations ++ sourceSorts.values).flatMap(_.symbols).map(s => s.text -> s.ref).distinct.sortBy(_._1)
+
+  /** The sorts of the variables of the sources, which are variables of the session. */
+  private def sourceSorts: Map[Ref, SExpr] = sorts.filter(_._1.isInstanceOf[Ref.Variable])
 
   override def toString: String = {
     def ints(is: Seq[Int]) = is.map(" " + _).mkString
@@ -219,23 +227,24 @@ final case class Certificate(proof: ScriptProof, templateScript: Seq[SExpr], tem
       }.getOrElse("")
       s"($kind (args${if (args.isEmpty) "" else " " + args})$inst${ints(asserts)})"
     }
-    def symbolLines(symbols: Seq[(String, Ref)]) = symbols.map { case (text, ref) =>
+    def symbolLines(symbols: Seq[(String, Ref)], sorts: Map[Ref, SExpr]) = symbols.map { case (text, ref) =>
       val kind +: rest = ref.describe: @unchecked
-      s"($text $kind${rest.map(" " + string(_)).mkString})"
+      s"($text $kind${rest.map(" " + string(_)).mkString}${sorts.get(ref).map(" " + _).getOrElse("")})"
     }
     s"(inox-certificate ${Certificate.version}\n" + Proof.block("script", proof.script :+ SList(Seq(Atom("check-sat")))) + "\n" +
       "(templates\n" + Proof.block("script", templateScript) + "\n" + templateLines.map(_ + "\n").mkString + ")\n" +
       "(rules\n" + ruleLines.map(_ + "\n").mkString + ")\n" +
       s"(assumptions (query${ints(assumptions.query)}) (complete${ints(assumptions.complete)}))\n" +
-      "(solver-symbols\n" + symbolLines(solverSymbols).map(_ + "\n").mkString + ")\n" +
-      "(source-symbols\n" + symbolLines(sourceSymbols).map(_ + "\n").mkString + ")\n" +
+      "(solver-symbols\n" + symbolLines(solverSymbols, sorts -- sourceSorts.keys).map(_ + "\n").mkString + ")\n" +
+      Proof.block("source-declarations", sourceDeclarations) + "\n" +
+      "(source-symbols\n" + symbolLines(sourceSymbols, sourceSorts).map(_ + "\n").mkString + ")\n" +
       Proof.block("cpc", proof.cpc) + ")"
   }
 }
 
 object Certificate {
   /** The version of the format that certificates print in, which changes with it. */
-  val version = 2
+  val version = 3
 }
 
 object Proof {

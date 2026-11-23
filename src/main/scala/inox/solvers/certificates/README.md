@@ -3,7 +3,7 @@
 A `(get-proof)` after a `(check-sat)` that Inox answers `unsat` prints the
 certificate of that query on standard output:
 
-    (inox-certificate 2
+    (inox-certificate 3
     (script
     <the SMT-LIB script of the clauses that the unrolling solver checked>
     )
@@ -19,10 +19,13 @@ certificate of that query on standard output:
     ...)
     (assumptions (query <the indices of their asserts>) (complete <the indices of their asserts>))
     (solver-symbols
-    (<symbol of the script> <kind> "<identifier, type or index>" ...)
+    (<symbol of the script> <kind> "<identifier, type or index>" ... [<sort>])
     ...)
+    (source-declarations
+    <the SMT-LIB 3 declarations of the datatypes and functions of the sources>
+    )
     (source-symbols
-    (<symbol of the sources> <kind> "<identifier, type or index>" ...)
+    (<symbol of the sources> <kind> "<identifier, type or index>" ... [<sort>])
     ...)
     (cpc
     <cvc5's proof that the script has no model>
@@ -53,19 +56,45 @@ source is an Inox expression, which Inox's SMT-LIB 3 printer prints
 `(assume <condition> <body>)` for each assumption). Its variables are those of
 the script, under the script's names, and its other symbols are those of the
 printer, which names identifiers as the script does. The source symbols say
-what each symbol of the sources stands for, as the solver symbols do for the script;
-the printer's declarations and definitions, such as the datatypes and the
-bodies of the functions, are left out.
+what each symbol of the sources stands for, as the solver symbols do for the script.
+The source declarations are the declarations that printing the sources made:
+the datatypes, and the signatures of the functions (a definition is the
+declaration of its signature, without its body).
 
-A checker can check that the clauses of the template are those of its source,
-under the encoding of the solver: they name the values of its subexpressions
-and the paths that lead to them. The solver gives every template a source, but
-some name symbols of the template, or functions that are no functions of the
-program (`unrolling.TemplateGenerator`), whose meanings the source gives: the
-certificate doesn't print these meanings yet, and leaves out the sources that
-give some. There is no certificate when a source can't be
-printed. The certificate doesn't yet hold the input query and the encoding of
-its program either, which relate the sources to the input.
+Sorts relate the two vocabularies. The symbols of the script that depend on a
+type end with the SMT-LIB 3 sort of that type, as the printer of the sources
+prints it: a sort, constructor, selector or tester with that of its datatype,
+a dynamic application with the function sort that it applies, and the instance
+of a generic function with the list of the sorts of its type arguments, such as
+
+    (Cons!0 constructor "Cons$0" "List$0[BigInt]" (List!1 Int))
+    (first!0 function "first$0" "BigInt" (Int))
+
+and the variables of the sources end with their sort. Distinct types must
+print as distinct sorts, since a checker picks the symbol of the script that a
+symbol of a source stands for by its sort; the solver checks that they do, and
+gives no certificate otherwise.
+
+The checker checks that the clauses of the template are those of its source: they
+name the values of its subexpressions and the paths that lead to them. Every
+template has a source, that of a type, a lambda or a quantifier included; when
+the solver can't print the source of a template, there is no certificate. The
+certificate doesn't yet hold the input query and the encoding of its program
+either, which relate the sources to the input.
+
+A source names what its body doesn't have with markers (`unrolling.TemplateGenerator.markers`), whose
+meanings a `(where (<marker> <meaning>) ...)` after the body gives. A marker
+is an uninterpreted Boolean function of the sources, which the source
+declarations don't declare, qualified by the sort of the type it is about: the
+typing of a value is `((as typing!0 <sort>) "<mode>" x <closures>)`, which means
+the conditions that its type puts on `x` (and `((as reads!0 <sort>) ...)` those
+on the values that reads of a collection give, `(as inhabited!0 <sort>)` that
+the type has a value), and the functions that a lambda `f` captures through a
+value `x` come before `f`, `((as typing!0 <sort>) "capture" x f)`, which the
+source of the template that orders them assumes. The sort keeps the type's
+refinements, which are the conditions that the meaning states. The checker checks the clauses against the
+marker and its meaning; it doesn't check that the meaning is that of the type,
+nor that the functions that a capture orders are those of the value.
 
 ## Through the solver interface
 
@@ -133,6 +162,8 @@ apart from the solver. From the text of a certificate, it checks that:
 - every assert is named by a rule, or is an assumption;
 - each fresh symbol that a `Define`, `Hypothesis` or `Root` rule introduces is
   introduced once;
+- the clauses of each template are those of its source, once the source is
+  lowered to the syntax of the script;
 - the proof's `assume` commands are asserts of the script.
 
 Ethos then checks the proof (as can Logos in Lean, which is proved sound, for

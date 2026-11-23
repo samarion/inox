@@ -4,8 +4,9 @@ package inox
 package solvers
 package smtlib
 
-import _root_.smtlib.trees.Terms.{SExpr, SSymbol, Sort, Term, QualifiedIdentifier, Identifier => SMTIdentifier}
+import _root_.smtlib.trees.Terms.{SExpr, SSymbol, Sort, SortedVar, Term, FunctionApplication, QualifiedIdentifier, Identifier => SMTIdentifier}
 import _root_.smtlib.trees.Commands._
+import _root_.smtlib.extensions.tip.Commands._
 import _root_.smtlib.printer.RecursivePrinter
 import scala.collection.mutable.ListBuffer
 
@@ -99,37 +100,34 @@ trait CVC5Certificates extends CVC5Solver with SymbolRefs with certificates.Cert
   }
 
   /** `es` as terms of the session, and the declarations of their symbols that printing them made. */
-  def printedTerms(es: Seq[Expr]): certificates.Certificates.Printed = printing {
+  def printTerms(es: Seq[Expr]): certificates.Certificates.Printed = printing {
     val terms = es.map(e => toSMT(e)(using Map()))
     // the symbols are known once the terms are translated
     (terms.map(RecursivePrinter.toString), symbolRefs)
   }
 
-  /** `es` as the sources of templates (see [[certificates.Certificates.CertificatePrinter]]), and
-    * the declarations of the session's symbols that printing them made: Inox's SMT-LIB 3 printer
-    * prints them, where their variables are those of the session. */
-  def printedSources(es: Seq[Expr]): certificates.Certificates.Printed = printing {
-    import certificates.Ref
-    val free = es.flatMap(exprOps.variablesOf).distinct
-    val bindings = free.map(v => v.id -> toSMT(v)(using Map())).toMap
-    val texts = es.map(e => sourcePrinter.termText(e, bindings))
-    val variables = free.map(v => bindings(v.id) match {
-      case QualifiedIdentifier(SMTIdentifier(s, Seq()), None) => s.name -> Ref.Variable(v)
-      case term => throw new IllegalStateException(s"the session's variable ${v.id} is the term $term")
-    })
-    val symbols = sourcePrinter.symbolRefs
-    for ((name, ref) <- variables if symbols.get(name).exists(_ != ref))
-      throw new IllegalStateException(s"$name is a symbol of the printer and a variable of the session")
-    (texts, symbols ++ variables)
-  }
+  /** The printer of the sources of templates (see [[certificates.Certificates.SourcePrinter]]). */
+  lazy val sourcePrinter: certificates.Certificates.SourcePrinter[Expr] = new SourcePrinter(symbolNames)
 
-  // The printer of the sources names identifiers as the session does, so that a name of a source
-  // stands for one identifier. Its definitions and declarations aren't printed: the symbols of a
-  // source are those of the printer and the variables of the session, which the session declares.
-  private lazy val sourcePrinter = new SourcePrinter(symbolNames)
-
+  /** The printer of the sources of templates: Inox's SMT-LIB 3 printer, which names identifiers
+    * as the session does, so that a name of a source stands for one identifier, and where the
+    * variables of the sources are those of the session. Its definitions and declarations aren't
+    * printed: the symbols of a source are those of the printer and the variables of the session,
+    * which the session declares. It prints the markers of sources (see [[unrolling.TemplateGenerator.markers]])
+    * as their symbol, qualified by the sort of the type they are about, and applied to their
+    * arguments:
+    * {{{
+    * ((as typing!0 <sort>) "<mode>" <value> <closures>)
+    * ((as reads!0 <sort>) "<mode>" <collection> <closures>)
+    * (as inhabited!0 <sort>)
+    * }}}
+    * It keeps the declarations that it prints, where the definitions of functions are declarations
+    * of their signatures, so that the sources can be typed. */
   private class SourcePrinter(names: SymbolNames)
-    extends inox.smtlib3.Printer(program, context, java.io.Writer.nullWriter()) with SymbolRefs {
+    extends inox.smtlib3.Printer(program, context, java.io.Writer.nullWriter()) with SymbolRefs
+      with certificates.Certificates.SourcePrinter[Expr] {
+    import certificates.Ref
+
     override protected def symbolNames = names
 
     /** `e` as the text of a term, where the variables that `bindings` binds are their terms. */
@@ -139,28 +137,118 @@ trait CVC5Certificates extends CVC5Solver with SymbolRefs with certificates.Cert
       writer.toString
     }
 
+    /** The text of the sort of `tpe`, whose variables are the terms that `bindings` binds. */
+    private def sortText(tpe: Type, bindings: Map[Identifier, Term]): String = {
+      val writer = new java.io.StringWriter
+      printingContext(writer).output(sortOf(tpe)(using bindings))
+      writer.toString
+    }
+
+    override protected def toSMT(e: Expr)(using bindings: Map[Identifier, Term]): Term = e match {
+      case UninterpretedCall(id, Seq(tpe), args, _) if unrolling.TemplateGenerator.markers(id) =>
+        val head = QualifiedIdentifier(SMTIdentifier(id2sym(id)), Some(sortOf(tpe)))
+        if (args.isEmpty) head else FunctionApplication(head, args.map(toSMT))
+      case _ => super.toSMT(e)
+    }
+
     /** What the symbols that the printer printed stand for, by name: those of the target, the
-      * variables that the printer declared, the functions of the uninterpreted calls, and the
-      * datatypes with type parameters, whose sorts are applied to the sorts of their arguments. */
-    override def symbolRefs: Map[String, certificates.Ref] = {
-      import certificates.Ref
+      * variables that the printer declared, the functions of the uninterpreted calls, the markers
+      * of sources, and the datatypes with type parameters, whose sorts are applied to the sorts of
+      * their arguments. */
+    override def symbolRefs: Map[String, Ref] = {
       val generic = sorts.iterator.collect { case (t: ADTType, Sort(id, _ +: _)) => id.symbol.name -> Ref.Sort(t) }
       super.symbolRefs ++ generic ++
         extraVars.iterator.map { case (v, s) => s.name -> Ref.Variable(v) } ++
-        uninterpreted.iterator.map { case ((id, _), s) => s.name -> Ref.Uninterpreted(id) }
+        uninterpreted.iterator.map { case ((id, _), s) => s.name -> Ref.Uninterpreted(id) } ++
+        unrolling.TemplateGenerator.markers.map(id => id2sym(id).name -> Ref.Uninterpreted(id))
     }
+
+    // the declarations that printing made: those of datatypes, sorts and functions, where a
+    // function's definition is the declaration of its signature
+    private val kept = ListBuffer.empty[SExpr]
+
+    override def emit(cmd: SExpr, rawOut: Boolean = false): SExpr = {
+      def declare(tps: Seq[SSymbol], name: SSymbol, params: Seq[SortedVar], returnSort: Sort): SExpr =
+        if (tps.isEmpty) DeclareFun(name, params.map(_.sort), returnSort)
+        else DeclareFunPar(tps, name, params.map(_.sort), returnSort)
+      kept ++= (cmd match {
+        case DefineFun(d) => Seq(declare(Seq(), d.name, d.params, d.returnSort))
+        case DefineFunRec(d) => Seq(declare(Seq(), d.name, d.params, d.returnSort))
+        case DefineFunPar(tps, d) => Seq(declare(tps, d.name, d.params, d.returnSort))
+        case DefineFunRecPar(tps, d) => Seq(declare(tps, d.name, d.params, d.returnSort))
+        case DefineFunsRec(decs, _) => decs.map(f => declare(Seq(), f.name, f.params, f.returnSort))
+        case DefineFunsRecPar(decs, _) => decs.map {
+          case Left(f) => declare(f.tps, f.name, f.params, f.returnSort)
+          case Right(f) => declare(Seq(), f.name, f.params, f.returnSort)
+        }
+        case _: DeclareDatatypes | _: DeclareDatatypesPar | _: DeclareSort | _: DeclareFun | _: DeclareFunPar |
+             _: DeclareConst | _: DeclareConstPar => Seq(cmd)
+        case other if other.getClass.getSimpleName.startsWith("DeclareDatatypes") => Seq(other)
+        case _ => Seq()
+      })
+      super.emit(cmd, rawOut)
+    }
+
+    def printSources(es: Seq[Expr]): certificates.Certificates.Printed = printing {
+      val bindings = sessionBindings(es.flatMap(exprOps.variablesOf).distinct)
+      (es.map(termText(_, bindings)), sourceSymbols)
+    }
+
+    def declarations: Seq[certificates.SExpr] = kept.toSeq.map { d =>
+      val writer = new java.io.StringWriter
+      printingContext(writer).output(d)
+      proofSExpr(writer.toString, sourceSymbols)
+    }
+
+    private val sorted = new certificates.Certificates.DistinctSorts[Type](_.asString(using PrinterOptions()))
+    private def sortSExpr(tpe: Type): certificates.SExpr = {
+      val (text, _) = declaring(sortText(tpe, sessionBindings(typeOps.variablesOf(tpe).toSeq.sortBy(_.id))))
+      proofSExpr(sorted(text, tpe), sourceSymbols)
+    }
+
+    def sort(ref: Ref): Option[certificates.SExpr] = ref match {
+      case Ref.Variable(v) => Some(sortSExpr(v.tpe))
+      case Ref.Lambda(tpe) => Some(sortSExpr(tpe))
+      case Ref.Constructor(_, tpe) => Some(sortSExpr(tpe))
+      case Ref.Selector(_, tpe, _) => Some(sortSExpr(tpe))
+      case Ref.Tester(_, tpe) => Some(sortSExpr(tpe))
+      case Ref.Sort(tpe) => Some(sortSExpr(tpe))
+      case Ref.Function(_, tps) => Some(certificates.SList(tps.map(sortSExpr)))
+      case Ref.Uninterpreted(_) => None
+    }
+
+    // the variables of the session that the sources and sorts have, by name
+    private val sessionVariables = scala.collection.mutable.Map[String, Ref]()
+    private def sourceSymbols: Map[String, Ref] = symbolRefs ++ sessionVariables
+
+    /** The variables `vs` bound to their symbols in the session, which the session declares. */
+    private def sessionBindings(vs: Seq[Variable]): Map[Identifier, Term] = vs.map { v =>
+      val term = CVC5Certificates.this.toSMT(v)(using Map())
+      term match {
+        case QualifiedIdentifier(SMTIdentifier(s, Seq()), None) =>
+          val ref = Ref.Variable(v)
+          if (symbolRefs.get(s.name).exists(_ != ref))
+            throw new IllegalStateException(s"${s.name} is a symbol of the printer and a variable of the session")
+          sessionVariables(s.name) = ref
+        case term => throw new IllegalStateException(s"the session's variable ${v.id} is the term $term")
+      }
+      v.id -> term
+    }.toMap
   }
 
   /** The terms whose texts `print` gives, with what their symbols stand for, and the commands
     * of the session that declare symbols while it prints them. */
   private def printing(print: => (Seq[String], Map[String, certificates.Ref])): certificates.Certificates.Printed = {
+    val ((texts, table), commands) = declaring(print)
+    certificates.Certificates.Printed(texts.map(proofSExpr(_, table)),
+      commands.map(c => proofSExpr(RecursivePrinter.toString(c), symbolRefs)))
+  }
+
+  /** `body`, and the commands of the session that declare symbols while it runs. */
+  private def declaring[A](body: => A): (A, Seq[SExpr]) = {
     val commands = ListBuffer.empty[SExpr]
     declared = commands
-    try {
-      val (texts, table) = print
-      certificates.Certificates.Printed(texts.map(proofSExpr(_, table)),
-        commands.toSeq.map(c => proofSExpr(RecursivePrinter.toString(c), symbolRefs)))
-    } finally declared = null
+    try (body, commands.toSeq) finally declared = null
   }
 
   /** The text `text` of the session or of the sources as an s-expression of a proof. */

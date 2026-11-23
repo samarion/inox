@@ -38,12 +38,46 @@ A certificate that holds, with a proof that Ethos accepts, shows that the
 clauses of its script have no model, and that each of them is a clause that a
 rule of `unrolling.RuleKernel` builds. Two things are left to the reader:
 
-- **The templates.** The checker takes the clauses of each template as given.
-  A template of a function, or of an expression that holds such as the query,
-  comes with its source, an Inox expression in SMT-LIB 3 syntax, but the
-  checker only parses it: it doesn't yet check that the clauses are those of
-  the source, and nothing relates the sources to the input query and its
-  functions.
+- **The templates.** Every template, of a function, a type, a lambda, a
+  quantifier or an expression that holds such as the query, comes with its
+  source, and the checker checks that its clauses are those of the source
+  ([`Sources.scala`](../src/main/scala/inox/certificates/Sources.scala)): the
+  values of its subexpressions, each under the blocker of its path, its
+  assumptions, what its divisions, selectors and invariants need, and that
+  the rank of a call decreases. It refuses a certificate with a template whose
+  clauses it can't relate to the source, and says which clause is in the way.
+  It checks the clauses of a typing against its marker and the meaning that
+  the source gives it, and not that the meaning is that of the type, nor that
+  the functions that a capture orders are those of the captured value.
+
+  Sources are in Inox's SMT-LIB 3 syntax, and clauses in that of the solver's
+  session. [`Lowering.scala`](../src/main/scala/inox/certificates/Lowering.scala)
+  first rewrites each source to the session's syntax, from the certificate's
+  tables alone: it infers the sort of each subterm bottom-up from the source
+  declarations, the sorts of the variables and the `(as f S)` qualifiers, and
+  picks the session symbol of the same Inox definition whose recorded sort is
+  the inferred one (a constructor, selector or tester of that datatype, the
+  instance of a generic function at those type arguments, the dynamic
+  application of that function sort). Sorts are compared without their
+  refinements (`:var` and `:restrict`), which the session's sorts don't have.
+  Its documentation lists how each construct lowers. What this trusts:
+  - that distinct types print as distinct sorts, which the solver checks
+    when it prints them;
+  - that the descriptions of symbols (the identifiers, and the index of a
+    selector) are those of the same Inox definitions in both tables, which
+    the solver prints from the same identifiers;
+  - that each construct lowers to a term of the same meaning, such as
+    `(insert s e)` to `(set.insert e s)`, `(exists ..)` to `(not (forall ..))`,
+    `Char` to `(_ BitVec 16)`, a function sort to `Int` (the session's sort of
+    function values), and the signedness annotations of bit vectors to
+    nothing (the session's operations say how they read their arguments).
+
+  The lowering refuses a source that it can't type, whose symbol the session
+  has none or several of, or that uses a construct that it doesn't lower:
+  lambdas, `tuple.unit`, bags, string operations and floating points, which
+  no source of the corpus uses.
+
+  Nothing yet relates the sources to the input query and its functions.
 - **The side conditions of the rules.** The checker checks the shape of each
   rule, and that the symbols that `Define`, `Hypothesis` and `Root` introduce
   are introduced once. It doesn't check what a rule states about the program,
@@ -51,5 +85,5 @@ rule of `unrolling.RuleKernel` builds. Two things are left to the reader:
   same function, or that an assumption states the completeness of an open
   conjunction that refutations may assume (it checks that it is a literal).
 
-Both need the trace from the input to the templates, of which the certificate
-only holds the sources so far.
+The second needs the trace from the input to the sources, which the
+certificate doesn't hold yet.

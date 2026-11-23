@@ -10,20 +10,23 @@ import scala.collection.immutable.{ListSet, VectorMap}
 
 /** The functions that the sources of templates name, which are no functions of the program (see
   * [[Templates.Source]]). They are Boolean uninterpreted calls whose type argument is the type
-  * `T` that they are about:
-  *  - `typing[T]("<mode>", x, <closures>)`: that `x` lies in the type `T`, which is
+  * that they are about, and print as their symbol qualified by the SMT-LIB 3 sort of that type
+  * (see [[smtlib.CVC5Certificates]]), with its refinements:
+  *  - `((as typing S) "<mode>" x <closures>)`: that `x` lies in the type `T` of sort `S`, which is
   *    checked the way the mode says (see [[TypingGenerator]]): `free`, `contract` or `membership`,
   *    then `-domain` when the check is the domain of a quantifier, and `-ground` when `x` is a
   *    fresh ground;
-  *  - `typing[T]("capture", x, f)`: that the functions that the value `x` of type `T` holds
+  *  - `((as typing S) "capture" x f)`: that the functions that the value `x` of type `T` holds
   *    come before the lambda `f` that captures `x` (see [[TypeTemplates.CaptureTemplate]]);
-  *  - `reads[T]("<mode>", x, <closures>)`: that the values that the reads of the collection
+  *  - `((as reads S) "<mode>" x <closures>)`: that the values that the reads of the collection
   *    `x` of type `T` give lie in their type (see [[Collection]]);
-  *  - `inhabited[T]()`: that the type parameter `T` has values. */
+  *  - `(as inhabited S)`: that the type parameter `T` has values. */
 object TemplateGenerator {
   val typing: Identifier = FreshIdentifier("typing")
   val reads: Identifier = FreshIdentifier("reads")
   val inhabited: Identifier = FreshIdentifier("inhabited")
+
+  val markers: Set[Identifier] = Set(typing, reads, inhabited)
 }
 
 trait TemplateGenerator { self: Templates =>
