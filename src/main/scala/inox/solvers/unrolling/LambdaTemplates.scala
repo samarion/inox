@@ -76,7 +76,8 @@ trait LambdaTemplates { self: Templates =>
 
       val lidT = encodeSymbol(lid)
       val (contents, str) = Template.contents(pathVar, idArgs zip trArgs, tmplClauses,
-        substMap = depSubst + (lid -> lidT), optApp = Some(lidT -> tpe), partial = true)
+        substMap = depSubst + (lid -> lidT), optApp = Some(lidT -> tpe), partial = true,
+        source = Some((Some(app), application(realLambda, idArgs))))
 
       val lambdaString : () => String = () => {
         "Template for lambda " + lid + ": " + lambda + " is :\n" + str()
