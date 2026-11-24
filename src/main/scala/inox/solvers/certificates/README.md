@@ -21,8 +21,8 @@ certificate of that query on standard output:
     (solver-symbols
     (<symbol of the script> <kind> "<identifier, type or index>" ... [<sort>])
     ...)
-    (source-declarations
-    <the SMT-LIB 3 declarations of the datatypes and functions of the sources>
+    (source-definitions
+    <the SMT-LIB 3 declarations of the datatypes and definitions of the functions of the sources>
     )
     (source-symbols
     (<symbol of the sources> <kind> "<identifier, type or index>" ... [<sort>])
@@ -47,19 +47,30 @@ that the query has no solution, which is the theorem of an UNSAT answer in
 
 The source of a template is the expression that its clauses are of:
 
+    (definition <the call of the function on the template's arguments> [(names (<name> <subterm>) ...)])
     (function <the call of the function on the template's arguments> <its body>)
     (expression <a term that holds under the template's start blocker>)
 
-The body is the one that the solver unfolds, after its simplifications. A
-source is an Inox expression, which Inox's SMT-LIB 3 printer prints
+The body of a function is the one that the solver unfolds, after its
+simplifications. The source definitions define each function once with that
+body, as a `define-fun`, `define-fun-rec` or `define-funs-rec` over its
+parameters and type parameters, and a `definition` source stands for the body
+of the definition at the arguments of the call and the type arguments that
+their sorts determine. Its names are the subterms of that body that the
+template has another term for, each with that term: the symbol of a lambda,
+the instantiations of a quantifier, or a construction or uninterpreted call
+under the assumptions that the clauses make of it. A `function` source gives
+its body in place: that of a lambda, the value that the solver computed for
+a call, or the body of a function that has equal subterms that the template
+has different terms for. A source is an Inox expression, which Inox's SMT-LIB 3 printer prints
 (`inox.smtlib3.Printer`, the syntax of `.smt3` inputs, with an
 `(assume <condition> <body>)` for each assumption). Its variables are those of
 the script, under the script's names, and its other symbols are those of the
 printer, which names identifiers as the script does. The source symbols say
 what each symbol of the sources stands for, as the solver symbols do for the script.
-The source declarations are the declarations that printing the sources made:
-the datatypes, and the signatures of the functions (a definition is the
-declaration of its signature, without its body).
+The source definitions are the commands that printing the sources made: the
+declarations of the datatypes and of the uninterpreted functions, and the
+definitions of the functions.
 
 Sorts relate the two vocabularies. The symbols of the script that depend on a
 type end with the SMT-LIB 3 sort of that type, as the printer of the sources
@@ -70,7 +81,15 @@ of a generic function with the list of the sorts of its type arguments, such as
     (Cons!0 constructor "Cons$0" "List$0[BigInt]" (List!1 Int))
     (first!0 function "first$0" "BigInt" (Int))
 
-and the variables of the sources end with their sort. Distinct types must
+and the variables of the sources end with their sort. Each instantiation of an
+uninterpreted function is a function of its own in the sources, which ends
+with the sorts of its type arguments when it has some:
+
+    (any!1 uninterpreted "any$1" (T!0))
+    (any!2 uninterpreted "any$1" (Int))
+
+so that the body of a definition that calls `any!1`, instantiated at `Int`,
+calls `any!2`. Distinct types must
 print as distinct sorts, since a checker picks the symbol of the script that a
 symbol of a source stands for by its sort; the solver checks that they do, and
 gives no certificate otherwise.

@@ -150,7 +150,7 @@ abstract class AbstractUnrollingSolver private
       val index = new java.util.IdentityHashMap[templates.TemplateContents, Int]
       for (r <- applied; (contents, _) <- r.template if !index.containsKey(contents)) index.put(contents, index.size)
       val templateSeq = scala.collection.mutable.ArrayBuffer.fill(index.size)(TemplateClauses[Encoded](Seq(), Seq(), None))
-      index.forEach { (contents, i) => templateSeq(i) = TemplateClauses(contents.pathVar._2 +: contents.args, contents.clauses, contents.source.map(s => certificates.Certificates.TemplateSource(s.call, s.expr, s.where))) }
+      index.forEach { (contents, i) => templateSeq(i) = TemplateClauses(contents.pathVar._2 +: contents.args, contents.clauses, contents.source.map(s => certificates.Certificates.TemplateSource(s.call, s.expr, s.where, s.names))) }
       val ruleSeq = applied.map { r =>
         // the values of the start blocker and arguments, which are themselves when not given, then
         // of the fresh symbols
@@ -165,7 +165,7 @@ abstract class AbstractUnrollingSolver private
       assumptions.find(a => !queryAssumptions(a) && !templates.assumedComplete(a)) match {
         case Some(a) => Left("the check that refuted the query assumes " + templates.asString(a) + ", which refutations don't assume")
         case None => certificatePrinter match {
-          case Some((printTerms, sourcePrinter)) => certificates.Certificates.certificate(proof, Refutation(clauses, assumed, templateSeq.toSeq, ruleSeq), printTerms, sourcePrinter)
+          case Some((printTerms, sourcePrinter)) => certificates.Certificates.certificate(proof, Refutation(clauses, assumed, templateSeq.toSeq, ruleSeq, Some(templates.definition)), printTerms, sourcePrinter)
           case None => Left("the underlying solver's session doesn't print the solver's terms")
         }
       }

@@ -121,8 +121,9 @@ trait CVC5Certificates extends CVC5Solver with SymbolRefs with certificates.Cert
     * ((as reads!0 <sort>) "<mode>" <collection> <closures>)
     * (as inhabited!0 <sort>)
     * }}}
-    * It keeps the declarations that it prints, where the definitions of functions are declarations
-    * of their signatures, so that the sources can be typed. */
+    * It keeps the declarations and the definitions of functions that it prints, so that the
+    * sources can be typed and the body of a function is printed once: it defines a function with
+    * the body that the solver unfolds (see [[define]]). */
   private class SourcePrinter(names: SymbolNames)
     extends inox.smtlib3.Printer(program, context, java.io.Writer.nullWriter()) with SymbolRefs
       with certificates.Certificates.SourcePrinter[Expr] {
@@ -159,28 +160,21 @@ trait CVC5Certificates extends CVC5Solver with SymbolRefs with certificates.Cert
       val generic = sorts.iterator.collect { case (t: ADTType, Sort(id, _ +: _)) => id.symbol.name -> Ref.Sort(t) }
       super.symbolRefs ++ generic ++
         extraVars.iterator.map { case (v, s) => s.name -> Ref.Variable(v) } ++
-        uninterpreted.iterator.map { case ((id, _), s) => s.name -> Ref.Uninterpreted(id) } ++
+        uninterpreted.iterator.map { case ((id, tps), s) => s.name -> Ref.Uninterpreted(id, tps) } ++
         unrolling.TemplateGenerator.markers.map(id => id2sym(id).name -> Ref.Uninterpreted(id))
     }
 
-    // the declarations that printing made: those of datatypes, sorts and functions, where a
-    // function's definition is the declaration of its signature
+    // the body that each function is defined with (see `define`)
+    private var bodies: Option[Identifier => Expr] = None
+    override def define(body: Identifier => Expr): Unit = bodies = Some(body)
+    override protected def definitionBody(fd: FunDef): Expr = bodies.fold(fd.fullBody)(_(fd.id))
+
+    // the declarations and definitions that printing made: those of datatypes, sorts and functions
     private val kept = ListBuffer.empty[SExpr]
 
     override def emit(cmd: SExpr, rawOut: Boolean = false): SExpr = {
-      def declare(tps: Seq[SSymbol], name: SSymbol, params: Seq[SortedVar], returnSort: Sort): SExpr =
-        if (tps.isEmpty) DeclareFun(name, params.map(_.sort), returnSort)
-        else DeclareFunPar(tps, name, params.map(_.sort), returnSort)
       kept ++= (cmd match {
-        case DefineFun(d) => Seq(declare(Seq(), d.name, d.params, d.returnSort))
-        case DefineFunRec(d) => Seq(declare(Seq(), d.name, d.params, d.returnSort))
-        case DefineFunPar(tps, d) => Seq(declare(tps, d.name, d.params, d.returnSort))
-        case DefineFunRecPar(tps, d) => Seq(declare(tps, d.name, d.params, d.returnSort))
-        case DefineFunsRec(decs, _) => decs.map(f => declare(Seq(), f.name, f.params, f.returnSort))
-        case DefineFunsRecPar(decs, _) => decs.map {
-          case Left(f) => declare(f.tps, f.name, f.params, f.returnSort)
-          case Right(f) => declare(Seq(), f.name, f.params, f.returnSort)
-        }
+        case _: DefineFun | _: DefineFunRec | _: DefineFunPar | _: DefineFunRecPar | _: DefineFunsRec | _: DefineFunsRecPar => Seq(cmd)
         case _: DeclareDatatypes | _: DeclareDatatypesPar | _: DeclareSort | _: DeclareFun | _: DeclareFunPar |
              _: DeclareConst | _: DeclareConstPar => Seq(cmd)
         case other if other.getClass.getSimpleName.startsWith("DeclareDatatypes") => Seq(other)
@@ -214,7 +208,8 @@ trait CVC5Certificates extends CVC5Solver with SymbolRefs with certificates.Cert
       case Ref.Tester(_, tpe) => Some(sortSExpr(tpe))
       case Ref.Sort(tpe) => Some(sortSExpr(tpe))
       case Ref.Function(_, tps) => Some(certificates.SList(tps.map(sortSExpr)))
-      case Ref.Uninterpreted(_) => None
+      case Ref.Uninterpreted(_, Seq()) => None
+      case Ref.Uninterpreted(_, tps) => Some(certificates.SList(tps.map(sortSExpr)))
     }
 
     // the variables of the session that the sources and sorts have, by name

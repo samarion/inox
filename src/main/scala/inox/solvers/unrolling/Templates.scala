@@ -405,19 +405,49 @@ trait Templates
   /** What a template is of, in the solver's terms: the expression `expr` that its clauses are the
     * clauses of, over its start blocker and arguments, and for the template of a function, the
     * `call` whose value the expression gives. The certificates of the solver's answers hold it
-    * (see [[certificates.Certificates]]), so that a checker relates the clauses to it. */
-  case class Source(call: Option[Encoded], expr: Encoded, where: Seq[(Encoded, Encoded)] = Seq())
+    * (see [[certificates.Certificates]]), so that a checker relates the clauses to it.
+    *
+    * The template of a defined function has `names`: its expression is the body of the function's
+    * definition (see [[FunctionTemplates.definition]]) at the type arguments and arguments of the
+    * call, where each subterm that is the right of a pair is the left of that pair, which is what
+    * the template has for it: the symbol of a lambda, the instantiations of a quantifier, or a
+    * construction or uninterpreted call under the assumptions that the clauses make of it (see
+    * [[TemplateGenerator.sourceExpr]]). A certificate then only prints the call and the names. */
+  case class Source(call: Option[Encoded], expr: Encoded, where: Seq[(Encoded, Encoded)] = Seq(),
+                    names: Option[Seq[(Encoded, Encoded)]] = None)
 
   /** The source of a template whose clauses `clauses` are those of `expr`, and of the function
     * that is called as `call` if there is one, when the rules are logged. The meanings of the
     * symbols and markers of the template that the source names (see [[TemplateGenerator]])
     * are those of the clauses and `meanings`. */
   private[unrolling] def templateSource(clauses: TemplateClauses, bindings: Map[Variable, Encoded], call: Option[Expr], expr: Expr,
-                                        meanings: Seq[(Expr, Expr)] = Seq()): Option[Source] =
+                                        meanings: Seq[(Expr, Expr)] = Seq(), definition: Boolean = false): Option[Source] =
     if (!loggingRules) None else {
       val enc = mkEncoder(bindings).compose(sourceExpr(_, clauses.lambdas, clauses.bound, clauses.abstracted))
-      Some(Source(call.map(enc), enc(expr), (clauses.meanings ++ meanings).map((l, r) => enc(l) -> enc(r)).distinct))
+      // the names of a definition, when replacing the subterms that they name gives its source
+      val names = if (!definition) None else {
+        val source = sourceExpr(expr, clauses.lambdas, clauses.bound, clauses.abstracted)
+        val named = differences(expr, source).distinct
+        Some(named).filter(ns => ns.map(_._1).distinct.size == ns.size && renamed(expr, ns.toMap) == source)
+          .map(_.map((original, name) => mkEncoder(bindings)(name) -> mkEncoder(bindings)(original)))
+      }
+      Some(Source(call.map(enc), enc(expr), (clauses.meanings ++ meanings).map((l, r) => enc(l) -> enc(r)).distinct, names))
     }
+
+  /** The outermost subterms of `body` that `source` has another term for, with that term. */
+  private def differences(body: Expr, source: Expr): Seq[(Expr, Expr)] = (body, source) match {
+    case _ if body == source => Seq.empty
+    // a negated quantifier is one term of the definition, which may print it as its dual
+    case (Not(_: Forall), Not(_)) => Seq(body -> source)
+    case (Operator(bs, _), Operator(ss, recons)) if body.getClass == source.getClass && bs.size == ss.size && recons(bs) == body =>
+      (bs zip ss).flatMap(differences(_, _))
+    case _ => Seq(body -> source)
+  }
+
+  /** `body` where each outermost subterm that `names` names is its name. */
+  private def renamed(body: Expr, names: Map[Expr, Expr]): Expr = names.getOrElse(body, body match {
+    case Operator(es, recons) => recons(es.map(renamed(_, names)))
+  })
 
   case class TemplateContents(
     val pathVar   : (Variable, Encoded),
@@ -458,7 +488,8 @@ trait Templates
         pointers.map(p => substituter(p._1) -> substituter(p._2)),
         failures.map(_.map(substituter)),
         source.map(s => Source(s.call.map(substituter), substituter(s.expr),
-          s.where.map((l, r) => (substituter(l), substituter(r)))))
+          s.where.map((l, r) => (substituter(l), substituter(r))),
+          s.names.map(_.map((l, r) => (substituter(l), substituter(r))))))
       )
 
     /** Instantiates the contents under `aVar`, where the arguments take the values `args`. */
@@ -842,7 +873,8 @@ trait Templates
       optCall: Option[Callee] = None,
       optApp: Option[(Encoded, FunctionType)] = None,
       partial: Boolean = false,
-      source: Option[(Option[Expr], Expr)] = None
+      source: Option[(Option[Expr], Expr)] = None,
+      definition: Boolean = false
     ): (TemplateContents, () => String) = {
 
       val encoding = Template.encode(
@@ -859,7 +891,7 @@ trait Templates
           val sameLambdas = tmplClauses.lambdas.groupBy(_.lambda).values.toSeq.flatMap { ts =>
             ts.init.filter(_.ids._1 != ts.last.ids._1).map(t => (t.ids._1: Expr) -> (ts.last.ids._1: Expr))
           }
-          templateSource(tmplClauses, symbols(pathVar, arguments, tmplClauses, substMap), call, expr, sameLambdas)
+          templateSource(tmplClauses, symbols(pathVar, arguments, tmplClauses, substMap), call, expr, sameLambdas, definition)
         }
       )
 

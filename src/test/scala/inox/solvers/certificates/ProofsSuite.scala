@@ -79,19 +79,27 @@ class ProofsSuite extends AnyFunSuite {
           Rule("Root", Seq(Argument("start", Seq(Atom("c0")))), None, Seq(0)),
           Rule("Unfold", Seq(Argument("blocker", Seq(Atom("c0"))), Argument("flag", Seq())),
             Some(Instance(0, Seq(Value(Atom("p"), Atom("c0"))))), Seq(1))))
-        assert(c.templates == Seq(Template(Seq(Atom("p")), Seq(0), Some(Source(None, Atom("tc"))))))
+        assert(c.templates == Seq(Template(Seq(Atom("p")), Seq(0), Some(Source(None, Some(Atom("tc")))))))
         assert(c.assumptions == Assumptions(Seq(2), Seq(3)))
         assert(c.solverSymbols == Seq("c0" -> Ref.Variable(x)))
         assert(c.toString ==
-          "(inox-certificate 3\n(script\n(assert c0)\n(assert c1)\n(assert a)\n(assert r)\n(check-sat)\n)\n" +
+          "(inox-certificate 4\n(script\n(assert c0)\n(assert c1)\n(assert a)\n(assert r)\n(check-sat)\n)\n" +
           "(templates\n(script\n(declare-const p Bool)\n(assert tc)\n)\n(0 (params p) (expression tc) 0)\n)\n" +
           "(rules\n(Root (args (start c0)) 0)\n(Unfold (args (blocker c0) (flag)) (instance 0 ((p c0))) 1)\n)\n" +
           "(assumptions (query 2) (complete 3))\n" +
           s"(solver-symbols\n(c0 variable \"${x.id.uniqueName}\" \"BigInt\")\n)\n" +
-          "(source-declarations\n)\n(source-symbols\n)\n" +
+          "(source-definitions\n)\n(source-symbols\n)\n" +
           "(cpc\n(assume @p1 c0)\n))")
       case Left(why) => fail(why)
     }
+  }
+
+  test("The source of a defined function prints its call and names, without its body") {
+    val call = SList(Seq(Atom("f"), Atom("x")))
+    assert(Source(Some(call), None, names = Some(Seq())).toString == "(definition (f x))")
+    assert(Source(Some(call), None, Seq(Atom("e") -> Atom("0")), Some(Seq(Atom("l") -> Atom("b")))).toString ==
+      "(definition (f x) (names (l b)) (where (e 0)))")
+    assert(Source(Some(call), Some(Atom("b"))).toString == "(function (f x) b)")
   }
 
   test("The symbols of the sources are apart from those of the session") {
@@ -118,6 +126,7 @@ class ProofsSuite extends AnyFunSuite {
     val ft = FunctionType(Seq(IntegerType()), BooleanType())
     assert(Ref.Function(id, Seq(IntegerType())).describe == Seq("function", id.uniqueName, "BigInt"))
     assert(Ref.Uninterpreted(id).describe == Seq("uninterpreted", id.uniqueName))
+    assert(Ref.Uninterpreted(id, Seq(IntegerType())).describe == Seq("uninterpreted", id.uniqueName))
     assert(Ref.Lambda(ft).describe == Seq("application", "(BigInt) => Boolean"))
     assert(Ref.Sort(ft).describe == Seq("sort", "(BigInt) => Boolean"))
     assert(Ref.Constructor(Some(id), ADTType(id, Seq())).describe == Seq("constructor", id.uniqueName, id.uniqueName))

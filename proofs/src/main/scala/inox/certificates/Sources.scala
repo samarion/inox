@@ -41,10 +41,16 @@ package certificates
 object Sources {
   import Checker._
 
-  /** What a template is of: `(function <call> <body>)` or `(expression <term>)`. */
+  /** What a template is of: `(function <call> <body>)`, `(definition <call>)` or `(expression <term>)`. */
   sealed trait Source { def expr: SExpr; def where: List[(SExpr, SExpr)] }
   final case class Function(call: SExpr, expr: SExpr, where: List[(SExpr, SExpr)] = Nil) extends Source
   final case class Expression(expr: SExpr, where: List[(SExpr, SExpr)] = Nil) extends Source
+  /** The source `(definition <call> [(names (<name> <subterm>) ...)] [(where ...)])` of the
+    * template of a defined function, which the lowering makes a [[Function]] with the body of
+    * the function's definition (see [[Lowering.Tables.lower]]). */
+  final case class Definition(call: SExpr, names: List[(SExpr, SExpr)], where: List[(SExpr, SExpr)] = Nil) extends Source {
+    def expr: SExpr = fail(s"the definition of $call has no body before it is lowered")
+  }
 
   object Source {
     /** The source `(function <call> <body> [(where (l r) ...)])` or
@@ -54,18 +60,24 @@ object Sources {
       case SList(List(Atom("function"), call, body, Where(w))) => Some(Function(call, body, w))
       case SList(List(Atom("expression"), expr)) => Some(Expression(expr))
       case SList(List(Atom("expression"), expr, Where(w))) => Some(Expression(expr, w))
+      case SList(List(Atom("definition"), call)) => Some(Definition(call, Nil))
+      case SList(List(Atom("definition"), call, Names(ns))) => Some(Definition(call, ns))
+      case SList(List(Atom("definition"), call, Where(w))) => Some(Definition(call, Nil, w))
+      case SList(List(Atom("definition"), call, Names(ns), Where(w))) => Some(Definition(call, ns, w))
       case _ => None
     }
   }
 
-  private object Where {
+  private class Pairs(name: String) {
     def unapply(e: SExpr): Option[List[(SExpr, SExpr)]] = e match {
-      case SList(Atom("where") :: pairs) =>
+      case SList(Atom(`name`) :: pairs) =>
         val ps = pairs.collect { case SList(List(l, r)) => l -> r }
         if (ps.size == pairs.size) Some(ps) else None
       case _ => None
     }
   }
+  private object Where extends Pairs("where")
+  private object Names extends Pairs("names")
 
   private final class Untraced(val why: String) extends Exception(why)
   private def untraced(why: String): Nothing = throw new Untraced(why)

@@ -50,11 +50,22 @@ rule of `unrolling.RuleKernel` builds. Two things are left to the reader:
   the source gives it, and not that the meaning is that of the type, nor that
   the functions that a capture orders are those of the captured value.
 
+  The certificate defines each function once, and the source of a template of
+  that function is the body of the definition at the arguments of the call,
+  which the checker instantiates. An uninterpreted function with the type
+  parameters of the definition in its type arguments becomes the symbol that
+  the source symbols record for the instantiated type arguments. Where the template has another term for a
+  subterm of the body (the symbol of a lambda, the instantiations of a
+  quantifier, a construction or uninterpreted call under the assumptions that
+  the clauses make of it), the source names the subterm with that term, and
+  the checker replaces it: it checks that every named subterm is in the body,
+  and not that the name is a term for it.
+
   Sources are in Inox's SMT-LIB 3 syntax, and clauses in that of the solver's
   session. [`Lowering.scala`](../src/main/scala/inox/certificates/Lowering.scala)
   first rewrites each source to the session's syntax, from the certificate's
   tables alone: it infers the sort of each subterm bottom-up from the source
-  declarations, the sorts of the variables and the `(as f S)` qualifiers, and
+  definitions, the sorts of the variables and the `(as f S)` qualifiers, and
   picks the session symbol of the same Inox definition whose recorded sort is
   the inferred one (a constructor, selector or tester of that datatype, the
   instance of a generic function at those type arguments, the dynamic

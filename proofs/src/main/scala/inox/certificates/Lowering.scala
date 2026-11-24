@@ -8,8 +8,9 @@ package certificates
   * [[Sources]] can relate them (see `certificates/README.md`).
   *
   * The lowering only reads the certificate's symbol tables:
-  *  - the `source-declarations`: the datatypes and the signatures of the functions that the
-  *    sources name, in SMT-LIB 3;
+  *  - the `source-definitions`: the datatypes and the definitions of the functions that the
+  *    sources name, in SMT-LIB 3, whose bodies are the sources of the templates of those
+  *    functions (see [[Sources.Definition]]);
   *  - the `source-symbols`: the Inox definition that each symbol of the sources stands for, and
   *    the SMT-LIB 3 sort of each variable;
   *  - the `solver-symbols`: the Inox definition that each symbol of the session stands for,
@@ -121,6 +122,8 @@ object Lowering {
   }
   /** The signature of a function of the sources, of type parameters `params`. */
   private final case class Signature(params: List[Atom], domain: List[SExpr], range: SExpr)
+  /** The definition of a function of the sources, of type parameters `params`. */
+  private final case class Definition(params: List[Atom], arguments: List[(Atom, SExpr)], range: SExpr, body: SExpr)
 
   /** The tables of a certificate: its `script` (with that of its templates), its session's
     * `solverSymbols`, and its `declarations` and `sourceSymbols`. */
@@ -153,12 +156,42 @@ object Lowering {
       (cs.toMap, cs.flatMap { case (c, cons) => cons.fields.zipWithIndex.map { case ((s, _), i) => s -> (c, i) } }.toMap)
     }
 
+    /** The definitions of the sources' functions: `define-fun` and `define-fun-rec` of
+      * `f ((x S) ..) R body` or of `(par (A ..) (f ((x S) ..) R body))`, and `define-funs-rec` of
+      * the lists of the signatures, each `(f ((x S) ..) R)` or `(par (A ..) (f ((x S) ..) R))`,
+      * and of the bodies. */
+    private val definitions: Map[Atom, Definition] = {
+      def parameters(ps: List[SExpr]): List[(Atom, SExpr)] = ps.map {
+        case SList(List(x: Atom, s)) => x -> s
+        case other => fail(s"$other is not a parameter")
+      }
+      def sortParameters(ps: List[SExpr]): List[Atom] = ps.map { case p: Atom => p; case p => fail(s"$p is not a sort parameter") }
+      def signature(dec: SExpr): (Atom, List[Atom], List[(Atom, SExpr)], SExpr) = dec match {
+        case SList(List(Atom("par"), SList(ps), SList(List(f: Atom, SList(xs), range)))) => (f, sortParameters(ps), parameters(xs), range)
+        case SList(List(f: Atom, SList(xs), range)) => (f, Nil, parameters(xs), range)
+        case other => fail(s"$other is not the signature of a function")
+      }
+      declarations.flatMap {
+        case SList(List(Atom("define-fun" | "define-fun-rec"), f: Atom, SList(xs), range, body)) =>
+          List(f -> Definition(Nil, parameters(xs), range, body))
+        case SList(List(Atom("define-fun" | "define-fun-rec"), SList(List(Atom("par"), SList(ps), SList(List(f: Atom, SList(xs), range, body)))))) =>
+          List(f -> Definition(sortParameters(ps), parameters(xs), range, body))
+        case SList(List(Atom("define-funs-rec"), SList(decs), SList(bodies))) if decs.size == bodies.size =>
+          (decs zip bodies).map { case (dec, body) =>
+            val (f, ps, xs, range) = signature(dec)
+            f -> Definition(ps, xs, range, body)
+          }
+        case d @ SList(Atom("define-fun" | "define-fun-rec" | "define-funs-rec") :: _) => fail(s"$d is not a definition")
+        case _ => Nil
+      }.toMap
+    }
+
     private val functions: Map[Atom, Signature] = declarations.collect {
       case SList(List(Atom("declare-fun"), f: Atom, SList(domain), range)) => f -> Signature(Nil, domain.map(erase), erase(range))
       case SList(List(Atom("declare-fun"), SList(List(Atom("par"), SList(ps), SList(List(f: Atom, SList(domain), range)))))) =>
         f -> Signature(ps.collect { case p: Atom => p }, domain.map(erase), erase(range))
       case SList(List(Atom("declare-const"), c: Atom, sort)) => c -> Signature(Nil, Nil, erase(sort))
-    }.toMap
+    }.toMap ++ definitions.map { case (f, d) => f -> Signature(d.params, d.arguments.map(a => erase(a._2)), erase(d.range)) }
 
     /** The session's functions of their own, which `(@ f ts)` applies directly. */
     private val predicates: Set[Atom] =
@@ -352,6 +385,31 @@ object Lowering {
         unique(s"instance of $id at $tps", e => e.kind == "function" && e.descriptions.headOption.contains(id) && e.sort.contains(tps))
       }
 
+    /** The instantiated body `body` of a definition whose type parameters are `typeArgs`, where
+      * each uninterpreted function that has them in its type arguments is the function of the
+      * instantiated type arguments: each instantiation of an uninterpreted function is a symbol
+      * of its own, whose entry ends with its type arguments. */
+    private def instance(body: SExpr, typeArgs: Map[Atom, SExpr]): SExpr = {
+      def target(u: Atom): Option[Atom] = for {
+        e <- source(u, "uninterpreted")
+        tps <- e.sort
+        at = erase(instantiate(tps, typeArgs)) if at != erase(tps)
+      } yield sources.values.filter(o => o.kind == "uninterpreted" && o.descriptions == e.descriptions && o.sort.map(erase).contains(at)).toList match {
+        case List(o) => o.name
+        case Nil => refuse(s"the sources have no instance of the uninterpreted function $u at $at")
+        case os => refuse(s"the sources have several instances of the uninterpreted function $u at $at")
+      }
+      def generic(u: Atom) = functions.get(u).exists(_.params.nonEmpty)
+      def rec(t: SExpr): SExpr = t match {
+        case SList(List(Atom("as"), u: Atom, s)) if target(u).nonEmpty =>
+          val v = target(u).get
+          if (generic(v)) SList(List(Atom("as"), v, s)) else v
+        case u: Atom => target(u).getOrElse(u)
+        case SList(items) => SList(items.map(rec))
+      }
+      rec(body)
+    }
+
     private def applied(head: SExpr, args: List[SExpr]): SExpr = if (args.isEmpty) head else SList(head :: args)
 
     /** The lowering of the term `e`, where `env` gives the sorts of the bound variables. */
@@ -450,7 +508,43 @@ object Lowering {
       s match {
         case Sources.Function(call, body, _) => Sources.Function(lower(call), lower(body), pairs)
         case Sources.Expression(expr, _) => Sources.Expression(lower(expr), pairs)
+        case Sources.Definition(call, names, _) => Sources.Function(lower(call), lower(defined(call, names)), pairs)
       }
+    }
+
+    /** The source of the template of the call `call` of a defined function: the body of the
+      * function's definition at the sorts of its type arguments, which the sorts of the
+      * arguments of the call give, and at these arguments, where each outermost subterm that
+      * is the right of a pair of `names` is the left of the pair. Sorts are compared without
+      * their refinements. It refuses a name that names no subterm of the body. */
+    // (see `instance` for the uninterpreted functions of the body)
+    private def defined(call: SExpr, names: List[(SExpr, SExpr)]): SExpr = {
+      val (f, args, qualifier) = call match {
+        case SList(List(Atom("as"), f: Atom, sort)) => (f, Nil, Some(sort))
+        case SList(SList(List(Atom("as"), f: Atom, sort)) :: args) => (f, args, Some(sort))
+        case SList((f: Atom) :: args) => (f, args, None)
+        case f: Atom => (f, Nil, None)
+        case other => refuse(s"$other is not the call of a function")
+      }
+      val definition = definitions.getOrElse(f, refuse(s"the function $f has no definition"))
+      if (definition.arguments.size != args.size) refuse(s"$call has ${args.size} arguments, not ${definition.arguments.size}")
+      val sorts = typeArguments(f, args.map(sortOf(_)), qualifier)
+      val typeArgs = (definition.params zip sorts).toMap
+      val body = instance(erase(instantiate(definition.body, typeArgs ++ (definition.arguments.map(_._1) zip args))), typeArgs)
+      val named = names.map { case (name, original) => erase(original) -> name }
+      if (named.map(_._1).distinct.size != named.size) refuse(s"the names of $call name a subterm twice")
+      val table = named.toMap
+      var used = Set.empty[SExpr]
+      def rec(t: SExpr): SExpr = table.get(t) match {
+        case Some(name) => used += t; name
+        case None => t match {
+          case SList(items) => SList(items.map(rec))
+          case atom => atom
+        }
+      }
+      val source = rec(body)
+      for ((original, _) <- named if !used(original)) refuse(s"the body of $f has no subterm $original")
+      source
     }
   }
 }

@@ -29,7 +29,7 @@ object Checker {
   private[certificates] def fail(msg: String): Nothing = throw new Failure(msg)
 
   /** The version of the certificates that the checker checks. */
-  val Version = "3"
+  val Version = "4"
 
   /** The s-expressions of `text`, whose atoms keep their text. */
   def parse(text: String): List[SExpr] = {
@@ -264,7 +264,7 @@ object Checker {
       SList(Atom("rules") :: ruleLines),
       SList(List(Atom("assumptions"), SList(Atom("query") :: query), SList(Atom("complete") :: complete))),
       SList(Atom("solver-symbols") :: solverSymbols),
-      SList(Atom("source-declarations") :: sourceDeclarations),
+      SList(Atom("source-definitions") :: sourceDeclarations),
       SList(Atom("source-symbols") :: sourceSymbols),
       SList(Atom("cpc") :: cpc))) =>
 

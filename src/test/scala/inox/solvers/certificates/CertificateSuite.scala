@@ -83,16 +83,17 @@ class CertificateSuite extends AnyFunSuite {
         assert(scriptRefs.exists(_.isInstanceOf[Ref.Variable]), scriptRefs)
         assert(certificate.proof.cpc.flatMap(refs).nonEmpty, text)
         assert(certificate.proof.asserts.size == certificate.rules.flatMap(_.asserts).toSet.size + certificate.assumptions.query.size + certificate.assumptions.complete.size, text)
-        assert(text.startsWith("(inox-certificate 3\n(script\n(set-logic ALL)\n"), text)
+        assert(text.startsWith("(inox-certificate 4\n(script\n(set-logic ALL)\n"), text)
         assert(text.contains("\n(templates\n(script\n"), text)
         // the templates of the query and of the function that it unfolds have their sources
         assert(certificate.templates.forall(_.source.nonEmpty), text)
         assert(certificate.templates.head.source.exists(_.call.isEmpty) && text.contains(") (expression ("), text)
-        assert(certificate.templates.exists(_.source.exists(_.call.nonEmpty)) && text.contains(") (function ("), text)
+        assert(certificate.templates.exists(_.source.exists(_.call.nonEmpty)) && text.contains(") (definition ("), text)
         // the sources are printed in SMT-LIB 3, with the session's variables and the printer's functions
         assert(certificate.sourceSymbols.exists(_._2.isInstanceOf[Ref.Function]), text)
         assert(certificate.sourceSymbols.exists(_._2.isInstanceOf[Ref.Variable]), text)
-        assert(text.contains("\n(source-declarations\n(declare-") && text.contains("\n(source-symbols\n("), text)
+        // the sources define the functions once, with the bodies that the templates unfold
+        assert(text.contains("\n(source-definitions\n(") && text.contains("\n(define-fun") && text.contains("\n(source-symbols\n("), text)
         assert(text.contains("\n(rules\n") && text.contains("\n(Root "), text)
         assert(text.contains("\n(Unfold (args (blocker "), text)
         // the rules have their arguments, and the symbols what they stand for
@@ -115,9 +116,9 @@ class CertificateSuite extends AnyFunSuite {
     check(vc, Proof) match {
       case UnsatWithProof(Right(certificate: Certificate)) =>
         val text = certificate.toString
-        // the instance of `first` records the sorts of its type arguments, and the sources declare it
+        // the instance of `first` records the sorts of its type arguments, and the sources define it
         assert(text.linesIterator.exists(l => l.contains(" function \"first") && l.trim.endsWith(" (Int))")), text)
-        assert(text.contains("(declare-fun (par ("), text)
+        assert(text.contains("(define-fun (par (") || text.contains("(define-fun-rec (par ("), text)
       case UnsatWithProof(Left(why)) if why.startsWith("certificates need cvc5") => cancel(why)
       case other => fail(s"Unexpected answer: $other")
     }

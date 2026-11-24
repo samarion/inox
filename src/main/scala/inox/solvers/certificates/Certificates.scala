@@ -14,8 +14,11 @@ object Certificates {
   /** What the unrolling solver checked in a refutation, in its terms `E`: the clauses that it
     * asserted and the assumptions of the check that answered unsat, in the order of the asserts
     * of the solver's session, the rules that gave the clauses, and the templates that they
-    * instantiate, which a rule names by their index. */
-  final case class Refutation[E](clauses: Seq[E], assumptions: Seq[Assumed[E]], templates: Seq[TemplateClauses[E]], rules: Seq[AppliedRule[E]])
+    * instantiate, which a rule names by their index. `definition` gives the body that the solver
+    * unfolds for each function, over the function's parameters and type parameters, when the
+    * certificate defines the functions with it (see [[TemplateSource]]). */
+  final case class Refutation[E](clauses: Seq[E], assumptions: Seq[Assumed[E]], templates: Seq[TemplateClauses[E]], rules: Seq[AppliedRule[E]],
+                                 definition: Option[Identifier => E] = None)
 
   /** An assumption of the check, and whether it states that an open conjunction or disjunction
     * is complete, which refutations may assume (see [[unrolling.OpenJunctions]]), or is one of
@@ -27,8 +30,10 @@ object Certificates {
     * clauses of, after the call that it is the value of for the template of a function. */
   final case class TemplateClauses[E](params: Seq[E], clauses: Seq[E], source: Option[TemplateSource[E]] = None)
 
-  /** The source of a template (see [[unrolling.Templates.Source]]). */
-  final case class TemplateSource[E](call: Option[E], expr: E, where: Seq[(E, E)] = Seq())
+  /** The source of a template (see [[unrolling.Templates.Source]]). With `names`, the expression
+    * is the body of the definition of the function that is called, at the arguments of the call,
+    * where each subterm that is the right of a pair is the left of that pair. */
+  final case class TemplateSource[E](call: Option[E], expr: E, where: Seq[(E, E)] = Seq(), names: Option[Seq[(E, E)]] = None)
 
   /** A rule that the solver applied (see [[unrolling.RuleKernel]]): its kind, its arguments, its
     * clauses, and when they are an instance of the clauses of a template, the instance. */
@@ -51,8 +56,12 @@ object Certificates {
     /** `es` as sources, and the declarations of the session's symbols that printing them made. */
     def printSources(es: Seq[E]): Printed
 
-    /** The declarations that printing the sources and sorts made, in the printer's syntax, where
-      * the definition of a function is the declaration of its signature. */
+    /** Has the printer define a function with the body that `body` gives, over the function's
+      * parameters, for the definitions that it hasn't printed yet. */
+    def define(body: Identifier => E): Unit = ()
+
+    /** The declarations and definitions that printing the sources and sorts made, in the
+      * printer's syntax. */
     def declarations: Seq[SExpr]
 
     /** The sort, as the printer of the sources prints it, of the type that a symbol stands for
@@ -107,8 +116,8 @@ object Certificates {
     * (solver-symbols
     * (<symbol of the session> <kind> "<identifier, type or index>" ... [<sort>])
     * ...)
-    * (source-declarations
-    * <the declarations of the datatypes and functions of the sources>
+    * (source-definitions
+    * <the declarations of the datatypes and the definitions of the functions of the sources>
     * )
     * (source-symbols
     * (<symbol of the sources> <kind> "<identifier, type or index>" ... [<sort>])
@@ -118,17 +127,21 @@ object Certificates {
     * ))
     * }}}
     * The source of a template is `(function <call> <body>)` for the template of a function, where
-    * the body is the value of the call, `(expression <term>)` for one of an expression that holds,
-    * such as the query, and is followed by `(where (<lhs> <rhs>) ...)` when the source names
+    * the body is the value of the call, or `(definition <call> [(names (<name> <subterm>) ...)])`
+    * when that body is the one that the source definitions define the function with, at the
+    * arguments of the call, where each named subterm is its name (see [[TemplateSource]]). It is
+    * `(expression <term>)` for one of an expression that holds, such as the query. A source is
+    * followed by `(where (<lhs> <rhs>) ...)` when the source names
     * markers or symbols of the template whose meanings it gives (see [[unrolling.TemplateGenerator.markers]]).
     * Every template has a source. Sources are terms of Inox's SMT-LIB 3 syntax (see
     * [[inox.smtlib3.Printer]]), with the `(assume <condition> <body>)` of Inox's expressions,
     * whose symbols are those of the printer and, for their variables, those of the session: the
     * source symbols say what they stand for. A marker of the sources is applied to its arguments
     * and qualified by the sort of the type that it is about, such as
-    * `((as typing!0 <sort>) "<mode>" <value> <closures>)`. The source declarations are those that
-    * printing the sources made, where the definition of a function is the declaration of its
-    * signature. The symbols of the session that depend on a type (see [[SourcePrinter.sort]]) and
+    * `((as typing!0 <sort>) "<mode>" <value> <closures>)`. The source definitions are the commands
+    * that printing the sources made: the declarations of the datatypes and uninterpreted
+    * functions, and the definitions of the functions, with the bodies that the solver unfolds
+    * (see [[Refutation]]). The symbols of the session that depend on a type (see [[SourcePrinter.sort]]) and
     * the variables of the sources end with the SMT-LIB 3 sort of that type, as the printer of the
     * sources prints it, so that a checker can relate the sources to the clauses.
     * The arguments of a rule are those that its clauses are built from, by name (see
@@ -143,7 +156,8 @@ object Certificates {
     * assert is named, and the proof (see `proofs/certificates`). */
   def certificate[E](proof: ScriptProof, refutation: Refutation[E], printTerms: Seq[E] => Printed,
                      sourcePrinter: SourcePrinter[E]): Either[String, Certificate] = {
-    val Refutation(clauses, assumptions, templates, rules) = refutation
+    val Refutation(clauses, assumptions, templates, rules, definition) = refutation
+    definition.foreach(sourcePrinter.define)
     val asserts = proof.asserts.size
     val ruled = rules.flatMap(_.clauses).toSet
     if (asserts != clauses.size + assumptions.size) {
@@ -166,12 +180,17 @@ object Certificates {
       // a source is printed on its own, as it has expressions that the clauses don't
       val sessionDeclarations = scala.collection.mutable.ListBuffer[SExpr]()
       val sourceSeq = templates.zipWithIndex.map { case (t, i) =>
-        val TemplateSource(call, expr, where) = t.source.getOrElse(
+        val TemplateSource(call, expr, where, names) = t.source.getOrElse(
           throw new IllegalStateException(s"template $i has no source"))
-        val Printed(terms, declarations) = sourcePrinter.printSources((call.toSeq :+ expr) ++ where.flatMap((l, r) => Seq(l, r)))
+        // the body of a definition isn't printed: the definition has it
+        val heads = call.toSeq ++ (if (names.isEmpty) Seq(expr) else Seq())
+        val Printed(terms, declarations) = sourcePrinter.printSources(
+          heads ++ names.toSeq.flatten.flatMap((l, r) => Seq(l, r)) ++ where.flatMap((l, r) => Seq(l, r)))
         sessionDeclarations ++= declarations
-        val (heads, defs) = terms.splitAt(call.size + 1)
-        Some(Source(if (call.isEmpty) None else Some(heads.head), heads.last, defs.grouped(2).map(d => d(0) -> d(1)).toSeq))
+        val (printedHeads, pairs) = terms.splitAt(heads.size)
+        val (printedNames, printedWhere) = pairs.grouped(2).map(d => d(0) -> d(1)).toSeq.splitAt(names.fold(0)(_.size))
+        Some(Source(if (call.isEmpty) None else Some(printedHeads.head), if (names.isEmpty) Some(printedHeads.last) else None,
+          printedWhere, names.map(_ => printedNames)))
       }
 
       val templateAsserts = scala.collection.mutable.ListBuffer[SExpr]()
@@ -190,7 +209,11 @@ object Certificates {
       // the sorts of the symbols, which may declare more datatypes in the printer, whose
       // declarations are then those of the sources
       def isVariable(ref: Ref) = ref.isInstanceOf[Ref.Variable]
-      val sorted = certificate.solverSymbols.map(_._2).filterNot(isVariable) ++ certificate.sourceSymbols.map(_._2).filter(isVariable)
+      def isUninterpreted(ref: Ref) = ref.isInstanceOf[Ref.Uninterpreted]
+      // (the uninterpreted functions of the sources are also those of the definitions)
+      val defined = certificate.copy(sourceDeclarations = sourcePrinter.declarations)
+      val sorted = certificate.solverSymbols.map(_._2).filterNot(isVariable) ++
+        defined.sourceSymbols.map(_._2).filter(ref => isVariable(ref) || isUninterpreted(ref))
       val sorts = sorted.distinct.flatMap(ref => sourcePrinter.sort(ref).map(ref -> _)).toMap
       Right(certificate.copy(sourceDeclarations = sourcePrinter.declarations, sorts = sorts))
     } catch {

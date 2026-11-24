@@ -60,7 +60,7 @@ sealed trait Ref {
     this match {
       case Ref.Variable(v) => Seq("variable", v.id.uniqueName, tp(v.tpe))
       case Ref.Function(id, tps) => Seq("function", id.uniqueName) ++ tps.map(tp)
-      case Ref.Uninterpreted(id) => Seq("uninterpreted", id.uniqueName)
+      case Ref.Uninterpreted(id, _) => Seq("uninterpreted", id.uniqueName)
       case Ref.Lambda(tpe) => Seq("application", tp(tpe))
       case Ref.Sort(tpe) => Seq("sort", tp(tpe))
       case Ref.Constructor(id, tpe) => Seq("constructor") ++ id.map(_.uniqueName) ++ Seq(tp(tpe))
@@ -75,8 +75,10 @@ object Ref {
   final case class Variable(v: t.Variable) extends Ref
   /** A function, under its type arguments. */
   final case class Function(id: Identifier, tps: Seq[t.Type]) extends Ref
-  /** An uninterpreted function of the underlying solver (see [[unrolling.Templates]]). */
-  final case class Uninterpreted(id: Identifier) extends Ref
+  /** An uninterpreted function of the underlying solver (see [[unrolling.Templates]]), and for
+    * one of the sources, the type arguments that it is the function of: each instantiation of
+    * an uninterpreted function is a function of its own. */
+  final case class Uninterpreted(id: Identifier, tps: Seq[t.Type] = Seq()) extends Ref
   /** The application of functions of type `tpe`. */
   final case class Lambda(tpe: t.FunctionType) extends Ref
   final case class Sort(tpe: t.Type) extends Ref
@@ -163,13 +165,20 @@ final case class Template(params: Seq[SExpr], asserts: Seq[Int], source: Option[
 
 /** What a template is of (see [[unrolling.Templates.Source]]): the expression `expr` that its
   * clauses are the clauses of, and for the template of a function, the `call` that it is the
-  * value of. */
-final case class Source(call: Option[SExpr], expr: SExpr, where: Seq[(SExpr, SExpr)] = Seq()) {
+  * value of. With `names`, the expression is left out: it is the body of the definition of the
+  * function of the call, at the call's arguments, where each subterm that is the right of a
+  * pair is the left of that pair. */
+final case class Source(call: Option[SExpr], expr: Option[SExpr], where: Seq[(SExpr, SExpr)] = Seq(),
+                        names: Option[Seq[(SExpr, SExpr)]] = None) {
   override def toString: String = {
-    val defs = if (where.isEmpty) "" else where.map((l, r) => s"($l $r)").mkString(" (where ", " ", ")")
-    call match {
-      case Some(c) => s"(function $c $expr$defs)"
-      case None => s"(expression $expr$defs)"
+    def pairs(name: String, ps: Seq[(SExpr, SExpr)]) =
+      if (ps.isEmpty) "" else ps.map((l, r) => s"($l $r)").mkString(s" ($name ", " ", ")")
+    val defs = pairs("where", where)
+    (call, expr, names) match {
+      case (Some(c), None, Some(ns)) => s"(definition $c${pairs("names", ns)}$defs)"
+      case (Some(c), Some(e), _) => s"(function $c $e$defs)"
+      case (None, Some(e), _) => s"(expression $e$defs)"
+      case _ => throw new IllegalStateException(s"the source of $call has no expression")
     }
   }
 }
@@ -208,11 +217,14 @@ final case class Certificate(proof: ScriptProof, templateScript: Seq[SExpr], tem
   /** What the symbols of the sources of the templates stand for, by their text and in its order:
     * those of the printer that printed them, and the variables of the session. */
   def sourceSymbols: Seq[(String, Ref)] =
-    (templates.flatMap(_.source.toSeq.flatMap(s => (s.call.toSeq :+ s.expr) ++ s.where.flatMap((l, r) => Seq(l, r)))) ++
+    (templates.flatMap(_.source.toSeq.flatMap(s => s.call.toSeq ++ s.expr ++ (s.names.toSeq.flatten ++ s.where).flatMap((l, r) => Seq(l, r)))) ++
       sourceDeclarations ++ sourceSorts.values).flatMap(_.symbols).map(s => s.text -> s.ref).distinct.sortBy(_._1)
 
-  /** The sorts of the variables of the sources, which are variables of the session. */
-  private def sourceSorts: Map[Ref, SExpr] = sorts.filter(_._1.isInstanceOf[Ref.Variable])
+  /** The sorts of the variables of the sources, which are variables of the session, and the
+    * sorts of the type arguments of their uninterpreted functions. */
+  private def sourceSorts: Map[Ref, SExpr] = sorts.filter { case (ref, _) =>
+    ref.isInstanceOf[Ref.Variable] || ref.isInstanceOf[Ref.Uninterpreted]
+  }
 
   override def toString: String = {
     def ints(is: Seq[Int]) = is.map(" " + _).mkString
@@ -236,7 +248,7 @@ final case class Certificate(proof: ScriptProof, templateScript: Seq[SExpr], tem
       "(rules\n" + ruleLines.map(_ + "\n").mkString + ")\n" +
       s"(assumptions (query${ints(assumptions.query)}) (complete${ints(assumptions.complete)}))\n" +
       "(solver-symbols\n" + symbolLines(solverSymbols, sorts -- sourceSorts.keys).map(_ + "\n").mkString + ")\n" +
-      Proof.block("source-declarations", sourceDeclarations) + "\n" +
+      Proof.block("source-definitions", sourceDeclarations) + "\n" +
       "(source-symbols\n" + symbolLines(sourceSymbols, sourceSorts).map(_ + "\n").mkString + ")\n" +
       Proof.block("cpc", proof.cpc) + ")"
   }
@@ -244,7 +256,7 @@ final case class Certificate(proof: ScriptProof, templateScript: Seq[SExpr], tem
 
 object Certificate {
   /** The version of the format that certificates print in, which changes with it. */
-  val version = 3
+  val version = 4
 }
 
 object Proof {

@@ -30,6 +30,10 @@ class LoweringSuite extends AnyFunSuite {
       (is-Cons!0 tester "Cons$0" "List$0[BigInt]" (List!9 Int))
       (size!0 function "size$0" "BigInt" (Int))
       (size!1 function "size$0" "Boolean" (Bool))
+      (first!1 function "first$0" "Boolean" (Bool))
+      (pick!1 function "pick$0" "Boolean" (Bool))
+      (pick!0 function "pick$0" "BigInt" (Int))
+      (is-Cons!1 tester "Cons$0" "List$0[Boolean]" (List!9 Bool))
       (dynLambda!0 application "(BigInt) => BigInt" (-> Int Int))
       (Int sort "(BigInt) => BigInt" (-> Int Int))
       (x!0 variable "x$1" "BigInt")
@@ -37,6 +41,10 @@ class LoweringSuite extends AnyFunSuite {
     declarations = sexprs("""
       (declare-datatypes ((List!9 1)) ((par (T!9) ((Cons!9 (head!9 T!9) (tail!9 (List!9 T!9))) (Nil!9)))))
       (declare-fun (par (T!8) (size!9 ((List!9 T!8)) Int)))
+      (declare-fun (par (T!6) (any!9 (T!6) T!6)))
+      (declare-fun any!8 (Bool) Bool)
+      (define-fun (par (T!6) (pick!9 ((y!6 T!6)) T!6 ((as any!9 T!6) y!6))))
+      (define-fun (par (T!7) (first!9 ((l!7 (List!9 T!7)) (d!7 T!7)) T!7 (ite ((_ is Cons!9) l!7) (head!9 l!7) d!7))))
     """),
     sourceSymbols = sexprs("""
       (List!9 sort "List$0")
@@ -45,6 +53,10 @@ class LoweringSuite extends AnyFunSuite {
       (head!9 selector "Cons$0" "List$0" "0")
       (tail!9 selector "Cons$0" "List$0" "1")
       (size!9 function "size$0")
+      (first!9 function "first$0")
+      (pick!9 function "pick$0")
+      (any!9 uninterpreted "any$0" (T!6))
+      (any!8 uninterpreted "any$0" (Bool))
       (typing!0 uninterpreted "typing$0")
       (x!0 variable "x$1" "BigInt" (! Int :var v :restrict (> v 0)))
       (l!0 variable "l$1" "List$0[Boolean]" (List!9 Bool))
@@ -61,6 +73,23 @@ class LoweringSuite extends AnyFunSuite {
     assert(lowered("((_ is Cons!9) (Cons!9 x!0 (as Nil!9 (List!9 Int))))") == "(is-Cons!0 (Cons!0 x!0 Nil!0))")
     assert(lowered("(size!9 l!0)") == "(size!1 l!0)")
     assert(lowered("((as Cons!9 (List!9 Bool)) true l!0)") == "(Cons!1 true l!0)")
+  }
+
+  test("The source of a definition is its body at the call, where the named subterms are their names") {
+    def definition(call: String, names: (String, String)*) =
+      tables.lower(Sources.Definition(sexpr(call), names.toList.map((n, t) => sexpr(n) -> sexpr(t))))
+    assert(definition("(first!9 l!0 true)") ==
+      Sources.Function(sexpr("(first!1 l!0 true)"), sexpr("(ite (is-Cons!1 l!0) (head!1 l!0) true)")))
+    assert(definition("(first!9 l!0 true)", "false" -> "(head!9 l!0)") ==
+      Sources.Function(sexpr("(first!1 l!0 true)"), sexpr("(ite (is-Cons!1 l!0) false true)")))
+    def refusal(call: String, names: (String, String)*) = intercept[Lowering.Refused](definition(call, names*)).why
+    assert(refusal("(first!9 l!0 true)", "false" -> "(head!9 x!0)").contains("has no subterm"))
+    assert(refusal("(first!9 l!0 true)", "false" -> "(head!9 l!0)", "true" -> "(head!9 l!0)").contains("twice"))
+    assert(refusal("(first!9 l!0)").contains("arguments"))
+    // an uninterpreted function of the body is its instance at the type arguments
+    assert(definition("(pick!9 true)", "false" -> "(any!8 true)") == Sources.Function(sexpr("(pick!1 true)"), sexpr("false")))
+    assert(refusal("(pick!9 x!0)", "0" -> "(any!8 x!0)").contains("no instance of the uninterpreted function any!9"))
+    assert(refusal("(size!9 l!0)").contains("has no definition"))
   }
 
   test("Refinements don't change sorts") {

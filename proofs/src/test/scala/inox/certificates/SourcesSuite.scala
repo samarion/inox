@@ -41,6 +41,15 @@ class SourcesSuite extends AnyFunSuite {
       Right(Ranks(Set(Atom("size") -> Atom("rank")), Set(Atom("rank") -> Set(Atom("size"))), Set(Atom("diverges")))))
   }
 
+  test("The source of a defined function is its call, with the names and meanings that it has") {
+    assert(Source.unapply(term("(definition (size l))")) == Some(Definition(term("(size l)"), Nil)))
+    assert(Source.unapply(term("(definition (size l) (names (n (f 1))) (where (e 0)))")) ==
+      Some(Definition(term("(size l)"), List(term("n") -> term("(f 1)")), List(term("e") -> term("0")))))
+    assert(Source.unapply(term("(definition (size l) (where (e 0)))")) ==
+      Some(Definition(term("(size l)"), Nil, List(term("e") -> term("0")))))
+    assert(Source.unapply(term("(definition (size l) (names n))")).isEmpty)
+  }
+
   test("A value, an assumption or a decrease that the source doesn't have is not traced") {
     def changed(from: String, to: String) = traced("start l", size, sizeClauses.map(c => if (c == from) to else c)*)
     assert(changed("(=> b2 (= e 0))", "(=> b2 (= e 1))").isLeft)
