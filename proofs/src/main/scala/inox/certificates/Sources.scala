@@ -392,50 +392,19 @@ object Sources {
     }
     def isCall(t: SExpr): Boolean = source match { case Function(call, _, _) => t == call; case _ => false }
     val definitions = scala.collection.mutable.LinkedHashMap[Atom, List[(Atom, SExpr)]]()
-    val equalities = scala.collection.mutable.ListBuffer[(Atom, (Atom, SExpr))]()
-    val conjunctions = scala.collection.mutable.Map[(Atom, Atom), SExpr]()
-    val disjunctions = scala.collection.mutable.Map[(Atom, Atom), List[SExpr]]()
     for ((b, clause) <- guarded) clause match {
       case SList(List(Atom("="), v: Atom, t)) if definable(v) && !atoms(t)(v) =>
         definitions(v) = definitions.getOrElse(v, Nil) :+ (b -> t)
       case SList(List(Atom("="), t, v: Atom)) if definable(v) && !definable(t) && !atoms(t)(v) && !isCall(t) =>
         definitions(v) = definitions.getOrElse(v, Nil) :+ (b -> t)
-        if (t.isInstanceOf[Atom]) equalities += v -> (b -> t)
-      case SList(List(Atom("=>"), SList(List(Atom("not"), r)), SList(List(Atom("not"), v: Atom)))) if definable(v) =>
-        conjunctions((v, b)) = r
-      case SList(List(Atom("=>"), r, v: Atom)) if definable(v) && r != True =>
-        disjunctions((v, b)) = disjunctions.getOrElse((v, b), Nil) :+ r
       case _ =>
     }
-    // a symbol that a clause states, or states the negation of, is defined there as `true` or
-    // `false` when its other definitions are on other paths, such as the other branch of a
-    // conditional
-    for ((b, clause) <- guarded) {
-      val stated = normal(clause) match {
-        case v: Atom if definable(v) => Some(v -> True)
-        case SList(List(Atom("not"), v: Atom)) if definable(v) => Some(v -> False)
-        case _ => None
-      }
-      // a symbol that nothing else defines is what the clause states of it
-      def undefined(v: Atom) = !conjunctions.keys.exists(_._1 == v) && !disjunctions.keys.exists(_._1 == v)
-      for ((v, t) <- stated; ds <- definitions.get(v).orElse(Option.when(undefined(v))(Nil))
-           if ds.forall { case d @ (db, _) => equalities.contains(v -> d) || !above(db).contains(b) && !above(b).contains(db) })
-        definitions(v) = ds :+ (b -> t)
-    }
-    // a symbol that is a parameter, such as the result of the typing of a value, is not defined
-    // by its equality with a symbol that has definitions of its own, whose meaning is the value
-    // of the symbol where the equality is
-    val equated = equalities.toList.filter { case (v, d) => definitions(v).exists(_ != d) }
-    for ((v, d) <- equated) definitions(v) = definitions(v).filter(_ != d)
 
     // the meaning of each symbol, without those of the symbols of its own meaning
     val meanings = scala.collection.mutable.Map[Atom, SExpr]()
     val pending = scala.collection.mutable.Set[Atom]()
     val opaque = scala.collection.mutable.Set[Atom]()
     final class Cyclic(val v: Atom) extends Exception(s"the symbol $v is defined from itself")
-    def children(p: Atom): List[Atom] = blockers.collect { case (b, (`p`, _)) => b }.toList ++
-      merges.keys.filter(m => ancestors(m).tail.headOption.contains(p))
-
     // that of a blocker is the conditions of its paths, those of the template's start aside
     val expanding = scala.collection.mutable.Set[Atom]()
     def meaning(v: Atom): Option[SExpr] = if (symbolMeanings.contains(v)) {
@@ -460,51 +429,9 @@ object Sources {
       catch { case c: Cyclic if c.v == v => opaque += v; None }
       finally pending -= v
     }
-    def definedMeaning(v: Atom): SExpr = {
-      // the blockers under which the clauses say something of the symbol
-      val sites: Set[Atom] = definitions(v).map(_._1).toSet ++ equated.collect { case (`v`, (b, _)) => b } ++ conjunctions.keys.collect { case (`v`, b) => b } ++
-        disjunctions.keys.collect { case (`v`, b) => b }
-      val paths = sites.toList.map(b => ancestors(b).reverse)
-      val common = paths.reduce((p, q) => (p zip q).takeWhile(pq => pq._1 == pq._2).map(_._1))
-      // the meaning is where the symbol is used, when that is on the path of its definitions
-      val used = guarded.collect { case (b, clause) if atoms(clause)(v) => b }.toSet
-      val home = common.find(used).orElse(common.lastOption)
-        .getOrElse(untraced(s"the definitions of $v are under blockers of different templates"))
-      // the operands of a conjunction or a disjunction give its value, where an assumption of
-      // the source may also equate it with another term
-      def at(p: Atom): SExpr = definitions(v).collect { case (`p`, t) => t } match {
-        case t :: _ if !conjunctions.contains((v, p)) && !disjunctions.contains((v, p)) => expand(t)
-        case _ =>
-          def under(b: Atom) = sites.exists(s => ancestors(s).contains(b))
-          (conjunctions.get((v, p)), disjunctions.get((v, p)), children(p).filter(under)) match {
-            // the symbol is only defined, and used, under the blocker, where its value is what
-            // it is anywhere
-            case (None, None, List(b)) if merges.contains(b) || blockers(b)._2 == True || guarded.forall {
-              case (g, clause) => above(g).contains(b) || !unguarded(clause, v, b)
-            } => at(b)
-            case (Some(r), _, List(b)) if blockers.contains(b) && (blockers(b)._2 == r || b == r) => app("and", expand(blockers(b)._2), at(b))
-            case (_, Some(List(r)), List(b)) if blockers.contains(b) && blockers(b)._2 == app("not", r) => app("or", expand(r), at(b))
-            case (_, Some(List(r)), List(b)) if blockers.contains(b) && r == app("not", b) => app("or", app("not", expand(blockers(b)._2)), at(b))
-            case (_, _, List(b1, b2)) if blockers.contains(b1) && blockers.contains(b2) && normal(blockers(b2)._2) == normal(app("not", blockers(b1)._2)) =>
-              app("ite", expand(blockers(b1)._2), at(b1), at(b2))
-            case (_, _, List(b1, b2)) if blockers.contains(b1) && blockers.contains(b2) && normal(blockers(b1)._2) == normal(app("not", blockers(b2)._2)) =>
-              app("ite", expand(blockers(b2)._2), at(b2), at(b1))
-            // the branches of the constructors of a value, where the value of the others is `true`
-            case (_, rs, bs @ (_ :: _)) if bs.forall(blockers.contains) && {
-              val tested = (bs.map(b => blockers(b)._2) ++ rs.getOrElse(Nil)).map(c => normal(expand(c)))
-              tested.collect { case SList(List(Atom("is"), _, x)) => x }.distinct.size == 1 &&
-                tested.forall { case SList(List(Atom("is"), _, _)) => true; case _ => false } &&
-                tested.distinct.size == tested.size
-            } =>
-              bs.foldRight(True: SExpr)((b, rest) => app("ite", expand(blockers(b)._2), at(b), rest))
-            // the symbol is only defined under one branch, and only used where that branch is
-            // taken, such as the operand of a conjunction after the one that is its condition
-            case (None, None, List(b)) if blockers.contains(b) =>
-              app("ite", expand(blockers(b)._2), at(b), False)
-            case (_, _, bs) => untraced(s"the symbol $v is defined under ${bs.mkString(", ")}, which are not the branches of a conditional of $p")
-          }
-      }
-      at(home)
+    def definedMeaning(v: Atom): SExpr = definitions(v) match {
+      case List((_, t)) => expand(t)
+      case ds => untraced(s"the symbol $v has no meaning and ${ds.size} definitions")
     }
     // `t` with the meanings of its symbols
     def expand(t: SExpr): SExpr = t match {

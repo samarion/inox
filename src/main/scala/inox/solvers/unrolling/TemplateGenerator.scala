@@ -334,6 +334,7 @@ trait TemplateGenerator { self: Templates =>
 
       val newCall = thenCall.tfd.applied(newArgs)
       builder.storeGuarded(newBlocker, Equals(newExpr, newCall))
+      builder.storeMeaning(newExpr, newCall)
     }
 
     for ((b, es) <- thenGuarded; e <- es) builder.storeGuarded(b, e)
@@ -663,6 +664,7 @@ trait TemplateGenerator { self: Templates =>
         val newExpr = Variable.fresh("uc", resTpe.getType, true)
         storeExpr(newExpr)
         storeGuarded(pathVar, Equals(newExpr, app))
+        storeMeaning(newExpr, app)
 
         // The refinements of the result are assumed under the path, and the type that they refine
         // is the type of the result
@@ -721,9 +723,11 @@ trait TemplateGenerator { self: Templates =>
             val newExpr: Variable = Variable.fresh("e", BooleanType(), true)
             storeExpr(newExpr)
 
-            def recAnd(pathVar: Variable, partitions: Seq[Expr]): Unit = partitions match {
+            def recAnd(pathVar: Variable, partitions: Seq[Expr]): Expr = partitions match {
               case x :: Nil =>
-                storeGuarded(pathVar, Equals(newExpr, rec(pathVar, x, pol)))
+                val xrec = rec(pathVar, x, pol)
+                storeGuarded(pathVar, Equals(newExpr, xrec))
+                xrec
 
               case x :: xs =>
                 // Only a conjunction that must hold forces each conjunct to hold. When it must not
@@ -741,12 +745,12 @@ trait TemplateGenerator { self: Templates =>
                 storeGuarded(pathVar, implies(not(newBool), not(newExpr)))
                 pathFacts(newBool) = factsOf(pathVar) ++ conjuncts(x)
 
-                recAnd(newBool, xs)
+                And(xrec, recAnd(newBool, xs))
 
               case Nil => scala.sys.error("Should never happen!")
             }
 
-            recAnd(pathVar, seq)
+            storeMeaning(newExpr, recAnd(pathVar, seq))
             newExpr
         }
 
@@ -758,9 +762,11 @@ trait TemplateGenerator { self: Templates =>
             val newExpr: Variable = Variable.fresh("e", BooleanType(), true)
             storeExpr(newExpr)
 
-            def recOr(pathVar: Variable, partitions: Seq[Expr]): Unit = partitions match {
+            def recOr(pathVar: Variable, partitions: Seq[Expr]): Expr = partitions match {
               case x :: Nil =>
-                storeGuarded(pathVar, Equals(newExpr, rec(pathVar, x, pol)))
+                val xrec = rec(pathVar, x, pol)
+                storeGuarded(pathVar, Equals(newExpr, xrec))
+                xrec
 
               case x :: xs =>
                 val xrec = rec(pathVar, x, None)
@@ -774,12 +780,12 @@ trait TemplateGenerator { self: Templates =>
                 storeGuarded(pathVar, implies(not(newBool), newExpr))
                 pathFacts(newBool) = factsOf(pathVar) ++ negated(x)
 
-                recOr(newBool, xs)
+                Or(xrec, recOr(newBool, xs))
 
               case Nil => scala.sys.error("Should never happen!")
             }
 
-            recOr(pathVar, seq)
+            storeMeaning(newExpr, recOr(pathVar, seq))
             newExpr
         }
 
@@ -807,6 +813,7 @@ trait TemplateGenerator { self: Templates =>
           builder ++=  mergeCalls(pathVar, newBool1, localSubst,
                                   tClauses + (newBool1 -> Equals(newExpr, trec)),
                                   eClauses + (newBool2 -> Equals(newExpr, erec)))
+          storeMeaning(newExpr, IfExpr(crec, trec, erec))
 
           newExpr
         }
@@ -874,6 +881,7 @@ trait TemplateGenerator { self: Templates =>
         val v = Variable.fresh("adt", res.getType, true)
         storeExpr(v)
         storeGuarded(pathVar, Equals(v, res))
+        storeMeaning(v, res)
         if (!guard(adt).exists(factsOf(pathVar))) constructionInvariant(res).foreach { inv =>
           // the invariant only mentions the encoded fields, or calls the sort's invariant on the value
           val cond = exprOps.replace(Map(res -> v), inv)
@@ -981,12 +989,13 @@ trait TemplateGenerator { self: Templates =>
     // would be registered (and unrolled) under `pathVar` instead of `guard`. We therefore bind it to
     // a fresh variable under `guard`. Where `guard` doesn't hold, the base check is false, so
     // the conjunction it is part of doesn't depend on the (unconstrained) variable.
-    def guardedResult(pathVar: Variable, guard: Variable, res: Expr, name: String): Expr =
+    def guardedResult(pathVar: Variable, guard: Variable, cond: Expr, res: Expr, name: String): Expr =
       if (guard == pathVar || res.isInstanceOf[BooleanLiteral]) res
       else {
         val newExpr: Variable = Variable.fresh(name, BooleanType(), true)
         storeExpr(newExpr)
         storeGuarded(guard, Equals(newExpr, res))
+        storeMeaning(newExpr, IfExpr(cond, res, BooleanLiteral(false)))
         newExpr
       }
 
@@ -1095,7 +1104,7 @@ trait TemplateGenerator { self: Templates =>
           exprOps.replaceFromSymbols(Map(vd -> newExpr), pred), localSubst)
         builder ++= predClauses
 
-        Check.and(recBase, Check(guardedResult(pathVar, predVar, p, "rr"), exprOps.replaceFromSymbols(Map(vd -> expr), pred)))
+        Check.and(recBase, Check(guardedResult(pathVar, predVar, recBase.result, p, "rr"), exprOps.replaceFromSymbols(Map(vd -> expr), pred)))
 
       case SigmaType(params, to) =>
         val (newExprs, recParams) = params.zipWithIndex.map { case (vd, i) =>
@@ -1114,7 +1123,7 @@ trait TemplateGenerator { self: Templates =>
           typeOps.replaceFromSymbols((params zip newExprs).toMap, to),
           TupleSelect(expr, params.size + 1), state)
 
-        Check.and(recParams :+ recTo.copy(result = guardedResult(pathVar, toVar, recTo.result, "sr"))*)
+        Check.and(recParams :+ recTo.copy(result = guardedResult(pathVar, toVar, Check.and(recParams*).result, recTo.result, "sr"))*)
 
       case adt: ADTType =>
         val sort = adt.getSort
@@ -1145,7 +1154,7 @@ trait TemplateGenerator { self: Templates =>
 
                 iff(and(pathVar, isCons(expr, tcons.id)), newBool)
                 storeGuarded(newBool, Equals(newExpr, recProps.result))
-                Some(tcons.id -> recProps.source)
+                Some(tcons.id -> recProps)
               } else {
                 // Constructors without fields to check trivially satisfy the type. Otherwise `newExpr`
                 // would be unconstrained for them, and the type check of a quantifier's domain could be
@@ -1157,10 +1166,15 @@ trait TemplateGenerator { self: Templates =>
             }
 
             // the fields of the constructor of the value lie in their types
-            if (stored.forall(_.isEmpty)) Check.trivial
-            else Check(newExpr, stored.flatten.foldRight(BooleanLiteral(true): Expr) {
-              case ((id, fields), rest) => IfExpr(isCons(expr, id), fields, rest)
-            })
+            if (stored.forall(_.isEmpty)) { storeMeaning(newExpr, BooleanLiteral(true)); Check.trivial }
+            else {
+              storeMeaning(newExpr, stored.flatten.foldRight(BooleanLiteral(true): Expr) {
+                case ((id, fields), rest) => IfExpr(isCons(expr, id), fields.result, rest)
+              })
+              Check(newExpr, stored.flatten.foldRight(BooleanLiteral(true): Expr) {
+                case ((id, fields), rest) => IfExpr(isCons(expr, id), fields.source, rest)
+              })
+            }
           }
         )
 
@@ -1206,6 +1220,7 @@ trait TemplateGenerator { self: Templates =>
             rec(newBool2, to, valueExpr, state)
           ))
           storeGuarded(newBool2, Equals(newExpr, parts.result))
+          storeMeaning(newExpr, IfExpr(condVar, BooleanLiteral(true), parts.result))
 
           Check.and(rec(pathVar, to, defaultExpr, state), Check(newExpr, IfExpr(isEmpty, BooleanLiteral(true), parts.source)),
             storeReads(pathVar, tpe, to, expr, inDomain))
@@ -1244,6 +1259,7 @@ trait TemplateGenerator { self: Templates =>
             Check(and(rest.result, elem.result), and(elem.source, rest.source))
           }
           storeGuarded(newBool2, Equals(newExpr, parts.result))
+          storeMeaning(newExpr, IfExpr(condVar, BooleanLiteral(true), parts.result))
 
           Check.and(Check(newExpr, IfExpr(isEmpty, BooleanLiteral(true), parts.source)), storeReads(pathVar, tpe, base, expr, inDomain))
         }
@@ -1283,6 +1299,7 @@ trait TemplateGenerator { self: Templates =>
             ))
           }
           storeGuarded(newBool2, Equals(newExpr, parts.result))
+          storeMeaning(newExpr, IfExpr(condVar, BooleanLiteral(true), parts.result))
 
           Check.and(Check(newExpr, IfExpr(isEmpty, BooleanLiteral(true), parts.source)), storeReads(pathVar, tpe, base, expr, inDomain))
         }
