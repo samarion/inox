@@ -160,7 +160,7 @@ class SimplificationRecorderSuite extends AnyFunSuite with DatastructureUtils {
 
   test("Quantifiers are lifted by steps of prenex, where the checker knows the types to have values") {
     assert(rules(Forall(Seq(i.toVal), And(Forall(Seq(j.toVal), LessThan(i, j)), p))) == Seq("prenex"))
-    assert(rules(Forall(Seq(i.toVal), Implies(p, Forall(Seq(j.toVal), LessThan(i, j))))) == Seq("prenex", "logic"))
+    assert(rules(Forall(Seq(i.toVal), Implies(p, Forall(Seq(j.toVal), LessThan(i, j))))) == Seq("logic", "prenex"))
     // not from the premise of an implication
     assert(rules(Forall(Seq(i.toVal), Implies(Forall(Seq(j.toVal), LessThan(i, j)), p))) == Seq("logic"))
 
@@ -217,5 +217,29 @@ class SimplificationRecorderSuite extends AnyFunSuite with DatastructureUtils {
     val e = Let(f, Lambda(Seq(n), Plus(n.toVariable, x)), And(Forall(Seq(i.toVal), GreaterThan(Application(f.toVariable, Seq(i)), y)), GreaterThan(Application(f.toVariable, Seq(y)), x)))
     assert(rules(e) == Seq("expand", "beta", "logic", "expand", "beta", "logic", "logic"))
     assert(simplifyFormula(e) == And(Forall(Seq(i.toVal), GreaterThan(Plus(i, x), y)), GreaterThan(Plus(y, x), x)))
+  }
+
+  test("Postconditions are assumed at the quantifiers that the simplification leaves") {
+    def post(e: Expr) = FunctionInvocation(postID, Seq(), Seq(e))
+    def assumed(e: Expr): Expr = simplifyFormula(e) match {
+      case Assume(pred, _) => pred
+      case res => fail(s"$e simplifies into $res, without an assumption")
+    }
+    def posts(vs: Seq[Variable], body: Expr): Expr =
+      Forall(vs.map(_.toVal), body)
+
+    // of the calls on the variables of quantifiers that are merged
+    val merged = Forall(Seq(i.toVal), Implies(GreaterThan(i, x), Forall(Seq(j.toVal), GreaterThan(post(i), j))))
+    assert(rules(merged) == Seq("logic", "logic", "prenex", "inline-postconditions"))
+    assert(sameUpToLocals(assumed(merged),
+      posts(Seq(i), Or(LessEquals(i, x), GreaterThan(FunctionInvocation(incID, Seq(), Seq(i)), post(i))))))
+
+    // and of the quantifiers in the lambdas that are applied
+    val f = ValDef.fresh("f", FunctionType(Seq(IntegerType()), BooleanType()))
+    val applied = Let(f, Lambda(Seq(n), Forall(Seq(j.toVal), GreaterThan(post(j), n.toVariable))),
+      Forall(Seq(i.toVal), Application(f.toVariable, Seq(i))))
+    assert(sameUpToLocals(simplifyFormula(applied), Assume(
+      posts(Seq(j), GreaterThan(FunctionInvocation(incID, Seq(), Seq(j)), post(j))),
+      Forall(Seq(i.toVal, j.toVal), GreaterThan(post(j), i)))))
   }
 }
