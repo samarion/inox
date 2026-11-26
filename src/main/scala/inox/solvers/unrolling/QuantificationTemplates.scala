@@ -128,33 +128,52 @@ trait QuantificationTemplates { self: Templates =>
     def quantified(args: Seq[Expr]): Boolean = args.exists { case v: Variable => quantifiers(v) case _ => false }
     def variables(args: Seq[Expr]): Boolean = args.forall { case v: Variable => subst.contains(v) case _ => false }
 
-    // the calls, and the applications and collection lookups, in order of occurrence
-    val seen = scala.collection.mutable.LinkedHashSet[Expr]()
-    def unfold(fi: FunctionInvocation): Unit = {
-      val tfd = fi.tfd
-      exprOps.preTraversal {
-        case call: FunctionInvocation if quantified(call.args) && variables(call.args) && seen.add(call) => unfold(call)
-        case e @ QuantificationMatcher(c, args) if quantified(args) && variables(args) &&
-          exprOps.variablesOf(c).forall(subst.contains) => seen += e
-        case _ =>
-      } (tfd.withParamSubst(fi.args, tfd.fullBody))
+    // The calls, and the applications and collection lookups, that the call `root` of the body
+    // reaches, in order of occurrence
+    def reached(root: FunctionInvocation): Seq[Expr] = {
+      val seen = scala.collection.mutable.LinkedHashSet[Expr]()
+      // a function is unfolded once for given arguments, whatever its type arguments are: there
+      // are finitely many functions and tuples of variables, also when the recursion is polymorphic
+      val unfolded = scala.collection.mutable.Set[(Identifier, Seq[Expr])]()
+      def unfold(fi: FunctionInvocation): Unit = {
+        val tfd = fi.tfd
+        exprOps.preTraversal {
+          case call: FunctionInvocation if quantified(call.args) && variables(call.args) =>
+            seen += call
+            if (unfolded.add(call.id -> call.args)) unfold(call)
+          case e @ QuantificationMatcher(c, args) if quantified(args) && variables(args) &&
+            exprOps.variablesOf(c).forall(subst.contains) => seen += e
+          case _ =>
+        } (tfd.withParamSubst(fi.args, tfd.fullBody))
+      }
+      unfold(root)
+      seen.toSeq
     }
-    exprOps.preTraversal {
-      case fi: FunctionInvocation if quantified(fi.args) => unfold(fi)
-      case _ =>
-    } (body)
+
+    val roots = exprOps.collectPreorder[FunctionInvocation] {
+      case fi: FunctionInvocation if quantified(fi.args) => Seq(fi)
+      case _ => Seq.empty
+    } (body).distinct
 
     val known = contents.items.matchers.values.flatten.toSet
-    val matchers: Set[Item] = ListSet.from(seen.toSeq.map {
-      case call @ FunctionInvocation(_, _, args) =>
-        Matcher(Right(call.tfd), args.map(arg => Left(encoder(arg))), encoder(call))
-      case e @ QuantificationMatcher(c, args) =>
-        Matcher(Left(encoder(c) -> c.getType), args.map(arg => Left(encoder(arg))), encoder(e))
-    }.filterNot(known))
+    roots.foldLeft(contents) { (contents, root) =>
+      val matchers: Set[Item] = ListSet.from(reached(root).map {
+        case call @ FunctionInvocation(_, _, args) =>
+          Matcher(Right(call.tfd), args.map(arg => Left(encoder(arg))), encoder(call))
+        case e @ QuantificationMatcher(c, args) =>
+          Matcher(Left(encoder(c) -> c.getType), args.map(arg => Left(encoder(arg))), encoder(e))
+      }.filterNot(known))
 
-    if (matchers.isEmpty) contents else {
-      val start = contents.pathVar._2
-      contents.copy(items = contents.items.updated(start, contents.items.getOrElse(start, ListSet.empty[Item]) ++ matchers))
+      // The matchers are under the blockers of the call that reaches them: they match where it does.
+      // The call is found by its arguments when they are variables, and by its function otherwise.
+      val rootArgs: Option[Seq[Arg]] = if (variables(root.args)) Some(root.args.map(arg => Left(encoder(arg)))) else None
+      val blockers = contents.items.matchers.collect {
+        case (b, ms) if ms.exists(m => m.key == Right(root.tfd) && rootArgs.forall(_ == m.args)) => b
+      }.toSeq
+
+      blockers.foldLeft(contents) { (contents, b) =>
+        contents.copy(items = contents.items.updated(b, contents.items.getOrElse(b, ListSet.empty[Item]) ++ matchers))
+      }
     }
   }
 
