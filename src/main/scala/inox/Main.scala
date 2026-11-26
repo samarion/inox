@@ -119,6 +119,7 @@ trait MainHelpers {
     solvers.optAssumeChecked -> Description(Solvers, "Assume that all impure expression have been checked"),
     solvers.optNoSimplifications -> Description(Solvers, "Disable selector/quantifier simplifications in solvers"),
     solvers.optStringsBMP -> Description(Solvers, "Restrict the characters of strings to the BMP (0 to 0xFFFF)"),
+    solvers.optProofs -> Description(Solvers, "Write the proof certificate of each UNSAT answer of the SMT solver to <dir> (smt-vik only)"),
     solvers.optCheckModels -> Description(Solvers, "Double-check counter-examples with evaluator"),
     solvers.optIgnoreModels -> Description(Solvers, s"Do not request models from solvers.\nOverrides and disables ${optCheckModels.name} and ${unrolling.optFeelingLucky.name}."),
     solvers.optSilentErrors -> Description(Solvers, "Fail silently into UNKNOWN when encountering an error"),

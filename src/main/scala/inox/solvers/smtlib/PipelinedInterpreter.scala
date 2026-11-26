@@ -276,3 +276,22 @@ object PipelinedCVC5Interpreter {
 
 class PipelinedBitwuzlaInterpreter(executable: String, args: Array[String])
   extends BitwuzlaInterpreter(executable, args) with PipelinedInterpreter
+
+/** A Vik process (`vik -in`), which answers `success` once asked to, as Z3 does. */
+class VikInterpreter(executable: String, args: Array[String])
+  extends ProcessInterpreter(executable, args) {
+
+  printer.printCommand(SetOption(PrintSuccess(true)), in)
+  in.write("\n")
+  in.flush()
+  parser.parseGenResponse
+
+  // `check-sat-assuming` answers as `check-sat` does
+  override def parseResponseOf(cmd: SExpr): SExpr = cmd match {
+    case _: CheckSatAssuming => parser.parseCheckSatResponse
+    case _ => super.parseResponseOf(cmd)
+  }
+}
+
+class PipelinedVikInterpreter(executable: String, args: Array[String])
+  extends VikInterpreter(executable, args) with PipelinedInterpreter

@@ -53,6 +53,13 @@ object SolverFactory {
     case _: java.io.IOException => false
   }
 
+  lazy val hasVik = try {
+    new smtlib.VikInterpreter("vik", Array("-in")).interrupt()
+    true
+  } catch {
+    case _: java.io.IOException => false
+  }
+
   lazy val hasBitwuzla = try {
     new BitwuzlaInterpreter("bitwuzla", Array("-v", "0", "--lang", "smt2")).interrupt()
     true
@@ -80,6 +87,7 @@ object SolverFactory {
     "smt-z3-opt"    -> "Z3 optimizer through SMT-LIB",
     "smt-z3:<exec>" -> "Z3 through SMT-LIB with custom executable name",
     "smt-bitwuzla"  -> "Bitwuzla through SMT-LIB",
+    "smt-vik"       -> "Vik through SMT-LIB",
     "eval"          -> "Internal evaluator to discharge ground assertions",
     "inv-z3"        -> "Horn solver using Z3 / Spacer",
 
@@ -93,6 +101,7 @@ object SolverFactory {
     "smt-z3-opt"   -> (() => hasZ3,       Seq("nativez3-opt"),                                 "'z3' binary"),
     "eval"         -> (() => true,        Seq(),                                               "Internal evaluator"),
     "smt-bitwuzla" -> (() => hasBitwuzla, Seq("smt-cvc5", "nativez3", "smt-z3", "princess"),   "'bitwuzla' binary"),
+    "smt-vik"      -> (() => hasVik,      Seq("smt-z3", "nativez3", "smt-cvc5", "princess"),   "'vik' binary"),
   )
 
   private var reported: Boolean = false
@@ -414,6 +423,38 @@ object SolverFactory {
         }
 
         () => new SMTBitwuzlaImpl(p)(enc)
+      })
+
+      case "smt-vik" => create(p)(finalName, {
+        val ev = sem.getEvaluator(using ctx)
+        class SMTVikImpl(override val program: p.type)
+                        (override val enc: transformers.ProgramTransformer {
+                          val sourceProgram: program.type
+                          val targetProgram: Program { val trees: inox.trees.type }
+                        })
+          extends AbstractUnrollingSolver(program, ctx, enc)(fullEncoder => theories.Vik(fullEncoder)(ev))
+            with UnrollingSolver
+            with TimeoutSolver
+            with tip.TipDebugger {
+
+          class Underlying(override val program: targetProgram.type)
+            extends smtlib.SMTLIBSolver(program, ctx)
+              with smtlib.VikSolver
+
+          protected val underlying = nonIncrementalWrap(ctx, nonIncremental)(targetProgram)(finalName, targetSemantics, () => new Underlying(targetProgram))
+
+          // Used to report SMT Lib files <-> VCs correspondence
+          override def getSmtLibFileId: Option[Int] = underlying.getSmtLibFileId
+
+          override def resourceLimitReached: Boolean = underlying.resourceLimitReached
+
+          // encoder is from TipDebugger and enc from AbstractUnrollingSolver
+          override protected val encoder = enc
+
+          override protected def partialModel = solverModel
+        }
+
+        () => new SMTVikImpl(p)(enc)
       })
 
       case "eval" => create(p)(finalName, {
