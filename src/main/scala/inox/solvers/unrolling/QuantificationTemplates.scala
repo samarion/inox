@@ -155,25 +155,44 @@ trait QuantificationTemplates { self: Templates =>
       case _ => Seq.empty
     } (body).distinct
 
+    val start = contents.pathVar._2
     val known = contents.items.matchers.values.flatten.toSet
-    roots.foldLeft(contents) { (contents, root) =>
-      val matchers: Set[Item] = ListSet.from(reached(root).map {
+
+    // The matchers that each blocker of a call of the body reaches, in order of occurrence. The
+    // call is found by its arguments when they are variables, and by its function otherwise; a
+    // call without a matcher of its own (one that the encoding rewrote) is at the start.
+    val reachedUnder = scala.collection.mutable.LinkedHashMap[Encoded, ListSet[Item]]()
+    for (root <- roots) {
+      val matchers = reached(root).map {
         case call @ FunctionInvocation(_, _, args) =>
           Matcher(Right(call.tfd), args.map(arg => Left(encoder(arg))), encoder(call))
         case e @ QuantificationMatcher(c, args) =>
           Matcher(Left(encoder(c) -> c.getType), args.map(arg => Left(encoder(arg))), encoder(e))
-      }.filterNot(known))
+      }.filterNot(known)
 
-      // The matchers are under the blockers of the call that reaches them: they match where it does.
-      // The call is found by its arguments when they are variables, and by its function otherwise.
       val rootArgs: Option[Seq[Arg]] = if (variables(root.args)) Some(root.args.map(arg => Left(encoder(arg)))) else None
       val blockers = contents.items.matchers.collect {
         case (b, ms) if ms.exists(m => m.key == Right(root.tfd) && rootArgs.forall(_ == m.args)) => b
       }.toSeq
 
-      blockers.foldLeft(contents) { (contents, b) =>
-        contents.copy(items = contents.items.updated(b, contents.items.getOrElse(b, ListSet.empty[Item]) ++ matchers))
-      }
+      if (matchers.nonEmpty) for (b <- if (blockers.isEmpty) Seq(start) else blockers)
+        reachedUnder(b) = reachedUnder.getOrElse(b, ListSet.empty[Item]) ++ matchers
+    }
+
+    // The matchers lie under a fresh blocker that is equal to the blocker of the call that reaches
+    // them. They match where the call does, and as their blocker is not the start of the template,
+    // an instance of the quantifier only adds them as ground matchers in the next generation (see
+    // `Axiom.instantiateSubst`), also when the call is at the start.
+    val condVarOf: Map[Encoded, Variable] = contents.condVars.map(_.swap) + (start -> contents.pathVar._1)
+    reachedUnder.foldLeft(contents) { case (contents, (b, matchers)) =>
+      val parent = condVarOf(b)
+      val c = Variable.fresh("cm", BooleanType(), true)
+      val cT = encodeSymbol(c)
+      contents.copy(
+        condVars = contents.condVars + (c -> cT),
+        condTree = contents.condTree.updated(parent, contents.condTree.getOrElse(parent, Set.empty[Variable]) + c),
+        clauses = contents.clauses :+ mkEquals(cT, b),
+        items = contents.items.updated(cT, matchers))
     }
   }
 
