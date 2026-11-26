@@ -602,6 +602,10 @@ trait Definitions { self: Trees =>
 
     val constructors: Seq[TypedADTConstructor] =
       definition.constructors map (TypedADTConstructor(_, this))
+
+    /** The constructor that has the field `selector`. */
+    def constructorOf(selector: Identifier): TypedADTConstructor = _selectorConstructors.get(selector)
+    private val _selectorConstructors = Lazy(constructors.flatMap(c => c.definition.fields.map(_.id -> c)).toMap)
   }
 
   /** Represents an [[ADTConstructor]] whose type parameters have been instantiated to ''tps'' */

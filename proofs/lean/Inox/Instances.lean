@@ -13,16 +13,15 @@ a model of the clauses before is extended, simultaneously, to the symbols of the
 
 `TermSteps.instanceFacts` substitutes the definitions that are steps in each clause of the instance
 and decides that the result holds in each well-formed model of the defining equations (`verify`),
-under the literals that the base clauses make known: an implication holds when its conclusion holds
-under the literals that its premise makes known, as it is and reduced under the known literals, a
-term holds when it reduces to `true` under the known literals (`red`), an instance of a defining
-equation holds in their models, as does the conclusion of one whose premise reduces to `true`
-(`mpInst`), and an equality holds by congruence (`congB`). The facts that `verify` accepts as they
-are hold too (`holds_verified`). This module proves that the clauses that it accepts hold in the
-models of the defining equations where the definitions hold (`holds_instanceFact`), which every
+under the literals that the base clauses and the root steps make known: an implication holds when
+its conclusion holds under the literals that its premise makes known, as it is and reduced under the
+known literals, a term holds when it reduces to `true` under the known literals (`red`), an instance
+of a defining equation holds in their models, as does the conclusion of one whose premise reduces to
+`true` (`mpInst`), and an equality holds by congruence (`congB`). The facts that `verify` accepts as
+they are hold too (`holds_verified`). This module proves that the clauses that it accepts hold in
+the models of the defining equations where the definitions hold (`holds_instanceFact`), which every
 model of the clauses before them is, since the definitions are clauses of the fresh-symbol steps:
-what the check needs of the facts that it doesn't decide
-(`no_good_model_of_instances`).
+what the check needs of the facts that it doesn't decide (`no_good_model_of_instances`).
 -/
 
 namespace Inox
@@ -261,11 +260,54 @@ theorem kSound_append {M : SmtModel} {K K' : List (SmtTerm × Bool)} (h : KSound
   · exact h p hp
   · exact h' p hp
 
+/-- The literals that the true disjunctions of `K` make known have their values where those of
+`K` do. -/
+theorem kSound_unitLits (hty : LogosTyping) {M : SmtModel} (hwf : model_wf M)
+    {K : List (SmtTerm × Bool)} (hK : KSound M K) : KSound M (unitLits K) := by
+  intro q hq
+  simp only [unitLits, List.mem_flatMap] at hq
+  obtain ⟨⟨t, b⟩, hp, hq⟩ := hq
+  split at hq
+  · rename_i x y heq
+    cases heq
+    have hor := hK _ hp
+    simp only [__smtx_model_eval] at hor
+    rcases List.mem_append.mp hq with hq | hq
+    · split at hq
+      · rename_i hx
+        have hxv : __smtx_model_eval M x = SmtValue.Boolean false := by
+          rw [← eval_red hty hwf hK x, hx]; simp [__smtx_model_eval]
+        have hy : __smtx_model_eval M y = SmtValue.Boolean true := by
+          rcases or_eq_true hor with h | h
+          · rw [hxv] at h; cases h
+          · exact h
+        rcases List.mem_append.mp hq with hq | hq
+        · exact lits_sound _ true (by rw [eval_red hty hwf hK y]; exact hy) q hq
+        · exact lits_sound _ true hy q hq
+      · cases hq
+    · split at hq
+      · rename_i hyf
+        have hyv : __smtx_model_eval M y = SmtValue.Boolean false := by
+          rw [← eval_red hty hwf hK y, hyf]; simp [__smtx_model_eval]
+        have hx : __smtx_model_eval M x = SmtValue.Boolean true := by
+          rcases or_eq_true hor with h | h
+          · exact h
+          · rw [hyv] at h; cases h
+        rcases List.mem_append.mp hq with hq | hq
+        · exact lits_sound _ true (by rw [eval_red hty hwf hK x]; exact hx) q hq
+        · exact lits_sound _ true hx q hq
+      · cases hq
+  · cases hq
+
+theorem kSound_withUnits (hty : LogosTyping) {M : SmtModel} (hwf : model_wf M)
+    {K : List (SmtTerm × Bool)} (hK : KSound M K) : KSound M (withUnits K) :=
+  kSound_append (kSound_unitLits hty hwf hK) hK
+
 theorem verifyUnder_base (hty : LogosTyping) {M : SmtModel} (hwf : model_wf M)
     {k : List (SmtTerm × Bool) → Bool} {K : List (SmtTerm × Bool)} (hK : KSound M K)
     (p : SmtTerm)
     (hv : (decide (red K p = SmtTerm.Boolean false) ||
-      k (lits (red K p) true ++ lits p true ++ K)) = true)
+      k (withUnits (lits (red K p) true ++ lits p true ++ K))) = true)
     (hp : __smtx_model_eval M p = SmtValue.Boolean true) : ∃ K', KSound M K' ∧ k K' = true := by
   simp only [Bool.or_eq_true, decide_eq_true_eq] at hv
   have hr := eval_red hty hwf hK p
@@ -273,8 +315,8 @@ theorem verifyUnder_base (hty : LogosTyping) {M : SmtModel} (hwf : model_wf M)
   · rw [hv, hp] at hr
     simp [__smtx_model_eval] at hr
   · rw [hp] at hr
-    exact ⟨_, kSound_append (kSound_append (lits_sound _ true hr) (lits_sound _ true hp)) hK,
-      hv⟩
+    exact ⟨_, kSound_withUnits hty hwf
+      (kSound_append (kSound_append (lits_sound _ true hr) (lits_sound _ true hp)) hK), hv⟩
 
 /-- When `p` is true, the literals that `verifyUnder` passes to `k`, for one of the disjuncts of
 `p`, have their values. -/
@@ -526,14 +568,38 @@ theorem subset_foldl_append : ∀ (sts : List Step) (acc : List Term),
 theorem base_subset_extend (base : List Term) (sts : List Step) : base ⊆ extend base sts :=
   subset_foldl_append sts base
 
-/-- The literals that the base clauses make known have their values in their models. -/
-theorem kSound_baseLits {r : TermSteps} {M : SmtModel}
-    (h : ∀ t ∈ r.base, __smtx_model_eval M (__eo_to_smt t) = SmtValue.Boolean true) :
+/-- The clauses of the steps are among the assumptions that they extend. -/
+theorem clause_mem_extend {t : Term} : ∀ {assums : List Term} {sts : List Step} {st : Step},
+    st ∈ sts → t ∈ st.clauses → t ∈ extend assums sts
+  | _, [], _, h, _ => by cases h
+  | assums, st' :: sts, st, h, ht => by
+    show t ∈ extend (assums ++ st'.clauses) sts
+    rcases List.mem_cons.mp h with rfl | h
+    · exact mem_extend (List.mem_append_right _ ht)
+    · exact clause_mem_extend h ht
+
+/-- The constants of the root steps are clauses of the fresh-symbol steps. -/
+theorem roots_subset_extend (r : TermSteps) : r.roots ⊆ extend r.base r.fresh := by
+  intro t ht
+  simp only [TermSteps.roots, List.mem_filterMap] at ht
+  obtain ⟨st, hst, h⟩ := ht
+  cases st <;> simp at h
+  subst h
+  exact clause_mem_extend hst (by simp [Step.clauses])
+
+/-- The literals that the base clauses and the root steps make known have their values in the
+models of the base clauses and of the clauses of the fresh-symbol steps. -/
+theorem kSound_baseLits (hty : LogosTyping) {r : TermSteps} {M : SmtModel} (hwf : model_wf M)
+    (h : ∀ t ∈ extend r.base r.fresh,
+      __smtx_model_eval M (__eo_to_smt t) = SmtValue.Boolean true) :
     KSound M r.baseLits := by
-  intro p hp
-  simp only [TermSteps.baseLits, List.mem_flatMap] at hp
+  refine kSound_withUnits hty hwf fun p hp => ?_
+  simp only [List.mem_flatMap, List.mem_append] at hp
   obtain ⟨t, ht, hp⟩ := hp
-  exact lits_sound _ true (h t ht) p hp
+  refine lits_sound _ true (h t ?_) p hp
+  rcases ht with ht | ht
+  · exact base_subset_extend _ _ ht
+  · exact roots_subset_extend r ht
 
 /-- The clauses of the instances that the check accepts hold, in the models of the defining
 equations, given the base clauses and the clauses of the fresh-symbol steps. -/
@@ -544,7 +610,7 @@ theorem holds_instanceFact (hty : LogosTyping) {r : TermSteps} {t : Term}
   simp only [TermSteps.instanceFacts, List.mem_flatMap, List.mem_filter] at ht
   obtain ⟨⟨defs, cs⟩, _, _, hc⟩ := ht
   have hK : KSound M r.baseLits :=
-    kSound_baseLits fun t ht => hsat.2 t (hsub (base_subset_extend _ _ ht))
+    kSound_baseLits hty hsat.1 fun t ht => hsat.2 t (hsub ht)
   refine instClause_sound hty hM hsat.1 ?_ hK hc
   intro e he
   obtain ⟨d, hd, hb⟩ := List.mem_filterMap.mp he
@@ -559,7 +625,7 @@ theorem holds_verified (hty : LogosTyping) {r : TermSteps} {t : Term} (h : r.ver
   intro M hM hsat
   simp only [TermSteps.verified, Bool.and_eq_true] at h
   have hK : KSound M r.baseLits :=
-    kSound_baseLits fun t ht => hsat.2 t (hsub (base_subset_extend _ _ ht))
+    kSound_baseLits hty hsat.1 fun t ht => hsat.2 t (hsub ht)
   exact verify_sound hty hM hsat.1 _ hK h.2
 
 theorem holds_covered (hty : LogosTyping) {r : TermSteps} {t : Term} (h : r.covered t = true)

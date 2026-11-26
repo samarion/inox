@@ -433,7 +433,7 @@ trait Expressions { self: Trees =>
 
     def constructor(using Symbols) = {
       val tpe = getADTType(adt).asInstanceOf[ADTType]
-      tpe.getSort.constructors.find(_.fields.exists(_.id == selector)).get
+      tpe.getSort.constructorOf(selector)
     }
 
     def selectorIndex(using Symbols) = constructor.definition.selectorID2Index(selector)

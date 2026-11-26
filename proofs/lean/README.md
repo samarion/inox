@@ -135,6 +135,21 @@ What remains is `hfacts`, that each rule that is a fact holds in the models
 that the solutions of the query give, and `hkeep`, that those models don't
 depend on the fresh symbols: these are about the semantics of Inox.
 
+The clauses of an `Enables` step, `(=> b c)` for each blocker `b`, don't say
+that the activation literal `c` holds only if one of its blockers does. The
+model that the steps build does have it, since it makes `c` the disjunction of
+the blockers and the later steps don't reinterpret them (`Step.Only`,
+`extend_sat_only`). `no_good_model_of_accept_only` is the same theorem with the
+facts only asked of such models, so that a fact about a call can go from its
+activation literal to the blockers of the paths that reach the call:
+
+```lean
+    (hfacts : FactsHold (fun M => Good M ∧ ∀ st ∈ r.fresh, st.Only M)
+      (extend r.base r.fresh) r.facts) :
+```
+
+The theorem without `Total` uses it (`no_solution_of_reached`, below).
+
 [`Inox/Unfold.lean`](Inox/Unfold.lean) discharges `hkeep`, and `hfacts` for
 the unfoldings of functions without branches, with `Good` the models of the
 program's defining equations. The checker keeps the source of each template
@@ -223,8 +238,12 @@ holds under the literals that `p` being true makes known, for each disjunct of
 `true` under the known literals (`red`: a known subterm is its value, an `ite`
 whose condition reduces to a literal is its branch, Boolean operators of
 literals are reduced, and `(= x y)` is true when `x` and `y` reduce to the same
-term); and an instance of a defining equation holds. So a result defined under
-the guards of both branches, `(=> b1 (= e t1))` and `(=> b2 (= e t2))`, becomes
+term); and an instance of a defining equation holds. The known literals include
+those that a true disjunction with an operand that reduces to false makes
+known, those of its other operand (`unitLits`, `kSound_unitLits`): on the
+branch of `(or b t)` where `b` is false, a query that states the disjunction
+makes `t` known. So a result defined under the guards of both branches,
+`(=> b1 (= e t1))` and `(=> b2 (= e t2))`, becomes
 `(=> (and n c) (= (ite c t1 t2) t1))`, which holds since the guard makes `c`
 known; and the value of a nested call, `(=> b (= lt (f' args)))`, is that call.
 [`Inox/Instances.lean`](Inox/Instances.lean) proves it: `eval_red`,
@@ -265,26 +284,27 @@ The base `r.base`, which the theorems say no `Good` model satisfies, is:
 The source expressions are in SMT-LIB 3, with markers and assumptions, which
 Logos doesn't read. The base has each one lowered to the syntax of the session
 (`Inox/Lowering.lean`), with the meaning that its `where` gives to each marker
-(a typing `((as typing!0 S) "free" x)`, for one) in place of the marker, each
-`(assume c b)` in a position where the expression holds replaced by `b`, and
-the conjuncts that still have markers left out; an expression with a marker
-left elsewhere is left out of the base. So the base's clause is implied by the
-source expression, given the meanings of its markers: the theorems' hypotheses
-are weaker than the query's assertions with their assumptions, and the theorems
-stronger than about the assertions themselves. That the meanings of the markers
-are those that the source gives them, and that a typing's meaning is what the
-template's clauses state of the marker, is only checked by the Scala checker
-(`Sources.scala`); neither checker checks that the meaning of a typing is that
-of the type.
+(a typing `((as typing!0 S) "free" x)`, for one) in place of the marker, the
+conjuncts that still have markers left out, of the expression and of the
+conditions of its assumptions, and each `(assume c b)` replaced by `b`; an
+expression with a marker left elsewhere is left out of the base. So the base's
+clause is implied by the source expression, given the meanings of its markers:
+the theorems' hypotheses are weaker than the query's assertions with their
+assumptions, and the theorems stronger than about the assertions themselves.
+That the meanings of the markers are those that the source gives them, and that
+a typing's meaning is what the template's clauses state of the marker, is only
+checked by the Scala checker (`Sources.scala`); neither checker checks that the
+meaning of a typing is that of the type.
 
 Of the latter two, those that mention a constant that a rule introduces (a
 fresh symbol, whose value the steps choose) can't be assumptions of a model of
 the query: such a completeness assumption stays a fact, and such a source
 expression is left out of the base. The clauses of an assertion's instance are
 then checked as those of a function's, given the base: the literals that the
-base clauses make known (`TermSteps.baseLits`, by `lits`) are known to `verify`
-in each clause (`instClauseB`, `kSound_baseLits`), so the meanings of the
-instance's symbols, substituted, reduce under the source expression.
+base clauses and the constants of the root steps make known
+(`TermSteps.baseLits`, by `lits`) are known to `verify` in each clause
+(`instClauseB`, `kSound_baseLits`), so the meanings of the instance's symbols,
+substituted, reduce under the source expression.
 
 So the final theorem (`no_good_model_of_instances`) reads: for each model `M`
 that is well formed and satisfies the defining equations `r.equations`
@@ -324,31 +344,44 @@ accepts:
   are those where `eq` is reflexive, and the facts are its instances by modus
   ponens. That this holds of the program's equality is a fact about Inox, as
   the defining equations are.
+- **Decreases**: a decreases clause is `(=> b (or (> r r') diverges))`, where
+  `r` and `r'` are the ranks of a call and of a call of its body, and nothing
+  else constrains `diverges`. So it is a fresh symbol that may be true: the
+  checker adds a root step for each constant that ends the disjunction of a
+  fact and that neither the base clauses, the equations, the other steps nor
+  the definitions mention (`unconstrained`), which the check of the steps
+  decides as for any other. The constants of the root steps are then known
+  literals (`TermSteps.roots`, `roots_subset_extend`), under which the clause
+  reduces to true. The clauses say nothing of the termination of the calls,
+  which the theorems about the semantics take as a hypothesis (`Total`) or do
+  without, for the calls that evaluation goes through
+  (`no_solution_of_reached`).
 
 `inox-check --terms` prints, for each certificate, how many facts are
 unfoldings, how many are clauses of instances that the check accepts, how many
 hold as they are (by rule kind), and how many remain, by category: `decreases`
-(the clauses of the `diverges!` symbols), `contract` (the clauses of an
-`Unfold` rule that are not about its symbols' meanings: preconditions,
-postconditions, ADT invariants, refinements), `assertion` (`Instance` rules),
-`typing` (the `tp!` predicates), `definition without source` (a template whose
-source is not a function), `binder`, `completeness`, and the other rules by
-kind; how many definitions of local symbols are steps; the base: how many of
-its clauses are the query's, how many of the source expressions and
-completeness assumptions are base clauses; and how many reflexivity axioms.
-`--remaining` also prints the remaining facts and the definitions left out. On
-the 31 regression certificates that Logos reads, 1,825 facts remain once the 46
-completeness assumptions are in the base, and 1,176 are covered (24 unfoldings,
-1,127 clauses of instances, 25 directly: 12 `Reflexivity`, 13 `Congruence`); 30
-of the 32 source expressions are base clauses, and 771 of the 805 definitions
-are steps (5 fewer than without the source expressions and completeness
-assumptions in the base, which mention their symbols).
+(the clauses of the `diverges!` symbols that are constrained), `contract` (the
+clauses of an `Unfold` rule that are not about its symbols' meanings:
+preconditions, postconditions, ADT invariants, refinements), `assertion`
+(`Instance` rules), `typing` (the `tp!` predicates),
+`definition without source` (a template whose source is not a function),
+`binder`, `completeness`, and the other rules by kind; how many definitions of
+local symbols are steps; the base: how many of its clauses are the query's, how
+many of the source expressions and completeness assumptions are base clauses;
+and how many reflexivity axioms. `--remaining` also prints the remaining facts
+and the definitions left out. On the 31 regression certificates that Logos
+reads, 1,825 facts remain once the 46 completeness assumptions are in the base,
+and 1,360 are covered (24 unfoldings, 1,311 clauses of instances, of which the
+180 decreases clauses, 25 directly: 12 `Reflexivity`, 13 `Congruence`); 30 of
+the 32 source expressions are base clauses, and 771 of the 805 definitions are
+steps (5 fewer than without the source expressions and completeness assumptions
+in the base, which mention their symbols).
 
 The soundness of Logos is a hypothesis of the theorems, `LogosSound`, which is
 the statement of Logos's own theorem. They then only need the definitions of
-Logos, and Mathlib for its reals: the [`verification`](verification) project
-builds them in minutes, and the `Lean proofs` workflow does when this directory
-changes.
+Logos, its proof that a well-formed model exists, and Mathlib for its reals and
+their cardinality: the [`verification`](verification) project builds them in
+minutes, and the `Lean proofs` workflow does when this directory changes.
 
 ```sh
 cd proofs/lean/verification && lake exe cache get && lake build
@@ -434,9 +467,11 @@ Given a program `P` and a solution `σ` of the query, the intended model
 [`Inox/Model.lean`](Inox/Model.lean) builds this model over an arbitrary
 interpretation `interp` of the functions, and proves it well formed whatever
 `interp` is. The bridge instantiates `interp` with `call`. It takes one fact as
-a hypothesis: an injection of names, types and argument lists into the nonzero
-codes of `Fun` values (`Codes`; `ModelId` is `ℝ`, so one exists, but it isn't
-proved yet).
+a parameter: an injection of names, types and argument lists into the nonzero
+codes of `Fun` values (`Codes`). One exists (`Codes.nonempty`,
+[`Inox/Codes.lean`](Inox/Codes.lean)): `ModelId` is `ℝ`, the sorts are
+countable, and a value is written injectively as a list of reals and naturals
+(`ser_inj`), so there are no more partial applications than reals.
 
 ### The agreement theorem
 
@@ -594,7 +629,7 @@ Proving it needs the agreement theorem. The instance and verified facts of
 equations at the instance's arguments without a guard, so restating them needs
 the same obligation at each use of an equation. The gap is large: on the
 regression corpus, `no_good_model_of_unfold_on` covers the 24 unfoldings of the
-1,176 facts that `no_good_model_of_instances` covers, and the other 1,152 stay
+1,360 facts that `no_good_model_of_instances` covers, and the other 1,336 stay
 in `hfacts`.
 
 **Fuel monotonicity** ([`Inox/Mono.lean`](Inox/Mono.lean)), against the
@@ -630,11 +665,11 @@ to their SMT-LIB counterparts. `S : List Sig` gives each function its
 parameters and return type, which the semantics' `FunDef` doesn't carry.
 `HasTy S Γ e T` is the typing of the fragment: variables, the integer and
 Boolean literals, `IfExpr`, `And`, `Or`, `Not`, `Implies`, `Equals`, `Plus`,
-`Minus`, `Times`, `UMinus`, `LessThan`, `GreaterThan`, `LessEquals`,
-`GreaterEquals`, `Assume`, and `FunctionInvocation` without type arguments of a
-function of `S`. For a model whose function constants agree with `call` at fuel
-`n` (`CallsOk`) and whose variable constants agree with the environment
-(`VarsOk`):
+`Minus`, `Times`, `Division`, `Remainder`, `Modulo`, `UMinus`, `LessThan`,
+`GreaterThan`, `LessEquals`, `GreaterEquals`, `Assume`, and
+`FunctionInvocation` without type arguments of a function of `S`. For a model
+whose function constants agree with `call` at fuel `n` (`CallsOk`) and whose
+variable constants agree with the environment (`VarsOk`):
 
 ```lean
 theorem ev (hO : O.Sound) (hty : LogosTyping) (hS : SigOk S) {n : Int}
@@ -672,6 +707,34 @@ theorem no_star_model (sound : LogosSound) (hO : O.Sound) (hty : LogosTyping)
 terminate on values of their parameter types (`guardOk_total`). For others it
 stays a hypothesis, inside `hfacts`.
 
+**The calls that evaluation goes through have values**
+([`Inox/Reach.lean`](Inox/Reach.lean)). A solution doesn't need every call to
+give a value, only those that its evaluation goes through, and they do: a call
+that is stuck or out of fuel makes the expression around it so. `reaches K c t`
+decides on terms that evaluating the expression of `t` goes through the call
+`c` in the models where the literals `K` have their values: `c` is `t`, or it
+is reached in an operand that is evaluated. The operands of `ite`, `and`, `or`
+and `=>` after the first are evaluated only when the first has the value that
+selects them, which `red K` has to give.
+
+```lean
+theorem called_of_reaches (hO : O.Sound) (hty : LogosTyping) (hS : SigOk S)
+    (hP : ProgTy S P) {n : Int} (hct : CallTy O P S n) {Γ : List (Id × Ty)}
+    {e : Expr} {T : Ty} (h : HasTy S Γ e T) {env : Env} {v : Value}
+    (hE : EnvTy Γ env) (he : eval O P n env e = .Ok v) {M : SmtModel}
+    (hw : model_wf M) (hc : CallsOk O P S n M) (hV : VarsOk Γ env M)
+    {K : List (SmtTerm × Bool)} (hK : KSound M K) {c : SmtTerm}
+    (hr : reaches K c true (tr S Γ e) = true) : Called O P S M c
+```
+
+`Called O P S M c` says that `c` is a function of `S` applied to terms whose
+values in `M` are those of values of its parameters' types, on which the call
+is `Ok` at some fuel. `called_of_call` is the same of the body of a function
+whose call is `Ok`, with the arguments of the call for its parameters.
+`reaches` is `reachesW` with the terms as they are, and `reachesW` sees them
+through a substitution, so that the body is compared with the terms of the
+certificate without counting the calls of the arguments.
+
 **The query has no solution** ([`Inox/NoSolution.lean`](Inox/NoSolution.lean)).
 For a program whose calls all give values (`Total O P S`: each function of `S`,
 on values of the types of its parameters, is `Ok` at some fuel), the intended
@@ -698,8 +761,7 @@ theorem no_solution (sound : LogosSound) (hO : O.Sound) (hty : LogosTyping)
     (hE : ∀ e ∈ r.equations, ∃ s ∈ S, EqFor P S s e)
     (hΓ : VarsFresh S Γ) (hbase : BaseFor S Γ qs r.base)
     (hfacts : FactsHoldExcept (Good r.equations) r.covered
-      (extend r.base r.fresh) r.facts)
-    (cd : Codes) (hM0 : model_wf M0) :
+      (extend r.base r.fresh) r.facts) :
     ∀ vs, ¬ Solution O P Γ qs vs
 ```
 
@@ -716,12 +778,14 @@ a query, and asks that the equations and the base clauses of the certificate
 are their translations. `no_solution_of_check` takes them from the certificate:
 `back` reads a term of Logos as an expression, `programOf r.equations` is the
 program of the functions that the defining equations read as, with the
-signatures `sigsOf r.equations`, and `queryOf r.base` the expressions that the
-base clauses read as, over the free variables `varsOf`. Nothing is proved of
-`back`. Instead `sourceCheck r` translates what it gives and compares the
-result with the terms, types the bodies and the query (`infer`, with
-`infer_sound`), and checks the names and the types, which gives `EqFor`,
-`BaseFor`, `SigOk`, `ProgTy`, `ProgFrag` and `VarsFresh`:
+signatures `sigsOf r.equations`, and `queryOf r.query` the expressions that the
+base clauses read as, over the free variables `varsOf`, where `r.query` is the
+base with the assumptions that are inside the source expressions marked, as for
+the bodies (see below). Nothing is proved of `back`. Instead `sourceCheck r`
+translates what it gives and compares the result with the terms, types the
+bodies and the query (`infer`, with `infer_sound`), and checks the names and
+the types, which gives `EqFor`, `BaseFor`, `SigOk`, `ProgTy`, `ProgFrag` and
+`VarsFresh`:
 
 ```lean
 theorem no_solution_of_check (sound : LogosSound) (hO : O.Sound)
@@ -732,10 +796,9 @@ theorem no_solution_of_check (sound : LogosSound) (hO : O.Sound)
     (hsrc : sourceCheck r = true)
     (htot : Total O (programOf r.equations) (sigsOf r.equations))
     (hfacts : FactsHoldExcept (Good r.equations) r.covered
-      (extend r.base r.fresh) r.facts)
-    (cd : Codes) (hM0 : model_wf M0) :
+      (extend r.base r.fresh) r.facts) :
     ∀ vs, ¬ Solution O (programOf r.equations)
-      (varsOf (sigsOf r.equations) r.base) (queryOf r.base) vs
+      (varsOf (sigsOf r.equations) r.query) (queryOf r.query) vs
 ```
 
 The program read is the one that the certificate states, as Logos reads it: its
@@ -746,15 +809,128 @@ answered about is what the certificate's sources state, and is not proved. A
 call of a function without parameters is read as a variable, so the check
 refuses a certificate that has one.
 
+When the check of the certificate covers every fact (`r.facts.all r.covered`),
+`no_solution_of_covered` has no hypothesis on the facts: what is left is
+`Total` and the oracle.
+
 On the certificates that Inox prints for two inputs of the fragment, a
 recursive function over the integers and a recursive predicate with a query
-that has free variables, the checker accepts and `sourceCheck` holds. They are
+that has free variables, the checker accepts and `sourceCheck` holds, and the
+check covers every fact of both, so `no_solution_of_covered` applies. They are
 not kept here. On the regression certificates, which are mostly about ADTs and
 first-class functions, it only holds of a few that define no function.
 
+**The query has no solution, whatever the calls**
+([`Inox/Reached.lean`](Inox/Reached.lean)). The models of a solution satisfy
+the defining equation of a function only where its call gives a value
+(`goodOn_calls`), so the certificate has to use the equations on such calls
+only. It does, and `reachedCheck` decides it:
+
+- an instance of a defining equation is guarded by the activation literal of
+  its call, `(=> d (= (f u1 … un) body))`, as it is or once the definitions
+  of the local symbols of its instance are in place (`guardedEq`);
+- the literal holds only if one of its blockers does (`Step.Only`);
+- under each blocker, with the literals that its definition and those of the
+  constants it mentions make known (`closeK`), evaluation goes through the call
+  (`Paths.guards`): a base clause reaches it, or the body of a call that is
+  already guarded, by a literal that is known, reaches it (`reachedBy`);
+- the other facts hold without the equations (`TermSteps.covered` with none),
+  and no fresh symbol is a function of the program or a variable of the query
+  (`apart`).
+
+Then a guard that holds implies that its call gives a value, by induction along
+the guarded calls (`inv_calls`), and so each fact holds in the models where the
+calls and the variables agree (`Agrees`), which the intended model of a
+solution is one of:
+
+```lean
+theorem no_solution_of_reached {O : Oracle} (sound : LogosSound) (hO : O.Sound)
+    (hty : LogosTyping) {certificate : Logos.Sexp} {checked : Checked}
+    {r : TermSteps} (hAccept : accept certificate = .ok checked)
+    (hr : termSteps checked = .ok r) (hcheck : r.check = true)
+    (hsrc : sourceCheck r = true) (hreached : reachedCheck r = true) :
+    ∀ vs, ¬ Solution O (programOf r.equations)
+      (varsOf (sigsOf r.equations) r.query) (queryOf r.query) vs
+```
+
+Nothing is assumed of the calls of the program, and `r.keeps` is not needed.
+The checks hold of the two certificates above, and of the certificate of a
+function that doesn't terminate on negative integers, with a query that only
+calls it on 0 and 1, which `Total` leaves out. Like `sourceCheck`,
+`reachedCheck` is defined over the semantics, so `inox-check` doesn't run it.
+
+**Running the checks.** `inox-solution`, an executable of the verification
+package ([`SolutionMain.lean`](SolutionMain.lean)), runs the hypotheses of
+`no_solution_of_reached` that are computed (`accept`, `r.check`, `sourceCheck`
+and `reachedCheck`) on each certificate of its files. It prints `no solution`
+for a certificate that they hold of: given the soundness of Logos, the query
+that it reads has no solution in the program that it reads. For another it
+prints which check fails: the part of `sourceCheck` that puts it outside the
+fragment, or how many facts `reachedCheck` doesn't cover, by the kinds of their
+rules. It exits with 1 unless they hold of every certificate.
+
+```sh
+cd proofs/lean/verification && lake build inox-solution
+.lake/build/bin/inox-solution answers.txt
+```
+
+The first build compiles the modules that the executable imports, those of
+Mathlib too, which takes a quarter of an hour. Of the 36 certificates of the
+corpus, the checks hold of 4: the 3 of `error-is-infeasible.smt3` and one of
+`empty-function-codomains.smt3`. 28 are outside the fragment of first-order
+integers and Booleans, 2 have facts that are not covered, and 2 have a proof
+with a constant array, which Logos doesn't read.
+
+**Assumptions.** A body with assumptions is read with them: Logos doesn't read
+`(assume c b)` in a term, so the equation that the clauses instantiate is
+without them (`dropAssumes`), and `equations` also reads each source with every
+`(assume c b)` marked as `(ite (xor c false) b b)`, which has the value of `b`
+and which no expression of the fragment translates to (`markAssumes`,
+`Equation.source`). `back` reads the mark as `Assume`, so the program of the
+certificate has the assumptions, and the translation of its bodies, which
+leaves them out, is still the equation. Where an assumption can fail, such a
+program is not `Total`, so `no_solution_of_check` and `no_solution_of_covered`
+say nothing of it, and `no_solution_of_reached` is its theorem. A call whose
+assumption fails is stuck, so where a call gives a value the assumptions that
+its evaluation goes through hold (`assumesW`, `holds_of_assumesW`,
+`assumed_of_call` in [`Inox/Reach.lean`](Inox/Reach.lean)). `reachedCovered`
+then accepts a clause `(=> g ψ)` where `ψ` is, with the arguments of the call
+for the parameters, the term of an assumption that the body of a guarded call
+goes through, under the literals that `g` makes known, which make the guard of
+the call true (`Paths.assumed`): the precondition of a call is one. A division
+by zero is stuck in the same way, and SMT-LIB leaves its value open, so Inox
+states that a divisor that is not a literal is not zero, in a clause
+`(=> g (not (= d 0)))` under the blocker of the branch of the division.
+`Division` is translated to `div`, and `Remainder` and `Modulo`, which are the
+same on integers, to `mod`, which `back` reads as `Modulo`. Where the divisor
+is not zero the terms have the values of the expressions (`ev`), `assumesW`
+also finds `(not (= d 0))` for a divisor `d` that evaluation goes through, and
+`reachedCovered` accepts the clause as it does that of an assumption. The
+checks hold of the certificates of a recursive function with a precondition,
+with a query that calls it within the precondition, and with one that calls it
+outside, which has no solution for that reason, and of those of functions that
+divide, one of them by zero on an argument of the query. An `Error` of a source
+is read as the assumption that it is lowered to, `(assume false v)`, which is
+stuck as it is: the program of the certificate has an `Assume` in its place,
+and the clause `(=> g false)` of its branch is that of this assumption. The
+checks hold of the certificates of a recursive function with an error, with a
+query that stays away from it and with one that only reaches it. The query is
+read in the same way: its source expressions are read once without the
+assumptions inside them, for the base clauses, and once with them marked, for
+`r.query`, which `sourceCheck` checks the base clauses to be the translations
+of. `reachedCovered` accepts the clause of an assumption, of a divisor or of an
+error that the evaluation of an expression of the query goes through
+(`Paths.assumedQuery`), since a solution gives the query a value. The checks
+hold of the certificates of queries that divide by zero, that reach an error,
+and that assume what doesn't hold. An assumption whose condition still has a
+marker, such as the typing of a free variable of a type that is not a sort of
+the session, is left out of the query. A mark doubles the body after it, so a
+body with many nested assumptions is read slowly.
+
 **The hypotheses that remain.**
 
-- `Total`, for `no_solution`. It leaves out the functions that don't terminate
+- `Total`, for `no_solution` and `no_solution_of_covered`, not for
+  `no_solution_of_reached`. It leaves out the functions that don't terminate
   on some arguments and those that are stuck on some, as a function with a
   precondition is where its `Assume` fails. Without it, `no_star_model` has
   `GuardOk` for the unfoldings, that a guard true in the intended model selects
@@ -763,22 +939,26 @@ first-class functions, it only holds of a few that define no function.
 - `LogosSound`, `LogosTyping` (discharged in `InoxClosed`), and `O.Sound`, that
   the oracle of `Forall` and `UninterpretedCall` agrees with the semantics
   (unused on the fragment but required by `call`).
-- For `no_solution` and `no_star_model`, the shape of the program (`ProgFrag
-  P`, `ProgTy S P`, `SigOk S`) and that the equations and the base clauses of
-  the certificate are the translations of its bodies and of the query (`EqFor`,
-  `BaseFor`). `sourceCheck` decides them for the program and the query read
-  from the certificate, so `no_solution_of_check` has `sourceCheck r = true` in
-  their place. A reflexivity axiom among the equations is not the translation
-  of a body, so the check refuses a certificate that has one; the programs of
-  the fragment have none.
+- For `no_solution` and `no_star_model`, the shape of the program
+  (`ProgFrag P`, `ProgTy S P`, `SigOk S`) and that the equations and the base
+  clauses of the certificate are the translations of its bodies and of the
+  query (`EqFor`, `BaseFor`). `sourceCheck` decides them for the program and
+  the query read from the certificate, so `no_solution_of_check` has
+  `sourceCheck r = true` in their place. A reflexivity axiom among the
+  equations is not the translation of a body, so the check refuses a
+  certificate that has one; the programs of the fragment have none.
 - That the program and the query read from the certificate are those that Inox
   answered about.
-- `model_wf M0`, a well-formed model for the sorts and the other function
-  values, and `cd : Codes`. That both exist is not proved here. For
-  `no_star_model`, also `model_wf N` and `N.usortDom = M0.usortDom`.
+- For `no_star_model`, `model_wf M0`, a well-formed model for the sorts and the
+  other function values, `cd : Codes`, `model_wf N` and
+  `N.usortDom = M0.usortDom`. `no_solution` takes none of them: a well-formed
+  model exists by the theorem of Logos (`Smtm.model_wf_nonvacuous`), and an
+  injection of codes by `Codes.nonempty`.
 - `hfacts`: for `no_solution`, the facts that `r.covered` doesn't cover
-  (contracts, `decreases`, assertions and the others, see above); for
-  `no_star_model`, the facts other than guarded unfoldings.
+  (contracts, assertions and the others, see above), and none when it covers
+  them all (`no_solution_of_covered`); for `no_star_model`, the facts other
+  than guarded unfoldings. `no_solution_of_reached` has none: `reachedCheck`
+  asks that every fact be covered.
 
 The translation stops at integers and Booleans: ADTs, unit, `Let`, `Error`,
 `Division`, `Remainder`, `Modulo`, type arguments, closures, `Forall` and
@@ -804,19 +984,20 @@ without type parameters, but only a lemma (`call_tenv`) shows it.
   [`semantics.md`](../semantics.md): the query has no solution. `no_solution`
   states it for the first-order programs over integers and Booleans whose calls
   all give values, with hypotheses (see [The bridge to the
-  semantics](#the-bridge-to-the-semantics-partly-proved)). In general it needs
+  semantics](#the-bridge-to-the-semantics-partly-proved)), and
+  `no_solution_of_reached` for those programs whatever their calls, for the
+  certificates of which its checks hold. In general it needs
   the bridge beyond that fragment, that its solutions give `Good` models (where
   the declared equalities are reflexive and the completeness assumptions hold,
   and for the programs with calls that give no value, with the clauses of
   instances relativized as the unfoldings are), and for each other kind of
-  rule, that its clauses hold in them (`hfacts`): the decreases clauses; the
-  preconditions, postconditions, ADT invariants and refinements of the
-  templates (`contract`), which are assumptions about the program; the clauses
-  of assertions about the instances of quantifiers, and those whose source
-  expression has a binder or mentions a fresh symbol; the typing predicates;
-  the templates whose source is not a function; the clauses with binders; and
-  the other rules (`Dispatched`, `SameLambda`, the `Congruence` of instances of
-  quantifiers, …).
+  rule, that its clauses hold in them (`hfacts`): the preconditions,
+  postconditions, ADT invariants and refinements of the templates (`contract`),
+  which are assumptions about the program; the clauses of assertions about the
+  instances of quantifiers, and those whose source expression has a binder or
+  mentions a fresh symbol; the typing predicates; the templates whose source is
+  not a function; the clauses with binders; and the other rules (`Dispatched`,
+  `SameLambda`, the `Congruence` of instances of quantifiers, …).
 - **Longer cycles of `Enables` rules.** A cycle where a target reaches a
   definition that enables it only through other definitions or targets
   (`bs := (and d s)`, `(=> m s)`, `(=> bs2 m)`, `bs2 := (and d2 x)`,
@@ -827,8 +1008,12 @@ without type parameters, but only a lemma (`call_tenv`) shows it.
   template to the syntax of the session, as the Scala checker does
   ([`Lowering.lean`](Inox/Lowering.lean), a port of
   [`Lowering.scala`](../src/main/scala/inox/certificates/Lowering.scala)), and
-  refuses a certificate with a source that doesn't lower. Only the Scala
-  checker checks that the clauses of a template are those of its source
+  refuses a certificate with a source that doesn't lower. An error of a source,
+  `(error S "message")`, is lowered to an assumption that never holds,
+  `(assume false v)` with `v` the `0` or the `false` of its sort, since Logos
+  reads the terms of a source, and an error of another sort is refused. Only
+  the Scala checker checks that the clauses of a template are those of its
+  source
   ([`Sources.scala`](../src/main/scala/inox/certificates/Sources.scala)); this
   checker only checks the clauses that it covers against the lowered source
   (`unfoldB`, and the clauses of instances, given the meanings of their
