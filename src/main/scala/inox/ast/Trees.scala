@@ -28,6 +28,13 @@ trait Trees
     def asString(using opts: PrinterOptions): String = prettyPrint(this, opts)
 
     override def toString = asString(using PrinterOptions())
+
+    // Trees are immutable, and the solvers hash deep ones (such as long chains of ifs) many times
+    @transient private lazy val cachedHash: Int = scala.util.hashing.MurmurHash3.productHash(this.asInstanceOf[Product])
+    override def hashCode: Int = this match {
+      case _: Product => cachedHash
+      case _ => System.identityHashCode(this)
+    }
   }
 
   val exprOps: ExprOps { val trees: self.type } = {
