@@ -109,6 +109,48 @@ trait QuantificationTemplates { self: Templates =>
     override def toString : String = str
   }
 
+  /** Whether the calls of the functions that a quantifier calls are matchers of the quantifier
+    * (see [[optCalleeMatchers]]). */
+  private lazy val calleeMatchers: Boolean = options.findOptionOrDefault(optCalleeMatchers)
+
+  /** `contents`, the contents of the template of a quantifier over `quantifiers` with the body
+    * `body`, with matchers for the calls on quantified variables in the bodies of the functions
+    * that the body calls on quantified variables, and in the bodies of the functions of these
+    * calls in turn: the quantifier is then instantiated for the values that these functions are
+    * called on, as the functions that it calls would call them there.
+    *
+    * Only the calls whose arguments are all variables of the quantifier (quantified or free) are
+    * taken, of which there are finitely many. */
+  private def withCalleeMatchers(contents: TemplateContents, body: Expr, quantifiers: Set[Variable],
+                                 subst: Map[Variable, Encoded]): TemplateContents = if (!calleeMatchers) contents else {
+    val encoder = mkEncoder(subst)
+    def quantified(args: Seq[Expr]): Boolean = args.exists { case v: Variable => quantifiers(v) case _ => false }
+    def variables(args: Seq[Expr]): Boolean = args.forall { case v: Variable => subst.contains(v) case _ => false }
+
+    val seen = scala.collection.mutable.LinkedHashSet[FunctionInvocation]()
+    def unfold(fi: FunctionInvocation): Unit = {
+      val tfd = fi.tfd
+      exprOps.preTraversal {
+        case call: FunctionInvocation if quantified(call.args) && variables(call.args) && seen.add(call) => unfold(call)
+        case _ =>
+      } (tfd.withParamSubst(fi.args, tfd.fullBody))
+    }
+    exprOps.preTraversal {
+      case fi: FunctionInvocation if quantified(fi.args) => unfold(fi)
+      case _ =>
+    } (body)
+
+    val known = contents.items.matchers.values.flatten.toSet
+    val matchers: Set[Item] = ListSet.from(seen.toSeq.map { call =>
+      Matcher(Right(call.tfd), call.args.map(arg => Left(encoder(arg))), encoder(call))
+    }.filterNot(known))
+
+    if (matchers.isEmpty) contents else {
+      val start = contents.pathVar._2
+      contents.copy(items = contents.items.updated(start, contents.items.getOrElse(start, ListSet.empty[Item]) ++ matchers))
+    }
+  }
+
   object QuantificationTemplate {
     def apply(
       pathVar: (Variable, Encoded),
@@ -155,7 +197,7 @@ trait QuantificationTemplates { self: Templates =>
         (inst, Negative(inst -> instT), contents, str)
       }
 
-      val template = new QuantificationTemplate(polarity, contents, structure, body,
+      val template = new QuantificationTemplate(polarity, withCalleeMatchers(contents, body, quantifiers, clauseSubst), structure, body,
         () => "Template for " + forall.asString + " is :\n" + str(), false, defer)
 
       (res, template)

@@ -22,6 +22,13 @@ package object solvers {
 
   object optNoSimplifications extends FlagOptionDef("no-simplifications", false)
 
+  /** Makes the calls on quantified variables in the bodies of the functions that a quantifier calls
+    * matchers of the quantifier, instead of assuming the postconditions of these functions at the
+    * quantifier (see `FormulaSimplifier.inlinePosts`).
+    *
+    * PROTOTYPE: the default comes from the environment, to measure it in front-ends. */
+  object optCalleeMatchers extends FlagOptionDef("callee-matchers", sys.env.contains("INOX_CALLEE_MATCHERS"))
+
   /** Restricts the characters of strings to the BMP (0 to 0xFFFF), instead of SMT-LIB's 0 to 0x2FFFF, so
     * that each character fits in a UTF-16 code unit. Front-ends whose strings are UTF-16 code units, such
     * as Stainless for the JVM, can turn it on to get no models with other characters. String literals

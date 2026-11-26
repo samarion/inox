@@ -155,7 +155,7 @@ trait FormulaSimplifier extends SimplifierWithPC { self =>
     * These are the passes that go before the simplification under path conditions, which does
     * the rest (see [[simplifyFormula]]).
     */
-  def simplifyForalls(e: Expr): Expr = {
+  def simplifyForalls(e: Expr, noPosts: Boolean = false): Expr = {
 
     def inlineFunctions(e: Expr): Expr = {
       val toInline = forallInlining.toInline(e)
@@ -241,7 +241,7 @@ trait FormulaSimplifier extends SimplifierWithPC { self =>
     val simp: Expr => Expr =
       recordedPass("normalize", (e: Expr) => { val n = normalizeClauses(e); recorded("logic", n); n }) compose
       recordedPass("lift-assumptions", (e: Expr) => simplifyAssumptions(e))  compose
-      recordedPass("inline-postconditions", (e: Expr) => inlinePosts(e))     compose
+      recordedPass("inline-postconditions", (e: Expr) => if (noPosts) e else inlinePosts(e))     compose
       recordedPass("quantifiers", (e: Expr) => inlineForalls(e))             compose
       recordedPass("inline-functions", (e: Expr) => inlineFunctions(e))
     simp(e)
@@ -272,7 +272,7 @@ trait FormulaSimplifier extends SimplifierWithPC { self =>
     val simp: Expr => Expr =
       recordedPass("evaluate", (e: Expr) => simplifyGround(e))               compose
       recordedPass("simplify", (e: Expr) => transform(e, initEnv))           compose
-      ((e: Expr) => simplifyForalls(e))                                      compose
+      ((e: Expr) => simplifyForalls(e, ctx.options.findOptionOrDefault(solvers.optCalleeMatchers) || sys.env.contains("INOX_NO_POST_INLINING"))) compose
       recordedPass("lift-assumptions", (e: Expr) => simplifyAssumptions(e))
     simp(e)
   }

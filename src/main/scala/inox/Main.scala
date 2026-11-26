@@ -118,6 +118,7 @@ trait MainHelpers {
     ast.optPrintUnicode -> Description(Printing, "Print unicode characters for mathematical symbols instead of their ASCII variant"),
     solvers.optAssumeChecked -> Description(Solvers, "Assume that all impure expression have been checked"),
     solvers.optNoSimplifications -> Description(Solvers, "Disable selector/quantifier simplifications in solvers"),
+    solvers.optCalleeMatchers -> Description(Solvers, "Match quantifiers on the calls of the functions that they call"),
     solvers.optStringsBMP -> Description(Solvers, "Restrict the characters of strings to the BMP (0 to 0xFFFF)"),
     solvers.optCheckModels -> Description(Solvers, "Double-check counter-examples with evaluator"),
     solvers.optIgnoreModels -> Description(Solvers, s"Do not request models from solvers.\nOverrides and disables ${optCheckModels.name} and ${unrolling.optFeelingLucky.name}."),
