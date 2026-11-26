@@ -119,19 +119,23 @@ trait QuantificationTemplates { self: Templates =>
     * calls in turn: the quantifier is then instantiated for the values that these functions are
     * called on, as the functions that it calls would call them there.
     *
-    * Only the calls whose arguments are all variables of the quantifier (quantified or free) are
-    * taken, of which there are finitely many. */
+    * The applications and the collection lookups on quantified variables in these bodies are
+    * matchers as well. Only the calls whose arguments are all variables of the quantifier
+    * (quantified or free) are taken, of which there are finitely many. */
   private def withCalleeMatchers(contents: TemplateContents, body: Expr, quantifiers: Set[Variable],
                                  subst: Map[Variable, Encoded]): TemplateContents = if (!calleeMatchers) contents else {
     val encoder = mkEncoder(subst)
     def quantified(args: Seq[Expr]): Boolean = args.exists { case v: Variable => quantifiers(v) case _ => false }
     def variables(args: Seq[Expr]): Boolean = args.forall { case v: Variable => subst.contains(v) case _ => false }
 
-    val seen = scala.collection.mutable.LinkedHashSet[FunctionInvocation]()
+    // the calls, and the applications and collection lookups, in order of occurrence
+    val seen = scala.collection.mutable.LinkedHashSet[Expr]()
     def unfold(fi: FunctionInvocation): Unit = {
       val tfd = fi.tfd
       exprOps.preTraversal {
         case call: FunctionInvocation if quantified(call.args) && variables(call.args) && seen.add(call) => unfold(call)
+        case e @ QuantificationMatcher(c, args) if quantified(args) && variables(args) &&
+          exprOps.variablesOf(c).forall(subst.contains) => seen += e
         case _ =>
       } (tfd.withParamSubst(fi.args, tfd.fullBody))
     }
@@ -141,8 +145,11 @@ trait QuantificationTemplates { self: Templates =>
     } (body)
 
     val known = contents.items.matchers.values.flatten.toSet
-    val matchers: Set[Item] = ListSet.from(seen.toSeq.map { call =>
-      Matcher(Right(call.tfd), call.args.map(arg => Left(encoder(arg))), encoder(call))
+    val matchers: Set[Item] = ListSet.from(seen.toSeq.map {
+      case call @ FunctionInvocation(_, _, args) =>
+        Matcher(Right(call.tfd), args.map(arg => Left(encoder(arg))), encoder(call))
+      case e @ QuantificationMatcher(c, args) =>
+        Matcher(Left(encoder(c) -> c.getType), args.map(arg => Left(encoder(arg))), encoder(e))
     }.filterNot(known))
 
     if (matchers.isEmpty) contents else {
