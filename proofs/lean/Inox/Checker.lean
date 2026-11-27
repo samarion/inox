@@ -332,7 +332,7 @@ def checkRule (clauses : Array Sexp) (templates : Array Template) (sources : Arr
   | other => fail s!"{text other} is not a rule"
 
 /-- The version of the format that the checker checks. -/
-def version : String := "4"
+def version : String := "5"
 
 /-- Checks `certificate`, and says why when it doesn't hold. -/
 def check (certificate : Sexp) : Check Checked := do
@@ -345,6 +345,9 @@ def check (certificate : Sexp) : Check Checked := do
       .expr (.atom "solver-symbols" :: solverSymbols),
       .expr (.atom "source-definitions" :: sourceDefinitions),
       .expr (.atom "source-symbols" :: sourceSymbols),
+      -- The simplification steps relate the sources to the original program. The Scala checker
+      -- replays them; this checker doesn't yet, so its result holds over the simplified program.
+      .expr (.atom "simplifications" :: _),
       .expr (.atom "cpc" :: cpc)] =>
     if v != version then fail s!"the certificate has version {v}, and the checker checks version {version}"
     let clauses := assertsOf script
@@ -376,10 +379,13 @@ def check (certificate : Sexp) : Check Checked := do
           let terms := source.meanings.filter fun (l, _) => match l with
             | .expr _ => true
             | _ => false
+          -- the typing of a set is true, of an element of it and of the others
+          let sets := source.meanings.filterMap Meanings.setTyping
+          let terms := sets.flatMap (·.1) ++ terms
           -- those with markers left, such as the typing of a value, the clauses can't state
-          let symbols := source.meanings.filterMap fun (l, r) => match l with
+          let symbols := sets.flatMap (·.2) ++ source.meanings.filterMap fun (l, r) => match l with
             | .atom v =>
-              let m := Lowering.Tables.unmark terms [] r
+              let m := Meanings.collapse (Lowering.Tables.unmark terms [] r)
               if tables.hasMarker m then none else some (v, m)
             | _ => none
           given := given.push (symbols, match source with
@@ -421,8 +427,10 @@ def check (certificate : Sexp) : Check Checked := do
       if !named[i]! then fail s!"assert {i}, {text clauses[i]!}, is the clause of no rule and no assumption"
 
     -- the proof refutes the script, where its definitions name terms: each of its assumptions is
-    -- an assert of the script as it is, up to how cvc5 prints testers
-    let asserted : Std.HashSet String := Std.HashSet.ofList (clauses.toList.map fun clause => text (testers clause))
+    -- an assert of the script as it is, up to how cvc5 prints testers, and where the solver may
+    -- have inlined the bindings of both
+    let asserted : Std.HashSet String := Std.HashSet.ofList (clauses.toList.flatMap fun clause =>
+      [text (testers clause), text (testers (inlined clause))])
     let mut definitions : Std.HashMap String Sexp := {}
     for step in cpc do
       match step with
@@ -430,7 +438,7 @@ def check (certificate : Sexp) : Check Checked := do
         definitions := definitions.insert name (substitute definitions [] term)
       | .expr [.atom "assume", _, formula] =>
         let assumed := substitute definitions [] formula
-        if !asserted.contains (text (testers assumed)) then
+        if !asserted.contains (text (testers assumed)) && !asserted.contains (text (testers (inlined assumed))) then
           fail s!"the proof assumes {text assumed}, which the script doesn't assert"
       | _ => pure ()
 

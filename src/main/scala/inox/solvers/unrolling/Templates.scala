@@ -305,8 +305,10 @@ trait Templates
     * the decomposition of each free collection with all the free collections of its type. */
   private[unrolling] val decompositionKeys: MutableSet[Expr] = MutableSet.empty
 
-  /** Represents an equality relation between two instances of a given type */
-  case class Equality(tpe: Type, e1: Encoded, e2: Encoded) extends Item {
+  /** Represents an equality relation between two instances of a given type. The clauses of the
+    * template that has a `defined` equality say what it is of its terms, and it is not unfolded
+    * (see the case of [[Equals]] in [[mkExprClauses]]). */
+  case class Equality(tpe: Type, e1: Encoded, e2: Encoded, defined: Boolean = false) extends Item {
     override def toString: String =
       s"${asString(e1)} == ${asString(e2)} (of type ${tpe.asString})"
 
@@ -419,7 +421,8 @@ trait Templates
     * [[TemplateGenerator.sourceExpr]]). It is the function with its body when replacing the
     * named subterms doesn't give the template's term for the body. */
   private[unrolling] def templateSource(clauses: TemplateClauses, bindings: Map[Variable, Encoded], call: Option[Expr], expr: Expr,
-                                        meanings: Seq[(Expr, Expr)] = Seq(), definition: Boolean = false): Option[Source] =
+                                        meanings: Seq[(Expr, Expr)] = Seq(), definition: Boolean = false,
+                                        original: Option[(Expr, Seq[(String, Expr)])] = None): Option[Source] =
     if (!loggingRules) None else {
       import certificates.Source._
       val encoder = mkEncoder(bindings)
@@ -428,7 +431,11 @@ trait Templates
       val where = (clauses.meanings ++ meanings).map((l, r) => enc(l) -> enc(r)).distinct
       lazy val names = differences(expr, source(expr)).distinct
       Some(call match {
-        case None => Expression(enc(expr), where)
+        case None => Expression(enc(expr), where, original.filter(_._1 != expr).map { (o, steps) =>
+          val allNames = nestedDifferences(expr, source(expr)).distinct
+          certificates.Source.Original(encoder(o), allNames.map((sub, name) => encoder(name) -> encoder(sub)),
+            steps.map((rule, term) => rule -> encoder(term)))
+        })
         case Some(c) if definition && names.map(_._1).distinct.size == names.size && renamed(expr, names.toMap) == source(expr) =>
           Definition(enc(c), names.map((original, name) => encoder(name) -> encoder(original)), where)
         case Some(c) => Function(enc(c), enc(expr), where)
@@ -443,6 +450,29 @@ trait Templates
     case (Operator(bs, _), Operator(ss, recons)) if body.getClass == source.getClass && bs.size == ss.size && recons(bs) == body =>
       (bs zip ss).flatMap(differences(_, _))
     case _ => Seq(body -> source)
+  }
+
+  /** The [[differences]] of `body` and `source`, and those of the named subterms with what their
+    * names hold of them: the body of a quantifier that the source assumes, the arguments of an
+    * uninterpreted call that the source applies its free function to, and the fields of a
+    * construction that the source assumes the invariant of. */
+  private def nestedDifferences(body: Expr, source: Expr): Seq[(Expr, Expr)] = {
+    def assumed(s: Expr): Expr = s match {
+      case Assume(_, b) => assumed(b)
+      case _ => s
+    }
+    differences(body, source).flatMap { case (b, s) =>
+      val inner = (b, s) match {
+        case (_, Assume(q, BooleanLiteral(true))) => nestedDifferences(b, q).filter(_ != (b -> q))
+        case (UninterpretedCall(_, _, args, _), _: Assume) => assumed(s) match {
+          case Application(_, as) if as.size == args.size => (args zip as).flatMap(nestedDifferences(_, _))
+          case _ => Seq.empty
+        }
+        case (_: ADT, _: Assume) => nestedDifferences(b, assumed(s)).filter(_ != (b -> assumed(s)))
+        case _ => Seq.empty
+      }
+      (b -> s) +: inner
+    }
   }
 
   /** `body` where each outermost subterm that `names` names is its name. */
@@ -873,7 +903,8 @@ trait Templates
       optApp: Option[(Encoded, FunctionType)] = None,
       partial: Boolean = false,
       source: Option[(Option[Expr], Expr)] = None,
-      definition: Boolean = false
+      definition: Boolean = false,
+      original: Option[(Expr, Seq[(String, Expr)])] = None
     ): (TemplateContents, () => String) = {
 
       val encoding = Template.encode(
@@ -890,7 +921,7 @@ trait Templates
           val sameLambdas = tmplClauses.lambdas.groupBy(_.lambda).values.toSeq.flatMap { ts =>
             ts.init.filter(_.ids._1 != ts.last.ids._1).map(t => (t.ids._1: Expr) -> (ts.last.ids._1: Expr))
           }
-          templateSource(tmplClauses, symbols(pathVar, arguments, tmplClauses, substMap), call, expr, sameLambdas, definition)
+          templateSource(tmplClauses, symbols(pathVar, arguments, tmplClauses, substMap), call, expr, sameLambdas, definition, original)
         }
       )
 
@@ -1080,21 +1111,21 @@ trait Templates
   }
 
   /** The clauses of the expression that `gen` gives, with the expression that they are the
-    * clauses of if it is the source of a template, under a fresh start blocker, which `root` gives
-    * the clauses of. */
+    * clauses of if it is the source of a template, and the expression before the solver
+    * simplified it if it did, under a fresh start blocker, which `root` gives the clauses of. */
   private def instantiate(
     bindings: Map[Variable, Encoded],
-    gen: (Variable, Encoded) => (TemplateClauses, Option[Expr]),
+    gen: (Variable, Encoded) => (TemplateClauses, Option[Expr], Option[(Expr, Seq[(String, Expr)])]),
     exempt: App => Boolean = _ => false,
     root: Encoded => Clauses = Rule.Root(_).clauses
   ): Clauses = {
     val start = Variable.fresh("start", BooleanType(), true)
     val encodedStart = encodeSymbol(start)
 
-    val (tmplClauses, source) = gen(start, encodedStart)
+    val (tmplClauses, source, original) = gen(start, encodedStart)
 
     val (contents, _) = Template.contents(start -> encodedStart, bindings.toSeq, tmplClauses,
-      source = source.map(None -> _))
+      source = source.map(None -> _), original = original)
     val instance =
       Rule.Instance(contents.instantiation(encodedStart, Map.empty[Encoded, Arg]), InstanceOf.Expression(exempt)).clauses
     val allClauses = root(encodedStart) ++ instance
@@ -1113,7 +1144,7 @@ trait Templates
       declared += v -> bindings(v)
       instantiate(bindings, { (start, encodedStart) =>
         (mkClauses1(start, v.tpe, v, bindings + (start -> encodedStart))(using FreeGenerator),
-          Some(freeTyping(v.tpe, v)))
+          Some(freeTyping(v.tpe, v)), None)
       })
     }
   }
@@ -1170,15 +1201,93 @@ trait Templates
         (w, e) => Assume(freeTyping(w.tpe, w), e)
       }
 
-      (tpeClauses.foldLeft(tmplClauses)(_ ++ _), Some(source))
+      (tpeClauses.foldLeft(tmplClauses)(_ ++ _), Some(source), None)
     }, isWitnessApp, root)
 
     clauses ++ newFailureDefinitions()
   }
 
+  /** Instantiates the comparison of the bodies of the lambdas of `t1` and `t2`, which are both defined
+    * when `cond` holds, under a fresh literal that only the checks deciding their equality assume
+    * (see [[WitnessTemplates.lambdaComparison]]). Returns the literal and the arguments on which the
+    * bodies are compared.
+    *
+    * The bodies are instantiated on fresh arguments `ws`, as the bodies of fresh functions `c1` and
+    * `c2` rather than of the lambdas themselves: the query may make the lambdas equal, and their
+    * applications on `ws` would then be equal as well, whatever their bodies. Under the literal, `cond`
+    * holds, the arguments lie in their types, and the bodies differ on them: exactly one of them
+    * fails, or neither does and their results differ. So if a check that assumes the literal is
+    * unsatisfiable, the bodies agree on every input wherever `cond` holds. Like the other
+    * hypotheses, the clauses hold when the literal is false. */
+  def instantiateComparison(cond: Encoded, t1: LambdaTemplate, t2: LambdaTemplate): (Encoded, Seq[Encoded], Clauses) = {
+    val tpe = t1.tpe
+    val literal = encodeSymbol(Variable.fresh("b_cmp", BooleanType(), true))
+    val ws = tpe.from.map(tp => Variable.fresh("w", tp, true))
+    val wsT = ws.map(encodeSymbol)
+    val partial = modes.partialFunctions
+
+    def body(t: LambdaTemplate): (Encoded, Option[Encoded], Clauses) = {
+      val copy = encodeSymbol(Variable.fresh("body", tpe, true))
+      val template = t.substitute(mkSubstituter(Map(t.ids._2 -> copy)), Map.empty)
+      val failure = if (partial) Some(encodeSymbol(Variable.fresh("fails", BooleanType(), true))) else None
+      (mkApp(copy, tpe, wsT), failure, Rule.Unfold(template, literal, wsT.map(Left(_)), failure).clauses)
+    }
+    val (res1, fail1, clauses1) = body(t1)
+    val (res2, fail2, clauses2) = body(t2)
+
+    val differ = mkNot(mkEquals(res1, res2))
+    val distinguished = (fail1, fail2) match {
+      case (Some(e1), Some(e2)) => mkOr(mkNot(mkEquals(e1, e2)), mkAnd(mkNot(e1), mkNot(e2), differ))
+      case _ => differ
+    }
+
+    val bindings = (ws zip wsT).toMap
+    val typing = instantiate(bindings, { (start, encodedStart) =>
+      val substMap = bindings + (start -> encodedStart)
+      val tpeClauses = ws.map { w =>
+        declared += w -> bindings(w)
+        mkClauses1(start, w.tpe, w, substMap)(using FreeGenerator)
+      }
+      val source = ws.foldRight(BooleanLiteral(true): Expr)((w, e) => Assume(freeTyping(w.tpe, w), e))
+      (tpeClauses.foldLeft(mkClauses0(start, BooleanLiteral(true), substMap))(_ ++ _), Some(source), None)
+    }, root = Rule.Define(None, _, literal).clauses)
+
+    val clauses = Rule.Hypothesis(literal, trueT, mkAnd(cond, distinguished)).clauses ++
+      clauses1 ++ clauses2 ++ typing ++ newFailureDefinitions()
+    for (cl <- clauses) reporter.debug("  . " + cl)
+    (literal, wsT, clauses)
+  }
+
+  /** Instantiates the applications of the functions `f1` and `f2` of type `tpe` to the values `args`
+    * where `cond` holds, so that `f1` and `f2` can only be equal if they agree on `args`: equal
+    * functions have the same applications, which the bodies of lambdas then define. The applications
+    * may fail. The free variables of `args` stand for the encoded `terms`, which are already typed. */
+  def instantiateProbe(cond: Encoded, tpe: FunctionType, f1: Encoded, f2: Encoded, args: Seq[Expr],
+      terms: Map[Variable, Encoded]): Clauses = {
+    val v1 = Variable.fresh("f", tpe, true)
+    val v2 = Variable.fresh("g", tpe, true)
+    val agree = Variable.fresh("agree", BooleanType(), true)
+    val bindings = terms ++ Map(v1 -> f1, v2 -> f2, agree -> encodeSymbol(agree))
+    // the compared functions have already been typed where they were registered, and so have the terms
+    declared += v1 -> f1
+    declared += v2 -> f2
+    for ((v, e) <- terms) declared += v -> e
+
+    val partial = modes.partialFunctions
+    def isProbeApp(app: App): Boolean = partial && (app.caller == f1 || app.caller == f2) && app.tpe == tpe
+
+    val expr = Equals(agree, Equals(Application(v1, args), Application(v2, args)))
+    instantiate(bindings, { (start, encodedStart) =>
+      (mkClauses0(start, expr, bindings + (start -> encodedStart)), Some(expr), None)
+    }, isProbeApp, Rule.Define(None, _, cond).clauses) ++ newFailureDefinitions()
+  }
+
   protected def instantiateExpr(expr: Expr, bindings: Map[Variable, Encoded]): Clauses = {
     instantiate(bindings, { (start, encodedStart) =>
-      val instExpr = timers.solvers.simplify.run { simplifyFormula(expr) }
+      // with the steps of the simplification, when certificates need them
+      val (instExpr, steps) = timers.solvers.simplify.run {
+        if (loggingRules) simplifyFormulaRecorded(expr) else (simplifyFormula(expr), Seq())
+      }
 
       val tmplClauses = mkClauses0(start, instExpr, bindings + (start -> encodedStart), polarity = Some(true))
       val typed = bindings.filterNot(declared `contains` _).toSeq
@@ -1187,9 +1296,11 @@ trait Templates
         mkClauses1(start, v.tpe, v, bindings + (start -> encodedStart))(using FreeGenerator)
       }
       // the formula holds of values that lie in their types
-      val source = typed.foldRight(instExpr) { case ((v, _), e) => Assume(freeTyping(v.tpe, v), e) }
+      def typedExpr(e: Expr) = typed.foldRight(e) { case ((v, _), e) => Assume(freeTyping(v.tpe, v), e) }
 
-      (tpeClauses.foldLeft(tmplClauses)(_ ++ _), Some(source))
+      // with the formula before it was simplified, which certificates relate it to
+      (tpeClauses.foldLeft(tmplClauses)(_ ++ _), Some(typedExpr(instExpr)),
+        Some(typedExpr(expr) -> steps.map((rule, term) => rule -> typedExpr(term))))
     })
   }
 }
