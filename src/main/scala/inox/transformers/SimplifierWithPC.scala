@@ -78,7 +78,10 @@ trait SimplifierWithPC extends Transformer { self =>
     case None =>
       pureCache += id -> Checking
       val fndef = getFunction(id)
+      // A call of a function with a refined return type says that its result satisfies the
+      // refinement, like an assumption in the body would, so it is kept even when its result is unused.
       val p = fndef.params.forall(vd => hasInstance(vd.tpe) == Some(true)) &&
+        !typeOps.exists { case _: RefinementType => true case _ => false }(fndef.returnType) &&
         isPure(fndef.fullBody, initEnv.withBounds(fndef.params))
       pureCache += id -> (if (p) Pure else Impure)
       p

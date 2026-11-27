@@ -25,10 +25,14 @@ trait FunctionTemplates { self: Templates =>
   private object functionCaches {
     /** The template of each function. */
     val templates: MutableMap[TypedFunDef, FunctionTemplate] = MutableMap.empty
+    /** The template of the return typing of each function (see [[returnTemplate]]). */
+    val returns: MutableMap[TypedFunDef, FunctionTemplate] = MutableMap.empty
     /** The body of each function that certificates define it with (see [[definitionBody]]). */
     val bodies: MutableMap[Identifier, Expr] = MutableMap.empty
     /** The steps of the simplification of each of the [[bodies]] (see [[definitionSteps]]). */
     val steps: MutableMap[Identifier, Seq[(String, Expr)]] = MutableMap.empty
+    /** The return type of each function, with simplified refinements (see [[returnType]]). */
+    val returnTypes: MutableMap[TypedFunDef, Type] = MutableMap.empty
     /** The template of the interpretation of each uninterpreted function (see [[InterpretedTemplate]]). */
     val interpreted: MutableMap[Interpreted, FunctionTemplate] = MutableMap.empty
     /** The rank function of each function, and its encoding (see [[rankClauses]]). */
@@ -75,6 +79,24 @@ trait FunctionTemplates { self: Templates =>
     functionCaches.steps(id).map((rule, body) => rule -> encoder(body))
   }
 
+  /** The return type of `tfd` that calls are typed by, whose refinements are simplified like its
+    * body (see [[FunctionTemplate.apply]]). The lambdas they define then have the structure of
+    * those of simplified bodies and formulas, so that they are equal to them in the solver (see
+    * [[LambdaTemplates]]): a postcondition that applies a lambda to a pattern's binder, for example,
+    * would otherwise keep the binding that the simplifier inlines elsewhere. */
+  private def returnType(tfd: TypedFunDef): Type = if (loggingRules) tfd.returnType else
+    functionCaches.returnTypes.getOrElseUpdate(tfd, {
+      def simplify(tpe: Type): Type = tpe match {
+        case RefinementType(vd, pred) =>
+          val base = simplify(vd.tpe)
+          val nvd = if (base == vd.tpe) vd else vd.copy(tpe = base)
+          val npred = if (nvd == vd) pred else exprOps.replaceFromSymbols(Map(vd -> nvd.toVariable), pred)
+          RefinementType(nvd, timers.solvers.simplify.run { simplifyFormula(npred) }).copiedFrom(tpe)
+        case _ => tpe
+      }
+      simplify(tfd.returnType)
+    })
+
   /** The definition of the function `id` in the solver's terms (see [[definitionBody]]). */
   def definition(id: Identifier): Encoded = mkEncoder(Map.empty)(definitionBody(id))
 
@@ -110,8 +132,10 @@ trait FunctionTemplates { self: Templates =>
         val clauses = bodyClauses + (start -> Equals(call, p))
 
         // Register the function's return as a contract typing to enable
-        // induction with refinement types
-        if (ContractUnrolling `unroll` tfd.returnType) {
+        // induction with refinement types. Under `optAssumeChecked`, calls are typed when they are
+        // registered rather than unfolded (see [[returnTemplate]]).
+        if (returnTyped(tfd)) clauses
+        else if (ContractUnrolling `unroll` tfd.returnType) {
           // The return type only holds for arguments that lie in the parameter types, so
           // it is assumed only once the arguments' membership in these types is shown.
           // Under `optAssumeChecked`, the front-end has checked the arguments of every call, so
@@ -125,15 +149,15 @@ trait FunctionTemplates { self: Templates =>
             }
 
           val allClauses = clauses ++ domClauses
-          val closures = typeOps.variablesOf(tfd.returnType).toSeq.sortBy(_.id).map(v => Left(substMap(v)))
+          val closures = typeOps.variablesOf(returnType(tfd)).toSeq.sortBy(_.id).map(v => Left(substMap(v)))
           val call = mkCall(tfd, arguments.map(_._2))
           if (domains.isEmpty) {
-            val typing = Typing(tfd.returnType, call, Constraint(trueT, closures, false))
+            val typing = Typing(returnType(tfd), call, Constraint(trueT, closures, false))
             allClauses.copy(types = allClauses.types `merge` Map(pathVar._2 -> Set(typing)))
           } else {
             val result = Variable.fresh("result", BooleanType(), true)
             val resultT = encodeSymbol(result)
-            val typing = Typing(tfd.returnType, call, Constraint(resultT, closures, false))
+            val typing = Typing(returnType(tfd), call, Constraint(resultT, closures, false))
             allClauses.copy(
               exprVars = allClauses.exprVars + (result -> resultT),
               guardedExprs = allClauses.guardedExprs `merge` (start -> Implies(andJoin(domains), result)),
@@ -257,10 +281,63 @@ trait FunctionTemplates { self: Templates =>
     override def toString : String = str
   }
 
+  /** The value of each argument of a call of `tfd`, when it is ground. */
+  private def groundArguments(tfd: TypedFunDef, args: Seq[Arg]): Seq[Option[Expr]] =
+    (args zip tfd.params).map { p =>
+      decodePartial(p._1.encoded, p._2.getType)
+        .map(e => exprOps.postMap {
+          case IsTyped(v: Variable, ft: FunctionType) =>
+            lambdaTemplates.find(_.ids._1 == v).map(_.lambda)
+          case _ => None
+        } (e))
+        .filter(exprOps.variablesOf(_).isEmpty)
+    }
+
   def instantiateCall(blocker: Encoded, fi: Call): Clauses = {
     state.update(s => s.copy(calls = s.calls.register(blocker, nextGeneration(currentGeneration), Set(fi))))
-    Seq.empty
+    fi.callee match {
+      // A ground call is evaluated when it is unfolded (see [[unroll]]), so typing it would only add
+      // the calls of its return type, which are ground too.
+      case Defined(tfd) if returnTyped(tfd) && !groundArguments(tfd, fi.args).forall(_.isDefined) =>
+        val (rBlocker, clauses) = state.get.typedCalls.get(fi) match {
+          case Some(rBlocker) => (rBlocker, Seq.empty)
+          case None =>
+            val rBlocker = encodeSymbol(Variable.fresh("r", BooleanType(), true))
+            state.update(s => s.copy(typedCalls = s.typedCalls.updated(fi, rBlocker)))
+            (rBlocker, Rule.Unfold(returnTemplate(tfd), rBlocker, fi.args ++ fi.tpSubst, None).clauses)
+        }
+        registerImplication(blocker, rBlocker)
+        clauses ++ enables(blocker, rBlocker)
+      case _ => Seq.empty
+    }
   }
+
+  /** Whether the calls of `tfd` are typed by its return type when they are registered.
+    *
+    * The result of a call lies in the return type of its function, whether or not the call is
+    * unfolded, as long as its arguments lie in the parameter types. Under `optAssumeChecked`, the
+    * front-end has checked that they do, so a call is typed as soon as it is met: the VCs that only
+    * need the return types of the calls they make, such as the postconditions that a front-end
+    * encodes as refinements of the return types, then need no unfolding of their bodies. The
+    * certificates of the solver's answers type calls in their bodies (see [[loggingRules]]). */
+  private def returnTyped(tfd: TypedFunDef): Boolean =
+    modes.assumeChecked && !loggingRules && (ContractUnrolling `unroll` tfd.returnType)
+
+  /** The template that types a call of `tfd` by its return type (see [[returnTyped]]). */
+  private def returnTemplate(tfd: TypedFunDef): FunctionTemplate = functionCaches.returns.getOrElseUpdate(tfd, {
+    val tpVars = tfd.tps.flatMap(variableSeq).distinct
+    val fdArgs: Seq[Variable] = tfd.params.map(_.toVariable)
+    val start = Variable.fresh("rstart", BooleanType(), true)
+    val pathVar = start -> encodeSymbol(start)
+    val arguments = (fdArgs ++ tpVars).map(v => v -> encodeSymbol(v))
+    val substMap = arguments.toMap + pathVar
+
+    val closures = typeOps.variablesOf(returnType(tfd)).toSeq.sortBy(_.id).map(v => Left(substMap(v)))
+    val typing = Typing(returnType(tfd), mkCall(tfd, arguments.map(_._2)), Constraint(trueT, closures, false))
+    val (contents, str) = Template.contents(pathVar, arguments, TemplateClauses(types = Map(pathVar._2 -> Set(typing))),
+      optCall = Some(Defined(tfd)))
+    new FunctionTemplate(contents, () => "Return typing of " + tfd.signature + " is :\n" + str())
+  })
 
   def getCalls: Seq[(Encoded, Call)] = state.get.defBlockers.toList.map(p => p._2 -> p._1)
 
@@ -375,17 +452,19 @@ trait FunctionTemplates { self: Templates =>
     * @param calls the calls that each blocker guards, which are unfolded with it
     * @param defBlockers the definition blocker of each unfolded call, under which its body is
     *                    instantiated, in the order in which the calls were unfolded
+    * @param typedCalls the blocker under which each call is typed by its return type (see [[returnTyped]])
     * @param constrained the types whose equality symbol is constrained (see [[constrainEquality]])
     * @param congruent the pairs of calls whose congruence was built (see [[modelCongruences]]), the
     *                  call that was unfolded first coming first */
   private[unrolling] case class FunctionsState(
     calls: Pending[Encoded, Call],
     defBlockers: VectorMap[Call, Encoded],
+    typedCalls: VectorMap[Call, Encoded],
     constrained: Set[Type],
     congruent: Set[(Call, Call)])
 
   private[unrolling] object functionsManager extends Manager {
-    private[FunctionTemplates] val state = new Snapshots(FunctionsState(Pending.empty, VectorMap.empty, Set.empty, Set.empty))
+    private[FunctionTemplates] val state = new Snapshots(FunctionsState(Pending.empty, VectorMap.empty, VectorMap.empty, Set.empty, Set.empty))
 
     private lazy val evaluator = semantics.getEvaluator(using context.withOpts(evaluators.optEvalQuantifiers(false)))
 
@@ -436,15 +515,7 @@ trait FunctionTemplates { self: Templates =>
                 // Ground calls are evaluated rather than unfolded, and unfolded when evaluation fails. A call is
                 // blocked if a ground argument that runs no functions gets stuck (e.g. `nil.tail`).
                 val (inlining, skip) = context.timers.solvers.`eval-call`.run {
-                  val groundArgs = (args zip tfd.params).map { p =>
-                    decodePartial(p._1.encoded, p._2.getType)
-                      .map(e => exprOps.postMap {
-                        case IsTyped(v: Variable, ft: FunctionType) =>
-                          lambdaTemplates.find(_.ids._1 == v).map(_.lambda)
-                        case _ => None
-                      } (e))
-                      .filter(exprOps.variablesOf(_).isEmpty)
-                  }
+                  val groundArgs = groundArguments(tfd, args)
 
                   val groundCall =
                     if (groundArgs.forall(_.isDefined)) Some(tfd.applied(groundArgs.map(_.get)))
@@ -476,6 +547,13 @@ trait FunctionTemplates { self: Templates =>
                     case None => Rule.Unfold(FunctionTemplate(tfd), defBlocker, args ++ tpSubst, Some(callFailure(call)))
                   }
                 newCls ++= rule.clauses
+
+                // A ground call that wasn't typed when it was registered (see [[instantiateCall]]) and
+                // whose evaluation failed is typed with its unfolding.
+                if (inlining.flatMap(_.result).isEmpty && !skip && returnTyped(tfd) && !state.get.typedCalls.contains(call)) {
+                  state.update(s => s.copy(typedCalls = s.typedCalls.updated(call, defBlocker)))
+                  newCls ++= Rule.Unfold(returnTemplate(tfd), defBlocker, args ++ tpSubst, None).clauses
+                }
             }
 
             defBlocker

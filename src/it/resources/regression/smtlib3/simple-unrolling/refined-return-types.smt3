@@ -1,0 +1,24 @@
+; The refinement of the return type of a function says what a postcondition in its body would: a
+; call is typed by it when it is registered, under assume-checked, and its facts are kept even when
+; its result is unused.
+(set-option :assume-checked true)
+(set-option :timeout 10)
+(define-fun-rec depth ((x Int)) Int (ite (<= x 0) 0 (+ 1 (depth (- x 1)))))
+(define-fun-rec lemma ((x Int)) (! Bool :var r :restrict (>= (depth x) 0))
+  (ite (<= x 0) true (lemma (- x 1))))
+(declare-const c Int)
+
+; the result of the call is unused, which doesn't drop it
+(push 1)
+(assert (not (let ((u (lemma c))) (>= (depth c) 0))))
+(set-info :status unsat)
+(check-sat)
+(pop 1)
+
+; the call is typed without unfolding its body
+(push 1)
+(assert (lemma c))
+(assert (not (>= (depth c) 0)))
+(set-info :status unsat)
+(check-sat)
+(pop 1)

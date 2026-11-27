@@ -346,6 +346,12 @@ trait TypeTemplates { self: Templates =>
       case _ if typing.instantiator.isInstanceOf[Collection] => instantiateTyping(blocker, typing)
       case (_: TypeParameter) => instantiateTyping(blocker, typing)
       case adt: ADTType if !adt.getSort.definition.isInductive => instantiateTyping(blocker, typing)
+      // as are the refinements of such types that make no calls, such as the postconditions that
+      // refine the return types of functions (see [[FunctionTemplates.returnTyped]])
+      case RefinementType(vd, prop) if !(ContractUnrolling `unroll` vd.tpe) && !exprOps.exists {
+        case _: FunctionInvocation | _: Application => true
+        case _ => false
+      } (prop) => instantiateTyping(blocker, typing)
 
       // In the default case, we simply register the typing for unrolling at
       // a later generation.
