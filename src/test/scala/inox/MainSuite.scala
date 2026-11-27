@@ -68,7 +68,7 @@ class MainSuite extends AnyFunSuite {
   }
 
   test("get-proof prints the certificate of a proved query") {
-    assert(cvc5Proof.startsWith("(inox-certificate 4\n(script\n") && cvc5Proof.contains("\n(cpc\n"), cvc5Proof)
+    assert(cvc5Proof.startsWith("(inox-certificate 6\n(script\n") && cvc5Proof.contains("\n(cpc\n"), cvc5Proof)
   }
 
   test("get-proof says why the solver gives no certificate") {
@@ -84,7 +84,7 @@ class MainSuite extends AnyFunSuite {
   test("get-proof prints the certificate of a portfolio with a solver that proves the query") {
     cvc5Proof
     val proof = proofOf("princess,smt-cvc5")
-    assert(proof.startsWith("(inox-certificate 4\n(script\n") && proof.contains("\n(cpc\n"), proof)
+    assert(proof.startsWith("(inox-certificate 6\n(script\n") && proof.contains("\n(cpc\n"), proof)
   }
 
   test("Satisfiable files are reported with their model") {
@@ -192,6 +192,17 @@ class MainSuite extends AnyFunSuite {
     assert(optFormat.parser("binary") == Some(Binary(None)))
     assert(optFormat.parser("binary:check") == Some(Binary(Some("check"))))
     assert(optFormat.parser("xml").isEmpty)
+  }
+
+  test("The options that a script sets apply to the queries after them") {
+    // functions can only be compared under the option, and the solver doesn't know SMT-LIB's
+    val script = "(set-option :produce-models true)\n(assert (= 1 2))\n(check-sat)\n" +
+      "(set-option :function-equality extensional)\n(assert (= (lambda ((x Int)) x) (lambda ((x Int)) (+ x 0))))\n(check-sat)\n"
+    withFiles(script) { case Seq(file) =>
+      val main = new TestMain
+      assert(!main.exitCode("--solvers=princess", "--timeout=30", "--format=smtlib3", file), main.output)
+      assert(main.output.split(s"$file => UNSAT", -1).size == 3, main.output)
+    }
   }
 
   test("SMT-LIB 3 inputs are read with --format=smtlib3 or from .smt3 files") {

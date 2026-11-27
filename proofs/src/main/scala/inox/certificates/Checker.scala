@@ -29,7 +29,7 @@ object Checker {
   private[certificates] def fail(msg: String): Nothing = throw new Failure(msg)
 
   /** The version of the certificates that the checker checks. */
-  val Version = "4"
+  val Version = "6"
 
   /** The s-expressions of `text`, whose atoms keep their text. */
   def parse(text: String): List[SExpr] = {
@@ -119,6 +119,38 @@ object Checker {
     case SList(Atom("or") :: es) => junction("and", True, False, es.map(negative))
     case SList(Atom("=>") :: es) if es.size >= 2 => junction("and", True, False, es.init.map(positive) :+ negative(es.last))
     case other => not(positive(other))
+  }
+
+  private val binders = Set("let", "forall", "exists", "lambda", "choose")
+
+  /** The names that the binders in `e` bind, and all the symbols of a `match`, whose patterns
+    * bind names. */
+  private def bound(e: SExpr): Set[String] = e match {
+    case SList(Atom("match") :: _) => symbols(e)
+    case SList(List(Atom(k), SList(decls), body)) if binders(k) =>
+      decls.collect { case SList(Atom(x) :: _) => x }.toSet ++ decls.flatMap(bound) ++ bound(body)
+    case SList(items) => items.flatMap(bound).toSet
+    case _ => Set()
+  }
+  /** The symbols of `e`. */
+  private def symbols(e: SExpr): Set[String] = e match {
+    case Atom(x) => Set(x)
+    case SList(items) => items.flatMap(symbols).toSet
+  }
+
+  /** `e` with each `let` replaced by its body with the terms of its bindings for its variables,
+    * as in SMT-LIB, where terms always have a value. A `let` whose body binds a name of a symbol of
+    * its terms, which the substitution would capture, or one of its own variables, stays. */
+  def inlined(e: SExpr): SExpr = e match {
+    case SList(List(Atom("let"), SList(bindings), body)) =>
+      val pairs = bindings.collect { case SList(List(Atom(x), v)) => x -> inlined(v) }
+      val inner = inlined(body)
+      val names = pairs.map(_._1).toSet
+      if (pairs.size != bindings.size || (bound(inner) & (names ++ pairs.flatMap((_, v) => symbols(v)))).nonEmpty)
+        SList(List(Atom("let"), SList(pairs.map((x, v) => SList(List(Atom(x), v)))), inner))
+      else substitute(inner, pairs.map((x, v) => (Atom(x): SExpr) -> v).toMap)
+    case SList(items) => SList(items.map(inlined))
+    case atom => atom
   }
 
   private def substitute(e: SExpr, subst: Map[SExpr, SExpr]): SExpr = subst.getOrElse(e, e match {
@@ -254,7 +286,11 @@ object Checker {
 
   /** What a certificate has, once checked. */
   final case class Checked(asserts: Int, rules: Int, instances: Int, assumptions: Int, cpc: List[SExpr],
-                           templates: Int = 0)
+                           templates: Int = 0, unexplained: List[String] = Nil) {
+    /** Whether the certificate is over the program and the query that the solver was given: whether
+      * the steps of all of its simplifications are given (and they then hold). */
+    def original: Boolean = unexplained.isEmpty
+  }
 
   /** Checks `certificate`, and fails with a [[Failure]] that says why when it doesn't hold. */
   def check(certificate: SExpr): Checked = certificate match {
@@ -266,9 +302,14 @@ object Checker {
       SList(Atom("solver-symbols") :: solverSymbols),
       SList(Atom("source-definitions") :: sourceDefinitions),
       SList(Atom("source-symbols") :: sourceSymbols),
+      SList(Atom("simplifications") :: simplifications),
+      SList(Atom("input") :: input),
       SList(Atom("cpc") :: cpc))) =>
 
       if (version != Version) fail(s"the certificate has version $version, and the checker checks version $Version")
+
+      // the constraints of the input are encoded as the certificate states
+      Encoders.check(input, sourceDefinitions, sourceSymbols, simplifications)
 
       val clauses = asserts(script)
       val templateClauses = asserts(templateScript)
@@ -281,6 +322,12 @@ object Checker {
           catch { case r: Lowering.Refused => fail(s"the source of template $n can't be lowered: ${r.why}") }
         case (_, n) => fail(s"template $n has no source")
       }.toVector
+
+      // the simplifications rewrite the program and the expressions that the solver was given
+      // into the source definitions and the expressions of the sources
+      val unexplained = Simplifications.check(simplifications, sourceDefinitions, i => templateLines.lift(i).collect {
+        case SList(_ :: _ :: Sources.Source(Sources.Expression(e, _)) :: _) => e
+      })
 
       // the functions are those that the scripts declare, and those that templates define
       val declared = Sources.Signature(script ++ templateScript)
@@ -388,18 +435,19 @@ object Checker {
 
       // the proof refutes the script, where its definitions name terms
       val asserted = clauses.toSet
-      val normalAsserted = asserted.map(normal)
+      // the solver may inline the bindings of a term that it asserts
+      val normalAsserted = asserted.map(normal) ++ asserted.map(a => normal(inlined(a)))
       var definitions = Map[SExpr, SExpr]()
       for (step <- cpc) step match {
         case SList(List(Atom("define"), name: Atom, SList(Nil), term)) =>
           definitions += name -> substitute(term, definitions)
         case SList(List(Atom("assume"), _, formula)) =>
           val assumed = substitute(formula, definitions)
-          if (!asserted(assumed) && !normalAsserted(normal(assumed))) fail(s"the proof assumes $assumed, which the script doesn't assert")
+          if (!asserted(assumed) && !normalAsserted(normal(assumed)) && !normalAsserted(normal(inlined(assumed)))) fail(s"the proof assumes $assumed, which the script doesn't assert")
         case _ =>
       }
 
-      Checked(clauses.size, ruleLines.size, instances, queryIndices.size + completeIndices.size, cpc, templates.size)
+      Checked(clauses.size, ruleLines.size, instances, queryIndices.size + completeIndices.size, cpc, templates.size, unexplained)
 
     case SList(Atom("inox-certificate") :: Atom(version) :: _) if version != Version =>
       fail(s"the certificate has version $version, and the checker checks version $Version")
@@ -453,7 +501,8 @@ object Checker {
           try {
             val checked = check(certificate)
             println(s"ok   $file ${n + 1}: ${checked.asserts} asserts, ${checked.rules} rules, ${checked.instances} instances, " +
-              s"${checked.templates} templates")
+              s"${checked.templates} templates, " +
+              (if (checked.original) "over the original program" else s"over the simplified program (${checked.unexplained.head})"))
             for (dir <- cpcDir)
               Files.writeString(dir.resolve(s"${path.getFileName}.${n + 1}.cpc"), checked.cpc.map(_.toString + "\n").mkString)
           } catch {

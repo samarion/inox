@@ -123,14 +123,21 @@ trait CVC5Certificates extends CVC5Solver with SymbolRefs with certificates.Cert
     * It keeps the declarations and the definitions of functions that it prints, so that the
     * sources can be typed and the body of a function is printed once: it defines a function with
     * the body that the solver unfolds (see [[define]]). */
-  private class SourcePrinter(names: SymbolNames)
-    extends inox.smtlib3.Printer(program, context, java.io.Writer.nullWriter()) with SymbolRefs
+  private class SourcePrinter(names: SymbolNames, printed: InoxProgram = program, encode: Expr => Expr = identity)
+    extends inox.smtlib3.Printer(printed, context, java.io.Writer.nullWriter()) with SymbolRefs
       with certificates.Certificates.Printer[Expr] {
     import certificates.Ref
 
     def printTerms(es: Seq[Expr]): certificates.Certificates.Printed = CVC5Certificates.this.printTerms(es)
 
     override protected def symbolNames = names
+
+    // a proposition of the input is printed as a Boolean, as the encoder of propositions makes it
+    // (the session's program has none)
+    override protected def sortOf(t: Type)(using bindings: Map[Identifier, Term]): Sort = t match {
+      case PropType() => super.sortOf(BooleanType())
+      case _ => super.sortOf(t)
+    }
 
     /** `e` as the text of a term, where the variables that `bindings` binds are their terms. */
     def termText(e: Expr, bindings: Map[Identifier, Term]): String = {
@@ -173,7 +180,7 @@ trait CVC5Certificates extends CVC5Solver with SymbolRefs with certificates.Cert
     // selector or tester of a datatype with type parameters, the type arguments of a function,
     // the function type of an application, and the type of a tuple.
     override protected def toSMT(e: Expr)(using bindings: Map[Identifier, Term]): Term = {
-      import program.symbols.given
+      import printed.symbols.given
       keyedSMT(e)
     }
     private def keyedSMT(e: Expr)(using bindings: Map[Identifier, Term], symbols: Symbols): Term = e match {
@@ -192,6 +199,10 @@ trait CVC5Certificates extends CVC5Solver with SymbolRefs with certificates.Cert
       case Application(caller, args) =>
         Keyed(QualifiedIdentifier(SMTIdentifier(SSymbol("@"))), Seq(sortOf(caller.getType)), false, (caller +: args).map(toSMT))
       case Tuple(_) => keyed(super.toSMT(e), Seq(sortOf(e.getType)))
+      // the connectives are printed as they are, where the target drops their trivial operands:
+      // a step of a simplification is told by the term that it gives
+      case And(es) => FunctionApplication(QualifiedIdentifier(SMTIdentifier(SSymbol("and"))), es.map(toSMT))
+      case Or(es) => FunctionApplication(QualifiedIdentifier(SMTIdentifier(SSymbol("or"))), es.map(toSMT))
       case TupleSelect(t, _) => keyed(super.toSMT(e), Seq(sortOf(t.getType)))
       case _ => super.toSMT(e)
     }
@@ -208,10 +219,43 @@ trait CVC5Certificates extends CVC5Solver with SymbolRefs with certificates.Cert
         unrolling.TemplateGenerator.markers.map(id => id2sym(id).name -> Ref.Uninterpreted(id))
     }
 
-    // the body that each function is defined with (see `define`)
+    // the body that each function is defined with (see `define`), and the functions defined so far
     private var bodies: Option[Identifier => Expr] = None
+    private val defined = ListBuffer.empty[FunDef]
     override def define(body: Identifier => Expr): Unit = bodies = Some(body)
-    override protected def definitionBody(fd: FunDef): Expr = bodies.fold(fd.fullBody)(_(fd.id))
+    override protected def definitionBody(fd: FunDef): Expr = {
+      defined += fd
+      bodies.fold(fd.fullBody)(_(fd.id))
+    }
+
+    // the steps of the simplification of the body of each function (see `defineSteps`)
+    private var steps: Option[Identifier => Seq[(String, Expr)]] = None
+    override def defineSteps(steps: Identifier => Seq[(String, Expr)]): Unit = this.steps = Some(steps)
+
+    // the original bodies printed so far, and the steps of their simplifications, by function
+    private type Original = (certificates.SExpr, certificates.SExpr, Seq[(String, certificates.SExpr)])
+    private val printedOriginals = scala.collection.mutable.LinkedHashMap[Identifier, Original]()
+
+    override def originals: Seq[Original] = {
+      // printing an original body, or a body between two steps, may define the functions that it calls
+      while (defined.exists(fd => !printedOriginals.contains(fd.id))) {
+        for (fd <- defined.toList if !printedOriginals.contains(fd.id)) {
+          val (_, _, bindings) = signature(fd)
+          def print(e: Expr): certificates.SExpr = proofSExpr(declaring(termText(e, bindings))._1, sourceSymbols)
+          // without steps, the body that the function is defined with is one step from the original
+          val recorded = steps.fold(Seq("unrecorded" -> bodies.fold(fd.fullBody)(_(fd.id))))(_(fd.id))
+          printedOriginals(fd.id) = (proofSExpr(RecursivePrinter.toString(id2sym(fd.id)), sourceSymbols),
+            print(fd.fullBody), recorded.map((rule, body) => rule -> print(body)))
+        }
+      }
+      printedOriginals.values.toSeq
+    }
+
+    // the input is that of a program of the trees of the session's, which this printer names
+    // the identifiers of as it does those of the session's
+    override def input(program: Program, encode: Expr => Expr): Option[certificates.Certificates.Printer[Expr]] =
+      if (program.trees ne printed.trees) None
+      else Some(new SourcePrinter(names, program.asInstanceOf[InoxProgram], encode))
 
     // the declarations and definitions that printing made: those of datatypes, sorts and functions
     private val kept = ListBuffer.empty[SExpr]
@@ -220,7 +264,8 @@ trait CVC5Certificates extends CVC5Solver with SymbolRefs with certificates.Cert
       cmd match {
         case _: DefineFun | _: DefineFunRec | _: DefineFunPar | _: DefineFunRecPar | _: DefineFunsRec | _: DefineFunsRecPar |
              _: DeclareDatatypes | _: DeclareDatatypesPar | _: inox.smtlib3.Commands.DeclareDatatypesWithPars |
-             _: DeclareSort | _: DeclareFun | _: DeclareFunPar | _: DeclareConst | _: DeclareConstPar => kept += cmd
+             _: DeclareSort | _: DeclareFun | _: DeclareFunPar | _: DeclareConst | _: DeclareConstPar |
+             _: inox.tip.Commands.DatatypeInvariant | _: inox.tip.Commands.DatatypeInvariantPar => kept += cmd
         case _ =>
       }
       super.emit(cmd, rawOut)
@@ -231,10 +276,27 @@ trait CVC5Certificates extends CVC5Solver with SymbolRefs with certificates.Cert
       (es.map(termText(_, bindings)), sourceSymbols)
     }
 
-    def declarations: Seq[certificates.SExpr] = kept.toSeq.map { d =>
-      val writer = new java.io.StringWriter
-      printingContext(writer).output(d)
-      proofSExpr(writer.toString, sourceSymbols)
+    private val invariants = scala.collection.mutable.Set[Identifier]()
+
+    /** Declares the invariants of the sorts that are declared, which only a script declares
+      * otherwise, until none declares another sort. */
+    private def declareInvariants(): Unit = {
+      import program.symbols.given
+      val sorts = adtManager.types.collect { case adt: ADTType => adt.getSort.definition }
+        .toSeq.distinct.sortBy(_.id.globalId).filter(sort => sort.invariant.nonEmpty && invariants.add(sort.id))
+      if (sorts.nonEmpty) {
+        declaring(declareSortProperties(sorts))
+        declareInvariants()
+      }
+    }
+
+    def declarations: Seq[certificates.SExpr] = {
+      declareInvariants()
+      kept.toSeq.map { d =>
+        val writer = new java.io.StringWriter
+        printingContext(writer).output(d)
+        proofSExpr(writer.toString, sourceSymbols)
+      }
     }
 
     private val sorted = new certificates.Certificates.DistinctSorts[Type](_.asString(using PrinterOptions()))
@@ -261,7 +323,7 @@ trait CVC5Certificates extends CVC5Solver with SymbolRefs with certificates.Cert
 
     /** The variables `vs` bound to their symbols in the session, which the session declares. */
     private def sessionBindings(vs: Seq[Variable]): Map[Identifier, Term] = vs.map { v =>
-      val term = CVC5Certificates.this.toSMT(v)(using Map())
+      val term = CVC5Certificates.this.toSMT(encode(v))(using Map())
       term match {
         case QualifiedIdentifier(SMTIdentifier(s, Seq()), None) =>
           val ref = Ref.Variable(v)
