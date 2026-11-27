@@ -61,6 +61,8 @@ trait TemplateGenerator { self: Templates =>
     *                        clauses (see [[Source]])
     * @param bound           the symbols that the variables of lets are replaced with (see [[sourceExpr]])
     * @param abstracted      the expressions that sources name by what the clauses have of them (see [[sourceExpr]])
+    * @param facts           the constructor tests known to hold on the path of each condition variable,
+    *                        which the calls under it pass on to their callees (see [[Template.Call]])
     */
   protected case class TemplateClauses(
     condVars: Map[Variable, Encoded] = Map.empty,
@@ -75,7 +77,8 @@ trait TemplateGenerator { self: Templates =>
     definitions: Map[Variable, Seq[Expr]] = VectorMap.empty,
     meanings: Seq[(Expr, Expr)] = Seq.empty,
     bound: Map[Expr, Expr] = Map.empty,
-    abstracted: Map[Expr, Expr] = Map.empty
+    abstracted: Map[Expr, Expr] = Map.empty,
+    facts: Map[Variable, Set[Expr]] = Map.empty
   ) {
     def ++(that: TemplateClauses): TemplateClauses = TemplateClauses(
       condVars ++ that.condVars,
@@ -90,7 +93,8 @@ trait TemplateGenerator { self: Templates =>
       definitions `merge` that.definitions,
       meanings ++ that.meanings,
       bound ++ that.bound,
-      abstracted ++ that.abstracted
+      abstracted ++ that.abstracted,
+      facts ++ that.facts
     )
 
     def +(pair: (Variable, Expr)): TemplateClauses = copy(guardedExprs = guardedExprs `merge` pair)
@@ -611,12 +615,15 @@ trait TemplateGenerator { self: Templates =>
     // The symbols that the variables of lets are replaced with
     var bound = Map[Expr, Expr]()
 
+    // The constructor tests known on the path of each condition variable (see [[TemplateClauses]])
+    var pathTests = Map[Variable, Set[Expr]]()
+
     // The expressions that sources name by what the clauses have of them
     var abstracted = Map[Expr, Expr]()
 
     def result: TemplateClauses =
       TemplateClauses(condVars, exprVars, condTree, guardedExprs, equations, types, equalities, lambdas, quantifications,
-        definitions, meanings, bound, abstracted)
+        definitions, meanings, bound, abstracted, pathTests)
 
     def ++=(that: TemplateClauses): this.type = {
       condVars ++= that.condVars
@@ -632,6 +639,7 @@ trait TemplateGenerator { self: Templates =>
       meanings ++= that.meanings
       bound ++= that.bound
       abstracted ++= that.abstracted
+      pathTests ++= that.facts
       this
     }
   }
@@ -936,7 +944,13 @@ trait TemplateGenerator { self: Templates =>
     }
 
     val p = rec(pathVar, expr, polarity)
+    for ((v, fs) <- pathFacts; tests = fs.filter(isConstructorTest) if tests.nonEmpty) builder.pathTests += v -> tests
     (p, builder.result)
+  }
+
+  private def isConstructorTest(e: Expr): Boolean = e match {
+    case IsConstructor(_, _) | Not(IsConstructor(_, _)) => true
+    case _ => false
   }
 
   /** Whether the clauses of `expr` may falsify the path condition they are guarded by,

@@ -231,8 +231,12 @@ trait Templates
     def substitute(substituter: Encoded => Encoded, msubst: Map[Encoded, Matcher]): Item
   }
 
-  /** Represents a named function call in the unfolding procedure */
-  case class Call(callee: Callee, args: Seq[Arg], tpSubst: Seq[Arg]) extends Item {
+  /** Represents a named function call in the unfolding procedure.
+    *
+    * @param facts the constructor tests on the parameters of the callee that hold on the path of
+    *              the call, as `IsConstructor(param, id)` or its negation. The body of the callee is
+    *              unfolded without the branches that they rule out (see `FunctionTemplate.pruned`). */
+  case class Call(callee: Callee, args: Seq[Arg], tpSubst: Seq[Arg], facts: Set[Expr] = Set.empty) extends Item {
     override def toString: String = {
       def pArgs(args: Seq[Arg]): String = args.map {
         case Right(m) => m.toString
@@ -246,7 +250,8 @@ trait Templates
         case _ => pArgs(args)
       }
 
-      callee.signature + rec(callee.getType, args) + pArgs(tpSubst)
+      callee.signature + rec(callee.getType, args) + pArgs(tpSubst) +
+        (if (facts.isEmpty) "" else facts.map(_.asString).mkString(" [", ", ", "]"))
     }
 
     def substitute(substituter: Encoded => Encoded, msubst: Map[Encoded, Matcher]): Call = copy(
@@ -667,7 +672,8 @@ trait Templates
       expr: Expr,
       substMap: Map[Variable, Encoded] = Map.empty[Variable, Encoded],
       optCall: Option[(Callee, Seq[Arg])] = None,
-      optApp: Option[App] = None
+      optApp: Option[App] = None,
+      facts: Set[Expr] = Set.empty
     ): ExtractedCalls = {
       val encoder : Expr => Encoded = mkEncoder(substMap)
 
@@ -708,7 +714,14 @@ trait Templates
       val calls = exprOps.collectPreorder[Call] {
         case FunctionInvocation(id, tps, args) =>
           val tpVars = tps.flatMap(variableSeq).distinct
-          Seq(Call(Defined(getFunction(id, tps)), args.map(encodeArg), tpVars.map(encodeArg)))
+          val tfd = getFunction(id, tps)
+          // The tests on the arguments, restated on the parameters of the callee
+          val callFacts: Set[Expr] = if (facts.isEmpty) Set.empty else facts.flatMap {
+            case IsConstructor(e, cid) => args.indices.filter(args(_) == e).map(i => IsConstructor(tfd.params(i).toVariable, cid))
+            case Not(IsConstructor(e, cid)) => args.indices.filter(args(_) == e).map(i => Not(IsConstructor(tfd.params(i).toVariable, cid)))
+            case _ => Seq.empty
+          }
+          Seq(Call(Defined(tfd), args.map(encodeArg), tpVars.map(encodeArg), callFacts))
         // The applications of the free functions of interpreted uninterpreted functions unfold their
         // interpretations
         case Application(f: Variable, args) => interpretedFunctions.get(f) match {
@@ -716,7 +729,7 @@ trait Templates
           case None => Seq.empty
         }
         case _ => Seq.empty
-      } (expr).filter { case Call(callee, args, _) =>
+      } (expr).filter { case Call(callee, args, _, _) =>
         !optCall.exists(p => p._1 == callee && p._2 == args)
       }
 
@@ -812,7 +825,7 @@ trait Templates
         for ((b,es) <- guardedExprs `merge` definitions `merge` Map(pv -> eqs)) {
           var bItems : Set[Item] = ListSet.empty
           for (e <- es) {
-            val extracted = extractCalls(e, idToTrId, optIdCall, optIdApp)
+            val extracted = extractCalls(e, idToTrId, optIdCall, optIdApp, tmplClauses.facts.getOrElse(b, Set.empty))
             bItems ++= extracted.items
             pointers ++= extracted.pointers
           }

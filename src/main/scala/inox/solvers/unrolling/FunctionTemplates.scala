@@ -25,6 +25,11 @@ trait FunctionTemplates { self: Templates =>
   private object functionCaches {
     /** The template of each function. */
     val templates: MutableMap[TypedFunDef, FunctionTemplate] = MutableMap.empty
+    /** The clauses of the template of each function, and how the template is built from them, from
+      * which its pruned templates are built (see [[FunctionTemplate.pruned]]). */
+    val sources: MutableMap[TypedFunDef, (TemplateClauses, TemplateClauses => FunctionTemplate)] = MutableMap.empty
+    /** The template of each function without the branches that some facts rule out, if they rule out any. */
+    val pruned: MutableMap[(TypedFunDef, Set[Expr]), Option[FunctionTemplate]] = MutableMap.empty
     /** The body of each function that certificates define it with (see [[definitionBody]]). */
     val bodies: MutableMap[Identifier, Expr] = MutableMap.empty
     /** The template of the interpretation of each uninterpreted function (see [[InterpretedTemplate]]). */
@@ -130,21 +135,91 @@ trait FunctionTemplates { self: Templates =>
         }
       }
 
-      val (contents0, str) = Template.contents(
-        pathVar, arguments, tmplClauses, optCall = Some(Defined(tfd)), partial = true, source = Some((Some(call), body)),
-        definition = true)
-      val contents = contents0.copy(clauses = contents0.clauses ++ rankClauses(tfd, contents0, bodySites))
+      def build(tmplClauses: TemplateClauses): FunctionTemplate = {
+        val (contents0, str) = Template.contents(
+          pathVar, arguments, tmplClauses, optCall = Some(Defined(tfd)), partial = true, source = Some((Some(call), body)),
+          definition = true)
+        val contents = contents0.copy(clauses = contents0.clauses ++ rankClauses(tfd, contents0, bodySites))
 
-      val funString : () => String = () => {
-        "Template for def " + tfd.signature +
-        "(" + tfd.params.map(a => a.id.toString + " : " + a.getType).mkString(", ") + ") : " +
-        tfd.getType + " is :\n" + str()
+        val funString : () => String = () => {
+          "Template for def " + tfd.signature +
+          "(" + tfd.params.map(a => a.id.toString + " : " + a.getType).mkString(", ") + ") : " +
+          tfd.getType + " is :\n" + str()
+        }
+
+        new FunctionTemplate(contents, funString)
       }
 
-      val res = new FunctionTemplate(contents, funString)
+      val res = build(tmplClauses)
+      functionCaches.sources(tfd) = (tmplClauses, build)
       functionCaches.templates(tfd) = res
       res
     })
+
+    /** The template of `tfd` without the branches that `facts` rule out, or `None` if they rule out
+      * none, in which case the call is unfolded with the template of `tfd`.
+      *
+      * The facts are constructor tests on the parameters of `tfd` that hold wherever the call is
+      * unfolded (see [[Call]]). A branch is ruled out when its condition tests a parameter for
+      * another constructor than the one the facts give, or for one they exclude (or the other way
+      * round), and so are the branches under it. The template asserts that their condition
+      * variables don't hold, and leaves out their clauses and items. */
+    def pruned(tfd: TypedFunDef, facts: Set[Expr]): Option[FunctionTemplate] =
+      if (facts.isEmpty) None else functionCaches.pruned.getOrElseUpdate((tfd, facts), {
+        apply(tfd)
+        val (tmplClauses, build) = functionCaches.sources(tfd)
+
+        def decided(cond: Expr): Option[Boolean] = cond match {
+          case ic @ IsConstructor(e, id) =>
+            if (facts(ic)) Some(true)
+            else if (facts(Not(ic)) || facts.exists {
+              case IsConstructor(`e`, id2) => id2 != id
+              case _ => false
+            }) Some(false)
+            else None
+          case Not(ic: IsConstructor) => decided(ic).map(!_)
+          case _ => None
+        }
+
+        def conjunctsOf(e: Expr): Seq[Expr] = e match {
+          case And(es) => es.flatMap(conjunctsOf)
+          case _ => Seq(e)
+        }
+
+        val ruledOut: Set[Variable] = (for {
+          (guard, es) <- tmplClauses.definitions.toSeq
+          case Equals(id: Variable, cond) <- es
+          if conjunctsOf(cond).exists(c => c != guard && decided(c) == Some(false))
+        } yield id).toSet
+
+        if (ruledOut.isEmpty) None else {
+          val parents: Map[Variable, Set[Variable]] = tmplClauses.condTree.toSeq
+            .flatMap { case (p, cs) => cs.map(_ -> p) }
+            .groupBy(_._1).view.mapValues(_.map(_._2).toSet).toMap
+
+          // the condition variables under ruled out ones, all of whose parents are ruled out
+          var dead = ruledOut
+          var frontier = ruledOut
+          while (frontier.nonEmpty) {
+            val next = frontier.flatMap(tmplClauses.condTree.getOrElse(_, Set.empty))
+              .filter(c => !dead(c) && parents.getOrElse(c, Set.empty).forall(dead))
+            dead ++= next
+            frontier = next
+          }
+
+          val deadT = dead.flatMap(tmplClauses.condVars.get)
+          Some(build(tmplClauses.copy(
+            guardedExprs = tmplClauses.guardedExprs.filter { case (b, _) => !dead(b) },
+            definitions = tmplClauses.definitions.collect { case (g, es) if !dead(g) =>
+              g -> es.filter { case Equals(id: Variable, _) => !dead(id) case _ => true }
+            }.filter(_._2.nonEmpty),
+            equations = tmplClauses.equations ++ dead.toSeq.sortBy(_.id).map(Not(_)),
+            types = tmplClauses.types.filter { case (b, _) => !deadT(b) },
+            equalities = tmplClauses.equalities.filter { case (b, _) => !deadT(b) },
+            facts = tmplClauses.facts.filter { case (b, _) => !dead(b) }
+          )))
+        }
+      })
   }
 
   /** Whether some call may reach itself on the same arguments (see `rankClauses`). The search for
@@ -273,7 +348,7 @@ trait FunctionTemplates { self: Templates =>
     val constrained = state.get.constrained
     if (constrained.isEmpty) Iterator.empty else {
       val calls = state.get.defBlockers.toSeq.collect {
-        case (call @ Call(Defined(tfd), _, _), blocker) if tfd.params.exists(vd => constrained(vd.getType)) => (tfd, call, blocker)
+        case (call @ Call(Defined(tfd), _, _, _), blocker) if tfd.params.exists(vd => constrained(vd.getType)) => (tfd, call, blocker)
       }
 
       for {
@@ -402,8 +477,16 @@ trait FunctionTemplates { self: Templates =>
       // an interruption stops the unrolling between blockers, never within the calls of one
       for ((blocker, gen, calls) <- thisCallInfos if calls.nonEmpty && !interrupted;
            _ = remainingBlockers -= blocker;
-           call @ Call(callee, args, tpSubst) <- calls) {
+           call0 @ Call(callee, args, tpSubst, facts) <- calls) {
         val newCls = new scala.collection.mutable.ListBuffer[Encoded]
+
+        // the facts of a call only matter if they prune the body of its callee, and the calls are
+        // unfolded once for each set of facts that does
+        val prunedTemplate = callee match {
+          case Defined(tfd) => FunctionTemplate.pruned(tfd, facts)
+          case _ => None
+        }
+        val call = if (prunedTemplate.isEmpty && facts.nonEmpty) call0.copy(facts = Set.empty) else call0
 
         val defBlocker = state.get.defBlockers.get(call) match {
           case Some(defBlocker) =>
@@ -459,7 +542,7 @@ trait FunctionTemplates { self: Templates =>
                   else inlining.flatMap(_.result) match {
                     case Some(value) =>
                       Rule.Unfold(valueTemplate(tfd, value, defBlocker, args), defBlocker, Seq.empty, Some(callFailure(call)))
-                    case None => Rule.Unfold(FunctionTemplate(tfd), defBlocker, args ++ tpSubst, Some(callFailure(call)))
+                    case None => Rule.Unfold(prunedTemplate.getOrElse(FunctionTemplate(tfd)), defBlocker, args ++ tpSubst, Some(callFailure(call)))
                   }
                 newCls ++= rule.clauses
             }
