@@ -44,10 +44,12 @@ diverges is one that runs out of fuel for every amount of fuel, and Inox
 doesn't distinguish it from one that gets stuck: both have no value. The fuel
 a call needs is its rank, the measure that Inox's termination clauses use.
 
-Types play a role in two places only: a quantifier ranges over the values of
-its parameters' types, and so does the extensional equality of functions. The
-expressions below keep the types that these need, and evaluation carries the
-types that the type parameters in scope stand for. The values of a type
+Types play a role in three places only: a quantifier ranges over the values of
+its parameters' types, so does the extensional equality of functions, and a
+set, a bag or a map carries the types of its elements or of its keys and
+values, as Inox's do, which is what tells two empty ones of different types
+apart. The expressions below keep the types that these need, and evaluation
+carries the types that the type parameters in scope stand for. The values of a type
 parameter that nothing instantiates can only be compared for equality, so
 they are read as integers: Inox's generic value `T#n` is the integer `n`.
 
@@ -99,10 +101,10 @@ Equality below).
   (RoundingModeV (mode RoundingMode))
   (TupleV (elems (List Value)))
   (ClosureV (params (List Param)) (body Expr) (env Env))
-  (SetV (elems (List Value)))
-  (BagV (entries (List BagEntry)))
-  (MapV (entries (List MapEntry)) (default Value))
-  (ADTV (ctor Id) (args (List Value))))
+  (SetV (base Type) (elems (List Value)))
+  (BagV (base Type) (entries (List BagEntry)))
+  (MapV (keys Type) (values Type) (entries (List MapEntry)) (default Value))
+  (ADTV (ctor Id) (tps (List Type)) (args (List Value))))
 
 (datatype BagEntry
   (BagEntry (elem Value) (count Int)))
@@ -234,20 +236,20 @@ refinement type `{x: base | prop}` holds the values of `base` for which
   (FPIsSubnormal (expr Expr))
   (Tuple (exprs (List Expr)))
   (TupleSelect (tuple Expr) (index Int))
-  (FiniteSet (elems (List Expr)))
+  (FiniteSet (elems (List Expr)) (base Type))
   (SetAdd (set Expr) (elem Expr))
   (ElementOfSet (elem Expr) (set Expr))
   (SubsetOf (lhs Expr) (rhs Expr))
   (SetIntersection (lhs Expr) (rhs Expr))
   (SetUnion (lhs Expr) (rhs Expr))
   (SetDifference (lhs Expr) (rhs Expr))
-  (FiniteBag (elems (List ExprPair)))
+  (FiniteBag (elems (List ExprPair)) (base Type))
   (BagAdd (bag Expr) (elem Expr))
   (MultiplicityInBag (elem Expr) (bag Expr))
   (BagIntersection (lhs Expr) (rhs Expr))
   (BagUnion (lhs Expr) (rhs Expr))
   (BagDifference (lhs Expr) (rhs Expr))
-  (FiniteMap (pairs (List ExprPair)) (default Expr))
+  (FiniteMap (pairs (List ExprPair)) (default Expr) (keys Type) (values Type))
   (MapApply (map Expr) (key Expr))
   (MapUpdated (map Expr) (key Expr) (value Expr))
   (MapMerge (mask Expr) (map1 Expr) (map2 Expr)))
@@ -258,9 +260,10 @@ refinement type `{x: base | prop}` holds the values of `base` for which
 
 A program gives each function its type parameters, parameters and body, each
 constructor its sort and fields, and each sort its type parameters and its
-invariant, a function of one argument, if it has one. It also gives the
-uninterpreted functions of a model, one function of the arguments for each
-instantiation, and how functions are compared: under `NoFunctionEquality`
+invariant, a function of one argument, if it has one, and its equality, a
+function of two arguments, if it has one (Inox's `HasADTEquality`). It also
+gives the uninterpreted functions of a model, one function of the arguments for
+each instantiation, and how functions are compared: under `NoFunctionEquality`
 (Inox's default) comparing two functions gets stuck, and under
 `ExtensionalEquality` they are equal when they agree on every input.
 
@@ -272,7 +275,7 @@ instantiation, and how functions are compared: under `NoFunctionEquality`
   (Constructor (id Id) (sort Id) (fields (List Param))))
 
 (datatype Sort
-  (Sort (id Id) (tparams (List Id)) (invariant (Option Id))))
+  (Sort (id Id) (tparams (List Id)) (invariant (Option Id)) (equality (Option Id))))
 
 (datatype Interpretation
   (Interpretation (id Id) (tps (List Type)) (params (List Id)) (body Expr)))
@@ -381,7 +384,7 @@ program never does.
     ((Nil) (Stuck))
     ((Cons srt rest)
       (match srt
-        ((Sort t _ _) (if (= s t) (Ok srt) (lookup-sort rest s)))))))
+        ((Sort t _ _ _) (if (= s t) (Ok srt) (lookup-sort rest s)))))))
 
 (define (select-field (fields (List Param)) (args (List Value)) (sel Id)) (Result Value)
   (match fields
@@ -500,23 +503,24 @@ does.
           ((Constructor _ s _)
             (let! ((srt (lookup-sort ss s)))
               (match srt
-                ((Sort _ _ (None)) (Ok (ADTV c vs)))
-                ((Sort _ _ (Some inv))
-                  (let! ((holds (call P fuel inv tps (env-types env) (Cons (ADTV c vs) (Nil)))))
+                ((Sort _ _ (None) _) (Ok (ADTV c (resolve-all (env-types env) tps) vs)))
+                ((Sort _ _ (Some inv) _)
+                  (let! ((holds (call P fuel inv tps (env-types env)
+                                  (Cons (ADTV c (resolve-all (env-types env) tps) vs) (Nil)))))
                     (match holds
-                      ((BoolV true) (Ok (ADTV c vs)))
+                      ((BoolV true) (Ok (ADTV c (resolve-all (env-types env) tps) vs)))
                       (_ (Stuck)))))))))))))
 
 (case eval (IsConstructor adt c)
   (let! ((v (eval P fuel env adt)))
     (match v
-      ((ADTV d _) (Ok (BoolV (= c d))))
+      ((ADTV d _ _) (Ok (BoolV (= c d))))
       (_ (Stuck)))))
 
 (case eval (ADTSelector adt sel)
   (let! ((v (eval P fuel env adt)))
     (match v
-      ((ADTV c vs)
+      ((ADTV c _ vs)
         (match P
           ((Program _ cs _ _ _)
             (let! ((k (lookup-ctor cs c)))
@@ -527,8 +531,13 @@ does.
 
 Equality compares values structurally, from left to right, and stops at the
 first difference, except for sets, bags and maps, which are equal when they
-have the same contents, and functions, which are compared as the program says
-(see Quantifiers below).
+have the same contents, functions, which are compared as the program says
+(see Quantifiers below), and the values of a sort that has an equality, which
+are equal when its equality evaluates to `true` on them for some fuel, at the
+type arguments of the first one, and differ when it evaluates to `false`.
+Comparing them gets stuck when it evaluates to neither. A value of a sort
+holds the type arguments that it was built with, as Inox's values do, in the
+environment of type parameters where it was built.
 
 ```inox-sem
 (define (value-eq (P Program) (a Value) (b Value)) (Result Bool)
@@ -551,9 +560,12 @@ have the same contents, and functions, which are compared as the program says
         ((NoFunctionEquality) (Stuck))
         ((ExtensionalEquality) (Ok (closures-equal P a b)))))))
 
-(case value-eq (ADTV c xs)
+(case value-eq (ADTV c tps xs)
   (match b
-    ((ADTV d ys) (if (= c d) (values-eq P xs ys) (Ok false)))
+    ((ADTV d _ ys)
+      (match (sort-equality P c)
+        ((Some f) (adt-equal P f tps a b))
+        ((None) (if (= c d) (values-eq P xs ys) (Ok false)))))
     (_ (Ok false))))
 
 (case value-eq (TupleV xs)
@@ -561,29 +573,48 @@ have the same contents, and functions, which are compared as the program says
     ((TupleV ys) (values-eq P xs ys))
     (_ (Ok false))))
 
-(case value-eq (SetV xs)
+(case value-eq (SetV _ xs)
   (match b
-    ((SetV ys)
+    ((SetV _ ys)
       (let! ((sub (subset P xs ys)))
         (if sub (subset P ys xs) (Ok false))))
     (_ (Ok false))))
 
-(case value-eq (BagV xs)
+(case value-eq (BagV _ xs)
   (match b
-    ((BagV ys)
+    ((BagV _ ys)
       (let! ((sub (sub-bag P xs ys)))
         (if sub (sub-bag P ys xs) (Ok false))))
     (_ (Ok false))))
 
-(case value-eq (MapV xs d)
+(case value-eq (MapV _ _ xs d)
   (match b
-    ((MapV ys e)
+    ((MapV _ _ ys e)
       (let! ((same (value-eq P d e)))
         (if same
           (let! ((l (same-entries P xs xs d ys e)))
             (if l (same-entries P ys xs d ys e) (Ok false)))
           (Ok false))))
     (_ (Ok false))))
+
+(define (sort-equality (P Program) (c Id)) (Option Id)
+  (match P
+    ((Program _ cs ss _ _)
+      (match (lookup-ctor cs c)
+        ((Ok (Constructor _ s _))
+          (match (lookup-sort ss s)
+            ((Ok (Sort _ _ _ eq)) eq)
+            (_ (None))))
+        (_ (None))))))
+
+(define (adt-equal (P Program) (f Id) (tps (List Type)) (a Value) (b Value)) (Result Bool)
+  (if (exists ((fuel Int))
+        (= (call P fuel f tps (Nil) (Cons a (Cons b (Nil)))) (Ok (BoolV true))))
+    (Ok true)
+    (if (exists ((fuel Int))
+          (= (call P fuel f tps (Nil) (Cons a (Cons b (Nil)))) (Ok (BoolV false))))
+      (Ok false)
+      (Stuck))))
 
 (define (values-eq (P Program) (xs (List Value)) (ys (List Value))) (Result Bool)
   (match xs
@@ -1684,7 +1715,10 @@ empty string when `start` is out of bounds or `end` isn't after it.
 Elements and keys are compared with `value-eq`, so a set of closures gets
 stuck as soon as two of them are compared. The arguments of an operation are
 evaluated from left to right, so `ElementOfSet` and `MultiplicityInBag`
-evaluate the element before the collection.
+evaluate the element before the collection. A collection carries the types
+that its literal gives, with the type parameters in scope replaced by what
+they stand for, and an operation gives a collection of the types of its first
+operand. Equality doesn't look at them.
 
 ```inox-sem
 (define (set-contains (P Program) (xs (List Value)) (v Value)) (Result Bool)
@@ -1720,52 +1754,62 @@ evaluate the element before the collection.
              (zs (set-filter P rest ys keep)))
         (if (= in keep) (Ok (Cons x zs)) (Ok zs))))))
 
-(define (eval-set (P Program) (fuel Int) (env Env) (e Expr)) (Result (List Value))
+(define (eval-set (P Program) (fuel Int) (env Env) (e Expr)) (Result Value)
   (let! ((v (eval P fuel env e)))
     (match v
-      ((SetV xs) (Ok xs))
+      ((SetV _ _) (Ok v))
       (_ (Stuck)))))
 
-(case eval (FiniteSet es)
+(define (set-elems (v Value)) (List Value)
+  (match v
+    ((SetV _ xs) xs)
+    (_ (Nil))))
+
+(define (set-with (v Value) (xs (List Value))) Value
+  (match v
+    ((SetV base _) (SetV base xs))
+    (_ v)))
+
+(case eval (FiniteSet es base)
   (let! ((vs (eval-list P fuel env es))
          (xs (set-insert-all P (Nil) vs)))
-    (Ok (SetV xs))))
+    (Ok (SetV (resolve (env-types env) base) xs))))
 
 (case eval (SetAdd set elem)
-  (let! ((xs (eval-set P fuel env set))
+  (let! ((s (eval-set P fuel env set))
          (v (eval P fuel env elem))
-         (ys (set-insert P xs v)))
-    (Ok (SetV ys))))
+         (ys (set-insert P (set-elems s) v)))
+    (Ok (set-with s ys))))
 
 (case eval (ElementOfSet elem set)
   (let! ((v (eval P fuel env elem))
-         (xs (eval-set P fuel env set))
-         (in (set-contains P xs v)))
+         (s (eval-set P fuel env set))
+         (in (set-contains P (set-elems s) v)))
     (Ok (BoolV in))))
 
 (case eval (SubsetOf lhs rhs)
-  (let! ((xs (eval-set P fuel env lhs))
-         (ys (eval-set P fuel env rhs))
-         (sub (subset P xs ys)))
+  (let! ((s (eval-set P fuel env lhs))
+         (u (eval-set P fuel env rhs))
+         (sub (subset P (set-elems s) (set-elems u))))
     (Ok (BoolV sub))))
 
 (case eval (SetIntersection lhs rhs)
-  (let! ((xs (eval-set P fuel env lhs))
-         (ys (eval-set P fuel env rhs))
-         (zs (set-filter P xs ys true)))
-    (Ok (SetV zs))))
+  (let! ((s (eval-set P fuel env lhs))
+         (u (eval-set P fuel env rhs))
+         (zs (set-filter P (set-elems s) (set-elems u) true)))
+    (Ok (set-with s zs))))
 
 (case eval (SetUnion lhs rhs)
-  (let! ((xs (eval-set P fuel env lhs))
-         (ys (eval-set P fuel env rhs))
-         (zs (set-insert-all P xs ys)))
-    (Ok (SetV zs))))
+  (let! ((s (eval-set P fuel env lhs))
+         (u (eval-set P fuel env rhs))
+         (zs (set-insert-all P (set-elems s) (set-elems u))))
+    (Ok (set-with s zs))))
 
 (case eval (SetDifference lhs rhs)
-  (let! ((xs (eval-set P fuel env lhs))
-         (ys (eval-set P fuel env rhs))
-         (zs (set-filter P xs ys false)))
-    (Ok (SetV zs))))
+  (let! ((s (eval-set P fuel env lhs))
+         (u (eval-set P fuel env rhs))
+         (zs (set-filter P (set-elems s) (set-elems u) false)))
+    (Ok (set-with s zs))))
 ```
 
 A bag maps each element to its multiplicity, and leaves out the elements of
@@ -1832,11 +1876,21 @@ smaller one, and the difference subtracts them.
       (let! ((m (bag-get P ys x)))
         (if (= n m) (sub-bag P rest ys) (Ok false))))))
 
-(define (eval-bag (P Program) (fuel Int) (env Env) (e Expr)) (Result (List BagEntry))
+(define (eval-bag (P Program) (fuel Int) (env Env) (e Expr)) (Result Value)
   (let! ((v (eval P fuel env e)))
     (match v
-      ((BagV xs) (Ok xs))
+      ((BagV _ _) (Ok v))
       (_ (Stuck)))))
+
+(define (bag-entries (v Value)) (List BagEntry)
+  (match v
+    ((BagV _ xs) xs)
+    (_ (Nil))))
+
+(define (bag-with (v Value) (xs (List BagEntry))) Value
+  (match v
+    ((BagV base _) (BagV base xs))
+    (_ v)))
 
 (define (eval-bag-entries (P Program) (fuel Int) (env Env) (acc (List BagEntry)) (es (List ExprPair))) (Result (List BagEntry))
   (match es
@@ -1847,40 +1901,40 @@ smaller one, and the difference subtracts them.
              (acc2 (bag-set P acc v n)))
         (eval-bag-entries P fuel env acc2 rest)))))
 
-(case eval (FiniteBag es)
+(case eval (FiniteBag es base)
   (let! ((xs (eval-bag-entries P fuel env (Nil) es)))
-    (Ok (BagV xs))))
+    (Ok (BagV (resolve (env-types env) base) xs))))
 
 (case eval (BagAdd bag elem)
-  (let! ((xs (eval-bag P fuel env bag))
+  (let! ((b (eval-bag P fuel env bag))
          (v (eval P fuel env elem))
-         (n (bag-get P xs v))
-         (ys (bag-set P xs v (+ n 1))))
-    (Ok (BagV ys))))
+         (n (bag-get P (bag-entries b) v))
+         (ys (bag-set P (bag-entries b) v (+ n 1))))
+    (Ok (bag-with b ys))))
 
 (case eval (MultiplicityInBag elem bag)
   (let! ((v (eval P fuel env elem))
-         (xs (eval-bag P fuel env bag))
-         (n (bag-get P xs v)))
+         (b (eval-bag P fuel env bag))
+         (n (bag-get P (bag-entries b) v)))
     (Ok (IntV n))))
 
 (case eval (BagIntersection lhs rhs)
-  (let! ((xs (eval-bag P fuel env lhs))
-         (ys (eval-bag P fuel env rhs))
-         (zs (bag-merge P (IntersectionOp) (Nil) xs ys)))
-    (Ok (BagV zs))))
+  (let! ((b (eval-bag P fuel env lhs))
+         (c (eval-bag P fuel env rhs))
+         (zs (bag-merge P (IntersectionOp) (Nil) (bag-entries b) (bag-entries c))))
+    (Ok (bag-with b zs))))
 
 (case eval (BagUnion lhs rhs)
-  (let! ((xs (eval-bag P fuel env lhs))
-         (ys (eval-bag P fuel env rhs))
-         (zs (bag-add-all P xs ys)))
-    (Ok (BagV zs))))
+  (let! ((b (eval-bag P fuel env lhs))
+         (c (eval-bag P fuel env rhs))
+         (zs (bag-add-all P (bag-entries b) (bag-entries c))))
+    (Ok (bag-with b zs))))
 
 (case eval (BagDifference lhs rhs)
-  (let! ((xs (eval-bag P fuel env lhs))
-         (ys (eval-bag P fuel env rhs))
-         (zs (bag-merge P (DifferenceOp) (Nil) xs ys)))
-    (Ok (BagV zs))))
+  (let! ((b (eval-bag P fuel env lhs))
+         (c (eval-bag P fuel env rhs))
+         (zs (bag-merge P (DifferenceOp) (Nil) (bag-entries b) (bag-entries c))))
+    (Ok (bag-with b zs))))
 ```
 
 A map gives each key its value, or the default value. Building a map keeps
@@ -1944,16 +1998,16 @@ others, and the default, from the second.
              (acc2 (map-put P acc kv vv)))
         (eval-map-entries P fuel env acc2 rest)))))
 
-(case eval (FiniteMap pairs default)
+(case eval (FiniteMap pairs default kt vt)
   (let! ((xs (eval-map-entries P fuel env (Nil) pairs))
          (d (eval P fuel env default)))
-    (Ok (MapV xs d))))
+    (Ok (MapV (resolve (env-types env) kt) (resolve (env-types env) vt) xs d))))
 
 (case eval (MapApply map key)
   (let! ((m (eval P fuel env map))
          (k (eval P fuel env key)))
     (match m
-      ((MapV xs d) (map-get P xs k d))
+      ((MapV _ _ xs d) (map-get P xs k d))
       (_ (Stuck)))))
 
 (case eval (MapUpdated map key value)
@@ -1961,9 +2015,9 @@ others, and the default, from the second.
          (k (eval P fuel env key))
          (v (eval P fuel env value)))
     (match m
-      ((MapV xs d)
+      ((MapV kt vt xs d)
         (let! ((ys (map-put P xs k v)))
-          (Ok (MapV ys d))))
+          (Ok (MapV kt vt ys d))))
       (_ (Stuck)))))
 
 (case eval (MapMerge mask map1 map2)
@@ -1971,12 +2025,12 @@ others, and the default, from the second.
          (m1 (eval P fuel env map1))
          (m2 (eval P fuel env map2)))
     (match m1
-      ((MapV xs d1)
+      ((MapV _ _ xs d1)
         (match m2
-          ((MapV ys d2)
-            (let! ((rest (map-without P ys ks))
-                   (zs (map-take P rest ks xs d1)))
-              (Ok (MapV zs d2))))
+          ((MapV kt vt ys d2)
+            (let! ((rest (map-without P ys (set-elems ks)))
+                   (zs (map-take P rest (set-elems ks) xs d1)))
+              (Ok (MapV kt vt zs d2))))
           (_ (Stuck))))
       (_ (Stuck)))))
 ```
@@ -2043,10 +2097,11 @@ A value has a type when it has the type's shape, and is in the canonical form
 that the operations above build: a real in lowest terms, a set, a bag or a map
 without repeated elements or keys, a bag with positive multiplicities, a
 character code below 2^16, and string characters at most `0x2FFFF`, as in
-SMT-LIB. A value of an ADT type also satisfies its sort's invariant, and a
-value of a refinement type its predicate, for some fuel. A type parameter
-stands for the type it is bound to, and for the integers if it isn't bound.
-`PropType`, the type of propositions, has the Booleans as values.
+SMT-LIB. A value of an ADT type holds the type arguments of the type, also
+satisfies its sort's invariant, and a value of a refinement type its predicate,
+for some fuel. A type parameter stands for the type it is bound to, and for the
+integers if it isn't bound. `PropType`, the type of propositions, has the
+Booleans as values.
 
 A value of a function type is a closure that, on every input of its parameter
 types, evaluates to a value of its result type, for some fuel. Function values
@@ -2115,17 +2170,17 @@ The quantifiers over values and fuel are in their own functions, so that
 
 (case has-type (SetType u)
   (match v
-    ((SetV xs) (and (all-have-type P env xs u) (distinct-values P xs)))
+    ((SetV _ xs) (and (all-have-type P env xs u) (distinct-values P xs)))
     (_ false)))
 
 (case has-type (BagType u)
   (match v
-    ((BagV xs) (and (bag-has-type P env xs u) (distinct-values P (bag-elems xs))))
+    ((BagV _ xs) (and (bag-has-type P env xs u) (distinct-values P (bag-elems xs))))
     (_ false)))
 
 (case has-type (MapType u w)
   (match v
-    ((MapV xs d)
+    ((MapV _ _ xs d)
       (and (has-type P env d w)
         (and (map-has-type P env xs u w) (distinct-values P (map-keys xs)))))
     (_ false)))
@@ -2147,14 +2202,14 @@ The quantifiers over values and fuel are in their own functions, so that
 
 (case has-type (ADTType s args)
   (match v
-    ((ADTV c vs)
+    ((ADTV c tps vs)
       (match P
         ((Program _ cs ss _ _)
           (match (lookup-ctor cs c)
             ((Ok (Constructor _ s2 fields))
               (match (lookup-sort ss s)
-                ((Ok (Sort _ tparams inv))
-                  (and (= s s2)
+                ((Ok (Sort _ tparams inv _))
+                  (and (and (= s s2) (= tps (resolve-all (env-types env) args)))
                     (and (params-have-types P (Env (bind-types tparams args (env-types env)) (Nil)) vs fields)
                       (match inv
                         ((None) true)

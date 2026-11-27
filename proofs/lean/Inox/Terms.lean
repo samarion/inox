@@ -761,16 +761,39 @@ def declarations (checked : Checked) : List Sexp :=
     | none => false
   ofProof ++ ofScript
 
+/-- `e` without its assumptions: each `(assume c b)` is `b`. -/
+def dropAssumes : Sexp → Sexp
+  | .expr [.atom "assume", _, b] => dropAssumes b
+  | .expr es => .expr (es.attach.map fun ⟨e, _⟩ => dropAssumes e)
+  | a => a
+
+/-- `e` with its assumptions marked in a form that Logos reads: each `(assume c b)` is
+`(ite (xor c false) b b)`, which has the value of `b`, and which no other expression is read
+as. -/
+def markAssumes : Sexp → Sexp
+  | .expr [.atom "assume", c, b] =>
+    .expr [.atom "ite", .expr [.atom "xor", markAssumes c, .atom "false"], markAssumes b,
+      markAssumes b]
+  | .expr es => .expr (es.attach.map fun ⟨e, _⟩ => markAssumes e)
+  | a => a
+
+/-- `e` has an assumption. -/
+def hasAssume : Sexp → Bool
+  | .expr [.atom "assume", _, _] => true
+  | .expr es => es.attach.any fun ⟨e, _⟩ => hasAssume e
+  | _ => false
+
 /-- The clauses: those of the query's assumptions, of each rule, and of the completeness
 assumptions, the definitions of the local symbols of the instances, and the source expressions
-of the instances of `expression` kind. -/
-def allClauses (checked : Checked) : List Sexp :=
+of the instances of `expression` kind, whose assumptions `f` reads: without them (`dropAssumes`),
+or marked (`markAssumes`). -/
+def allClauses (checked : Checked) (f : Sexp → Sexp := dropAssumes) : List Sexp :=
   checked.query ++ checked.applied.flatMap (·.2) ++ checked.complete ++
-    checked.defined.flatMap (·.map fun (v, m) => app "=" [v, m]) ++ checked.expressions
+    checked.defined.flatMap (·.map fun (v, m) => app "=" [v, m]) ++ checked.expressions.map f
 
 /-- The declarations and one `assume` per clause. -/
-def clauseText (checked : Checked) : String :=
-  let assumes := (allClauses checked).zipIdx.map fun (c, i) =>
+def clauseText (checked : Checked) (f : Sexp → Sexp := dropAssumes) : String :=
+  let assumes := (allClauses checked f).zipIdx.map fun (c, i) =>
     Sexp.expr [.atom "assume", .atom s!"inox.clause.{i}", c]
   "\n".intercalate ((declarations checked ++ assumes).map text) ++ "\n"
 
@@ -871,6 +894,8 @@ structure Equation where
   term : Term
   args : List Term
   params : List (SmtEval.native_String × SmtType)
+  /-- the equation with its assumptions marked (`markAssumes`), if its body has some -/
+  source : Option Term := none
 
 /-- The arguments of a call, if it is one. -/
 def callArgs : Term → Option (List Term)
@@ -967,22 +992,24 @@ def equationText (checked : Checked) : String :=
     Sexp.expr [.atom "assume", .atom s!"inox.source.{i}", c]
   "\n".intercalate ((decls ++ ofTemplates ++ assumes).map text) ++ "\n"
 
-/-- `e` without its assumptions: each `(assume c b)` is `b`. -/
-def dropAssumes : Sexp → Sexp
-  | .expr [.atom "assume", _, b] => dropAssumes b
-  | .expr es => .expr (es.attach.map fun ⟨e, _⟩ => dropAssumes e)
-  | a => a
-
 /-- The defining equations of the functions of a certificate, as Logos reads them, if it can,
 without their assumptions, which Logos doesn't read in a term: each `(assume c b)` is `b`. Where
 the call has a value, its evaluation went through each assumption it met, which held, so the call
 equals the body without them: the equation holds on the calls that have values, which is what the
-intended model gives (`GoodOn`). -/
+intended model gives (`GoodOn`). When a body has assumptions, each equation also has its `source`,
+read with the assumptions marked, which says where the body assumes what. -/
 def equations (checked : Checked) : List Equation :=
-  let checked := { checked with sources := checked.sources.map dropAssumes }
-  match parseProof (equationText checked) with
-  | .ok (terms, _) => terms.filterMap equationOf
-  | .error _ => []
+  let read (f : Sexp → Sexp) : List Equation :=
+    match parseProof (equationText { checked with sources := checked.sources.map f }) with
+    | .ok (terms, _) => terms.filterMap equationOf
+    | .error _ => []
+  let plain := read dropAssumes
+  if checked.sources.any hasAssume then
+    let marked := read markAssumes
+    if marked.length = plain.length then
+      List.zipWith (fun e m => { e with source := some m.term }) plain marked
+    else plain
+  else plain
 
 /-- What the second parse gives: the proof's assumptions as Logos reads them, the base clauses
 (the query's assumptions), the fresh-symbol steps and the facts. -/
@@ -996,6 +1023,10 @@ structure TermSteps where
   equations : List Equation := []
   /-- the instances of templates: the definitions of their local symbols, and their clauses -/
   instances : List (List Term × List Term) := []
+  /-- the definitions of the symbols that the clauses of every instance may mention -/
+  shared : List Term := []
+  /-- the base clauses with the assumptions of the source expressions marked (`markAssumes`) -/
+  query : List Term := []
   /-- how many of the defining equations are the reflexivity of an equality -/
   axioms : Nat := 0
   /-- how many base clauses are source expressions, and completeness assumptions -/
@@ -1195,11 +1226,45 @@ def reflexivities (terms : List Term) (fresh : List Step) (kinds : List (String 
   let terms := (all.map (·.term)).eraseDups
   terms.filterMap fun t => (all.find? (·.term == t)).filter fun e => mentionsNone fresh e.term
 
+/-- The last disjunct of `t`, if it is a constant: of `(or … d)`, as Logos reads it with or
+without the `false` that ends it. -/
+def lastDisjunct : Term → Option Term
+  | .Apply (.Apply (.UOp .or) a) (.Boolean false) => match a with
+    | .UConst _ _ => some a
+    | _ => none
+  | .Apply (.Apply (.UOp .or) _) r => match r with
+    | .UConst _ _ => some r
+    | _ => lastDisjunct r
+  | _ => none
+
+/-- A root step for each constant that ends the disjunction of a fact `(=> b (or … d))` or
+`(or … d)` and that neither the base clauses, the equations, the steps `fresh` nor the definitions
+`defs` mention, as the `diverges` of the decreases clauses: such a constant may be true. Nothing
+relies on this: the check decides that the steps are fresh. -/
+def unconstrained (eqs : List Equation) (base : List Term) (fresh : List Step) (defs : List Term)
+    (facts : List Term) : List Step :=
+  let names := addClauseNames {} (base ++ eqs.map (·.term) ++ fresh.flatMap (·.clauses) ++ defs)
+  let ends := facts.filterMap fun t => match t with
+    | .Apply (.Apply (.UOp .imp) _) c => lastDisjunct c
+    | c => lastDisjunct c
+  let ok (c : Term) : Bool := match asConst (__eo_to_smt c) with
+    | some (s, T) => T == SmtType.Bool && decide (Unreserved s) && !names.contains s &&
+        eqs.all fun e => !e.params.contains (s, T)
+    | none => false
+  (ends.eraseDups.filter ok).map Step.root
+
+/-- The source expressions among the clauses `terms` of the second parse, which come last. -/
+def expressionTerms (checked : Checked) (terms : List Term) : List Term :=
+  terms.drop (checked.query.length + ((checked.applied.map fun (_, cs) => cs.length).sum) +
+    checked.complete.length + (checked.defined.map List.length).sum)
+
 /-- The steps of the clauses `terms` of the second parse: the base clauses are the query's
 assumptions, the source expressions of the instances of `expression` kind and the completeness
 assumptions, those of the latter two that mention none of the constants of the steps of the
 rules; the other completeness assumptions are facts, and the other source expressions are left
-out. -/
+out. The fresh-symbol steps are those of the rules, a root step for each constant that only ends
+disjunctions of facts (`unconstrained`), and the definitions of the local symbols of the instances
+that can be steps (`addDefinitions`). -/
 def termStepsOf (checked : Checked) (terms : List Term) : Except String TermSteps :=
   let nq := checked.query.length
   let counts := checked.applied.map fun (k, cs) => (k, cs.length)
@@ -1220,16 +1285,34 @@ def termStepsOf (checked : Checked) (terms : List Term) : Except String TermStep
     let base := terms.take nq ++ exprs ++ completeBase.map (·.1)
     let axioms := reflexivities terms fresh (withKinds counts ruleTerms)
     let eqs := equations checked ++ axioms
+    -- the definitions of the symbols that name values over the symbols of the query only, such
+    -- as the typing of a set, which is true, or a constructor with an invariant: the clauses
+    -- of another instance than theirs may mention them
+    let defined : Std.HashSet SmtEval.native_String := Std.HashSet.ofList (defs.filterMap fun d =>
+      match d with
+      | .Apply (.Apply (.UOp .eq) v) _ => (asConst (__eo_to_smt v)).map (·.1)
+      | _ => none)
+    let ground (rhs : Term) : Bool :=
+      (addClauseNames {} [rhs]).all fun n => !defined.contains n
+    let trues := defs.filter fun d => match d with
+      | .Apply (.Apply (.UOp .eq) _) (.Boolean true) => true
+      | .Apply (.Apply (.UOp .eq) _) rhs =>
+        decide (__smtx_typeof (__eo_to_smt rhs) ≠ .Bool) && ground rhs
+      | _ => false
     -- the definitions and the clauses of each instance
     let instances := (counts.zip ndefs).foldl
       (fun (acc : List (List Term × List Term) × List Term × List Term) ((k, n), nd) =>
         let (out, cs, ds) := acc
         let out :=
-          if k == "Unfold" || k == "Instance" then out ++ [(ds.take nd, cs.take n)] else out
+          if k == "Unfold" || k == "Instance" then out ++ [(ds.take nd ++ trues, cs.take n)]
+          else out
         (out, cs.drop n, ds.drop nd)) ([], ruleTerms, defs)
+    let facts := facts ++ completeFacts.map (·.1)
+    let fresh := unconstrained eqs base fresh defs facts ++ fresh
     .ok { assums := [], base, fresh := addDefinitions eqs base fresh defs,
-          facts := facts ++ completeFacts.map (·.1), derived, equations := eqs,
-          instances := instances.1, axioms := axioms.length, expressions := exprs.length,
+          facts, derived, equations := eqs,
+          instances := instances.1, shared := trues, axioms := axioms.length,
+          expressions := exprs.length,
           completeBase := completeBase.length,
           kinds := factKinds checked ++ completeFacts.map fun (_, c) => ("complete", c) }
 
@@ -1241,7 +1324,16 @@ def termSteps (checked : Checked) : Except String TermSteps :=
     let checked := usableDefinitions checked
     match parseProof (clauseText checked) with
     | .error e => .error s!"Logos can't read the clauses: {e}"
-    | .ok (terms, _) => (termStepsOf checked terms).map fun r => { r with assums }
+    | .ok (terms, _) => (termStepsOf checked terms).map fun r =>
+      -- the source expressions that have assumptions, each with its marked reading
+      let marked :=
+        if checked.expressions.any hasAssume then
+          match parseProof (clauseText checked markAssumes) with
+          | .ok (ms, _) => (expressionTerms checked terms).zip (expressionTerms checked ms)
+          | .error _ => []
+        else []
+      { r with assums,
+               query := r.base.map fun t => ((marked.find? (·.1 == t)).map (·.2)).getD t }
 
 /-- A hash of a term, for the set of the clauses: equal terms have equal hashes, which is all
 `Std.HashSet` needs of it. -/
@@ -1385,6 +1477,18 @@ def red (K : List (SmtTerm × Bool)) : SmtTerm → SmtTerm
     lookupOr K (.eq x y) (if red K x = red K y then .Boolean true else .eq (red K x) (red K y))
   | t => lookupOr K t t
 
+/-- The literals that the true disjunctions of `K` with an operand that reduces to false under `K`
+make known: those of their other operand. -/
+def unitLits (K : List (SmtTerm × Bool)) : List (SmtTerm × Bool) :=
+  K.flatMap fun p => match p with
+    | (.or x y, true) =>
+      (if red K x = .Boolean false then lits (red K y) true ++ lits y true else []) ++
+        (if red K y = .Boolean false then lits (red K x) true ++ lits x true else [])
+    | _ => []
+
+/-- The literals `K`, with those that their true disjunctions make known. -/
+def withUnits (K : List (SmtTerm × Bool)) : List (SmtTerm × Bool) := unitLits K ++ K
+
 /-- The arguments of an application. -/
 def smtArgs : SmtTerm → List SmtTerm
   | .Apply f a => smtArgs f ++ [a]
@@ -1443,16 +1547,26 @@ def congEq (K : List (SmtTerm × Bool)) : SmtTerm → Bool
 def verifyUnder (k : List (SmtTerm × Bool) → Bool) (K : List (SmtTerm × Bool)) :
     SmtTerm → Bool
   | .or p1 p2 => verifyUnder k K p1 && verifyUnder k K p2
-  | p => red K p = .Boolean false || k (lits (red K p) true ++ lits p true ++ K)
+  | p => red K p = .Boolean false || k (withUnits (lits (red K p) true ++ lits p true ++ K))
+
+/-- `φ` states that the set `s`, which `K` makes known not to be empty, is the element that Logos
+chooses of it (`set.choose`) with the others: what the typing of a set states of it, with that
+element and those others for the element and the rest that it names. -/
+def setSplit (K : List (SmtTerm × Bool)) : SmtTerm → Bool
+  | .eq s (.set_union (.set_union (.set_singleton c) (.set_empty T))
+      (.set_minus s' (.set_singleton c'))) =>
+    decide (s' = s) && decide (c' = c) && decide (c = .map_diff s (.set_empty T)) &&
+      decide (__smtx_typeof s = .Set T) && known K (.eq s (.set_empty T)) == some false
+  | _ => false
 
 /-- `φ` holds in the models of the defining equations `eqs` where the literals `K` have their
 values: an implication whose premise makes its conclusion hold, or a term that reduces to true, or
 an instance of a defining equation, or the conclusion of one whose premise holds, or an equality
-by congruence. -/
+by congruence, or the split of a set that is not empty. -/
 def verify (eqs : List Equation) (K : List (SmtTerm × Bool)) : SmtTerm → Bool
   | .imp p q => decide (__smtx_typeof p = .Bool) && decide (__smtx_typeof q = .Bool) &&
       verifyUnder (fun K' => verify eqs K' q) K p
-  | φ => red K φ = .Boolean true || eqInst eqs φ || mpInst eqs K φ || congEq K φ
+  | φ => red K φ = .Boolean true || eqInst eqs φ || mpInst eqs K φ || congEq K φ || setSplit K φ
 
 /-- The binding of the constant that a definition `(= v D)` defines to `D`, if `v` is a constant
 whose name Logos doesn't reserve, of a sort that has values and is not that of regular languages,
@@ -1468,15 +1582,31 @@ def defBinding : Term → Option (SmtEval.native_String × SmtType × SmtTerm)
     | _ => none
   | _ => none
 
+/-- `t` with the definitions `σ` in place, and then in place in what they put: a definition of
+an instance may mention a symbol that another instance defines. -/
+def subst2 (σ : List (SmtEval.native_String × SmtType × SmtTerm)) (t : SmtTerm) : SmtTerm :=
+  substSmt σ (substSmt σ t)
+
+/-- `t` has no binder, before and after the definitions `σ` are put in place. -/
+def substB (σ : List (SmtEval.native_String × SmtType × SmtTerm)) (t : SmtTerm) : Bool :=
+  noBinder t && noBinder (substSmt σ t)
+
 /-- The clause `c` holds, under the literals `K`, once the definitions `σ` are substituted in
 it. -/
 def instClauseB (eqs : List Equation) (K : List (SmtTerm × Bool))
     (σ : List (SmtEval.native_String × SmtType × SmtTerm)) (c : Term) : Bool :=
-  noBinder (__eo_to_smt c) && verify eqs K (substSmt σ (__eo_to_smt c))
+  substB σ (__eo_to_smt c) && verify eqs K (subst2 σ (__eo_to_smt c))
 
-/-- The literals that the base clauses make known. -/
+/-- The constants of the root steps: the clauses that state them are among those of the
+fresh-symbol steps. -/
+def TermSteps.roots (r : TermSteps) : List Term :=
+  r.fresh.filterMap fun st => match st with
+    | .root c => some c
+    | _ => none
+
+/-- The literals that the base clauses and the root steps make known. -/
 def TermSteps.baseLits (r : TermSteps) : List (SmtTerm × Bool) :=
-  r.base.flatMap fun t => lits (__eo_to_smt t) true
+  withUnits ((r.base ++ r.roots).flatMap fun t => lits (__eo_to_smt t) true)
 
 /-- The clauses of the instances that hold, given the base clauses and the definitions of their
 local symbols that are clauses of the fresh-symbol steps. -/
@@ -1542,7 +1672,7 @@ def TermSteps.coverage (r : TermSteps) (checked : Checked) : String := Id.run do
   let fmt (m : Std.HashMap String Nat) :=
     ", ".intercalate ((m.toList.mergeSort (fun a b => a.1 ≤ b.1)).map fun (k, n) => s!"{k} {n}")
   let ctx := Std.HashSet.ofList (extend r.base r.fresh)
-  let ndefs := ((r.instances.flatMap (·.1)).filter ctx.contains).length
+  let ndefs := ((r.instances.flatMap (·.1)).eraseDups.filter ctx.contains).length
   let nprop := (checked.defined.map List.length).sum
   let left := r.facts.length - unf - byInst - direct
   let query := r.base.length - r.expressions - r.completeBase

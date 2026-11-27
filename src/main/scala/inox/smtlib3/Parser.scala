@@ -24,8 +24,9 @@ private[smtlib3] case class TypeDefinition(params: Seq[Either[inox.trees.TypePar
 /** Parses SMT-LIB 3 scripts (see https://smt-lib.org/version3.shtml) into Inox programs.
   *
   * The parser extends the TIP parser of [[inox.tip.Parser]], so it also accepts TIP inputs and the
-  * Inox extensions to it (e.g. `datatype-invariant` and `assume`). On top of these, it
-  * supports the following SMT-LIB 3 features:
+  * Inox extensions to it (e.g. `datatype-invariant`, `assume`, and `(error T "message")` for an
+  * expression of type `T` whose evaluation fails). On top of these, it supports the following
+  * SMT-LIB 3 features:
   *
   *  - Function types `(-> A B C)` (also spelled `→`), and dependent function types whose parameters
   *    bind variables with `(! A :var x)`, which become Inox `PiType`s.
@@ -149,12 +150,6 @@ class Parser(reader: Reader, file: Option[File]) extends tip.Parser(reader, file
     val body = exprOps.uninterpretedBody(sym.name, tparams, params, returnType)
     new FunDef(FreshIdentifier(sym.name), tparams, params, returnType, body, Seq.empty)
       .setPos(sym.optPos)
-  }
-
-  /** `tpe` without its top-level refinements. */
-  private def stripRefinements(tpe: Type): Type = tpe match {
-    case RefinementType(vd, _) => stripRefinements(vd.tpe)
-    case _ => tpe
   }
 
   /** A parameter `(x S)` whose sort `S` isn't a plain sort, which parses as a term. */
@@ -625,7 +620,7 @@ class Parser(reader: Reader, file: Option[File]) extends tip.Parser(reader, file
     /** Applies the constructor `sym`, of the datatype type `sort`, to `args`. */
     private def construct(sym: SSymbol, sort: Sort, args: Seq[Term], term: Term)(using ctx: Context): Expr = {
       val cons = symbols.getConstructor(ctx.getConstructor(sym))
-      val tps = stripRefinements(fromSMT(sort)) match {
+      val tps = typeOps.stripRefinements(fromSMT(sort)) match {
         case ADTType(_, tps) => tps
         case tpe => error(s"unexpected type $tpe for constructor $sym", term.optPos)
       }

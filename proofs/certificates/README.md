@@ -9,7 +9,8 @@ This directory checks certificates apart from the solver, in two steps.
    what Inox printed and checks the rules of each certificate: each rule is an
    instance of its kind and builds the asserts that it names, every assert of
    the script is named by a rule or is an assumption, each fresh symbol is
-   introduced once, and the proof only assumes asserts of the script. It shares
+   introduced once, and the proof only assumes asserts of the script (where
+   the solver may have inlined their bindings). It shares
    no code with the solver. With `--cpc <dir>`, it writes the CPC proof of each
    certificate that holds to `<dir>`.
 
@@ -91,7 +92,111 @@ rule of `unrolling.RuleKernel` builds. Two things are left to the reader:
   lambdas, `tuple.unit`, bags, string operations and floating points, which
   no source of the corpus uses.
 
-  Nothing yet relates the sources to the input query and its functions.
+  The `simplifications` section relates the sources to the input query and
+  its functions. Before generating templates, the solver simplifies each
+  formula (inlining, path simplification, let and quantifier simplification).
+  For each function whose source body differs from its original definition,
+  and for each source expression that differs from the formula it was made
+  from, the section holds the original term and the steps that rewrite it
+  into the source. [`Simplifications.scala`](../src/main/scala/inox/certificates/Simplifications.scala)
+  replays them. The steps are not found by comparing the two terms: the
+  simplifiers record each rewrite as they apply it. A step is
+  `(<rule> <position> <subterm>)`: the rule, the position of the smallest
+  subterm outside of which the step leaves the term as it is, and what that
+  subterm becomes. The checker checks the rule at the position, or at a
+  subterm around it. A step may only refine the subterm: wherever the
+  original has a value, the rewritten term has the same value.
+  The rules are three-valued propositional reasoning over the atoms of the
+  term, under the facts of the path to it (`logic`), unfolding a function
+  call (`unfold`), beta reduction (`beta`), replacing a variable by the
+  value of its let (`expand`), selecting a field of a construction or an
+  element of a tuple (`select`), a construction of the fields of a term
+  (`eta`), binding a subterm that is always evaluated (`bind`), lifting a
+  let or an assumption out of an operand that is always evaluated (`lift`),
+  merging quantifiers (`merge`), dropping the unused variables of a
+  quantifier over inhabited sorts (`unused`), lifting the quantifiers of
+  the operands of a connective (`prenex`), polynomial arithmetic
+  (`arith`), renaming bound variables (`rename`), and the evaluation of a
+  closed term (`evaluate`): the term and its value are read as terms of
+  Inox with the source definitions, where the functions have their original
+  bodies, and both are evaluated, with fuel, by
+  the evaluator that is generated from [`semantics.md`](../semantics.md),
+  to the same value. The simplifiers name
+  every rewrite, and don't judge which ones the checker can check: a step
+  of a rule that the checker doesn't know is applied as it is given, and
+  the certificate then holds over the simplified program only, which the
+  checker says with the rules. This is the case of the evaluation of a term
+  that the generated evaluator gives no value to (it covers a fragment of
+  Inox, and doesn't compare functions) and that doesn't reduce to the value
+  either (the checker reduces calls, bindings, conditionals and selections
+  to literals, lambdas and constructions, which is how it checks the values
+  of functions, and takes an equality of closures, or the membership of a
+  closure in a set of closures, to be false where the evaluator gives the
+  closures different values on an integer or Boolean input, and true where
+  they reduce to the same lambda), and of the steps that a simplifier
+  can't tell are ones of `logic`, which the checker checks as such, and
+  reports when they are not: an assumption that is lifted out of a binder
+  (`lift-assumptions`, a step of `logic` out of a quantifier over sorts
+  that have values, whose body always evaluates the assumption), and what
+  a simplifier makes of a term without a rule of its own (`simplify`). A
+  step of a rule that the
+  checker knows, and which doesn't hold, makes the certificate fail, and so
+  does what a simplifier did without recording it (`unrecorded`). When the
+  program compares functions (`--function-equality` is not `none`), a
+  refinement under a lambda or in a function body is not enough, as it may
+  make two functions equal. Where functions are compared extensionally, the
+  steps under a lambda, and those of a function body, must then preserve the
+  value of the subterm exactly, which the checker checks of each rule:
+  `logic` checks both directions, `select` and `arith` drop no operand that
+  may have no value (nor `select` a construction of a sort with an
+  invariant), `prenex` lifts out of the last operand only and over
+  sorts that have values, and a reduction selects no field out of a
+  construction of a sort with an invariant.
+  Where they are compared intensionally, a step may change a lambda that the
+  program compares as written: the checker doesn't check the steps, and says
+  so. What remains trusted:
+  - that the originals are the program and the query that the solver was
+    given: the certificate states them, and nothing compares them with an
+    input;
+  - the names of the sources: the symbol of a lambda or of the instantiations
+    of a quantifier stands for the subterm that the section gives for it, and
+    so does the symbol of the equality of a sort, applied to the operands of
+    an equality that the simplifiers keep, as the check of the sources trusts
+    too (the checker checks that a name is not a symbol of the original, that
+    the operands are those of the equality, and that a quantifier that the
+    source assumes is where it must hold, as is the universal one whose
+    negation names an existential one). The source also names a call of an
+    uninterpreted function under the assumptions of its typing, and a
+    construction under the assumption of the invariant of its sort, which
+    the checker checks to be the invariant that the source definitions
+    declare (`datatype-invariant`), as it is of the construction or as a
+    function of the same body, and evaluates or reports otherwise;
+  - the theory encoders (sets, bags, maps, propositions) that run before the
+    simplifier, whose output is the original that the steps start from;
+  - the rules themselves, which the Lean checker doesn't prove yet (it skips
+    the section, and its result holds over the simplified program).
+
+  The certificate also holds the input of the solver: its constraints before
+  the solver's encoders, each with the term that the encoders make of it. The
+  checker checks that term against the constraint
+  ([`Encoders.scala`](../src/main/scala/inox/certificates/Encoders.scala)):
+  both have the same shape, a symbol of the input facing the symbol of the
+  sources of the same identifier, except where the input has a term of an
+  encoder's theory, which faces what the encoder makes of it, such as
+  `(bag.union a b)` and `(Node 0 a b)`. It knows the encoders that cvc5 runs
+  with (`propositions`, `bags` and `map-merge`), and refuses a certificate
+  that names another. It checks that the datatype of bags and its functions
+  `get` and `inv` in the source definitions are those of the encoder of
+  bags. It doesn't check the sorts that only the encoded term has, nor the
+  encoder's equality of bags and its `mapMerge`.
+
+  The same goes for the functions: the input gives, for each function of the
+  source definitions, its body after the encoders, which the checker checks
+  against the definition of the function in the input, and which must be the
+  original of the function in the `simplifications` section, whose steps lead
+  to the body of the source definition, or that body when the section has no
+  entry for the function. The datatypes of the input are checked against those
+  of the sources in the same way.
 - **The side conditions of the rules.** The checker checks the shape of each
   rule, and that the symbols that `Define`, `Hypothesis` and `Root` introduce
   are introduced once. It doesn't check what a rule states about the program,
@@ -100,4 +205,4 @@ rule of `unrolling.RuleKernel` builds. Two things are left to the reader:
   conjunction that refutations may assume (it checks that it is a literal).
 
 The second needs the trace from the input to the sources, which the
-certificate doesn't hold yet.
+`simplifications` section starts to hold.

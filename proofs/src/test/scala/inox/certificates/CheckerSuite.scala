@@ -16,7 +16,7 @@ class CheckerSuite extends AnyFunSuite {
   // A template with the parameters `s` and `p` and its own symbol `c`, instantiated once under
   // the root blocker, a definition, an implication between blockers and an assumption.
   val certificate: String =
-    """(inox-certificate 4
+    """(inox-certificate 6
       |(script
       |(declare-const start Bool)
       |(declare-const b Bool)
@@ -55,6 +55,10 @@ class CheckerSuite extends AnyFunSuite {
       |(source-symbols
       |(p variable "p$2" "BigInt" Int)
       |)
+      |(simplifications
+      |(function-equality none)
+      |)
+      |(input)
       |(cpc
       |(assume @p1 start)
       |(define @t1 () (> x 0))
@@ -97,7 +101,7 @@ class CheckerSuite extends AnyFunSuite {
   }
 
   test("A certificate of another version is refused") {
-    assert(refused(changed("(inox-certificate 4", "(inox-certificate 2")).contains("version 2"))
+    assert(refused(changed("(inox-certificate 6", "(inox-certificate 2")).contains("version 2"))
   }
 
   test("An assert that no rule names is refused") {
@@ -146,6 +150,15 @@ class CheckerSuite extends AnyFunSuite {
     assert(refused(changed("(define @t1 () (> x 0))", "(define @t1 () (> x 1))")).contains("the proof assumes"))
   }
 
+  test("A proof may assume an assertion with its bindings inlined, unless they would be captured") {
+    def inlined(text: String): String = Checker.inlined(parse(text).head).toString
+    assert(inlined("(=> start (let ((y (+ x 1))) (> y 0)))") == "(=> start (> (+ x 1) 0))")
+    assert(inlined("(let ((y 1)) (let ((z (+ y 1))) (= z y)))") == "(= (+ 1 1) 1)")
+    // a binder of the body would capture a symbol of a binding, or rebinds its variable
+    assert(inlined("(let ((y x)) (forall ((x Int)) (> y x)))") == "(let ((y x)) (forall ((x Int)) (> y x)))")
+    assert(inlined("(let ((y 1)) (exists ((y Int)) (> y 0)))") == "(let ((y 1)) (exists ((y Int)) (> y 0)))")
+  }
+
   /** Inox's command line, which exits by throwing. */
   private class Exit extends Exception
   private class Main extends InoxMain {
@@ -192,6 +205,7 @@ class CheckerSuite extends AnyFunSuite {
     }
     for ((certificate, n) <- found.zipWithIndex) {
       val checked = check(certificate)
+      if (!checked.original) info(s"certificate ${n + 1} is over the simplified program: ${checked.unexplained.head.take(300)}")
       for (dir <- cpcDir) {
         Files.createDirectories(dir)
         val name = file.replace('/', '_') + s".${n + 1}.cpc"
