@@ -33,9 +33,11 @@ trait CVC5Solver extends CVCSolver with CVC5Target {
   // charged all that was spent since the previous one
   override protected def resourcesSinceLastCheck: Boolean = true
 
-  override protected def resourceCount(): Option[Long] = interpreter match {
-    case cvc5: PipelinedCVC5Interpreter => cvc5.resourceUnitsUsed()
-    case _ => None
+  override protected def resourceCount(): Option[Long] = recordedCount("resource-units") {
+    interpreter match {
+      case cvc5: PipelinedCVC5Interpreter => cvc5.resourceUnitsUsed()
+      case _ => None
+    }
   }
 
   // Under `--strings-bmp`, restrict the string alphabet to the BMP (by default, cvc5 uses all

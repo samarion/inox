@@ -78,11 +78,28 @@ trait SMTLIBTarget extends SMTLIBParser with Interruptible with ADTManagers {
       freed = true
       (wasFreed, interrupted)
     }
+    if (!wasFreed) transcript.foreach(_.close())
     if (!wasFreed && (wasInterrupted || !recycle())) interpreter.free()
   }
 
+  // The session of the transcript that this solver records its commands to, or answers them from (see
+  // `SMTTranscript`). Lazy, as the targets emit commands as they are created.
+  private lazy val transcript: Option[SMTTranscript#Session] =
+    context.options.findOptionOrDefault(optSMTTranscript).map(_.session())
+
   /* Send a command to the solver */
-  def emit(cmd: SExpr, rawOut: Boolean = false): SExpr = interpreter match {
+  def emit(cmd: SExpr, rawOut: Boolean = false): SExpr = transcript match {
+    case Some(session) =>
+      try session(cmd)(send(cmd, rawOut))
+      catch { case e: SMTTranscript.MismatchException => throw new InternalSolverError(targetName, e.getMessage) }
+    case None => send(cmd, rawOut)
+  }
+
+  /** A count that the solver gets from its process without a command, which a transcript records as well. */
+  protected def recordedCount(name: String)(count: => Option[Long]): Option[Long] =
+    transcript.fold(count)(_.value(name)(count))
+
+  private def send(cmd: SExpr, rawOut: Boolean): SExpr = interpreter match {
     // the command's answer is read with that of the next command that isn't sent this way, and
     // an error is reported there
     case pipelined: PipelinedInterpreter if !rawOut && pipelined.pipelines(cmd) =>
