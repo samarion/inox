@@ -55,6 +55,9 @@ MAJOR_RESOURCES_FACTOR = 5.0
 MAJOR_RESOURCES_MIN = 25 * MILLION
 MAJOR_UNROLLINGS_FACTOR = 3.0
 MAJOR_UNROLLINGS_MIN = 20
+# A total that changes by less than this factor, or less than the totals of
+# the builds of main differ from each other, is within noise.
+TOTAL_NOISE = 1.1
 # Without this many earlier builds of main, the factor of the resources is
 # this much larger.
 MIN_HISTORY = 2
@@ -124,6 +127,15 @@ def compare(title, head, base, history):
     for m in METRICS:
         both = [k for k in common if number(head[k].get(m)) is not None and number(base[k].get(m)) is not None]
         job[m] = {"count": len(both), "base": sum(base[k][m] for k in both), "head": sum(head[k][m] for k in both)}
+        # How much the totals of the builds of main differ from the base's, on
+        # the same tests: a change of the total within that is noise.
+        spread = 0.0
+        for x in history:
+            hb = [k for k in both if number(x.get(k, {}).get(m)) is not None]
+            if hb:
+                th, tb = sum(x[k][m] for k in hb), sum(base[k][m] for k in hb)
+                spread = max(spread, abs(math.log((th + 1) / (tb + 1))))
+        job[m]["noise"] = round(spread, 4)
 
     changed, major = [], []
     for k in common:

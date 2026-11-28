@@ -23,6 +23,7 @@ comment, hidden, for the next updates.
 
 import base64
 import json
+import math
 import re
 import sys
 import zlib
@@ -245,13 +246,14 @@ def total(job, metric):
     if not t.get("count"):
         return "–"
     b, h = t["base"], t["head"]
-    if b == h:
-        return "same"
     shown = work if metric == "resources" else (lambda v: f"{v:,}")
     r = (h + 1) / (b + 1)
-    text = f"×{r:.2f} ({shown(b)} → {shown(h)})"
-    # Totals move a little with the symbol names: only bold what is beyond.
-    return f"<b>{text}</b>" if r >= 1.1 or r <= 1 / 1.1 else text
+    # Totals move a little with the names of the symbols, as the builds of
+    # main show: a change within that is the same as main's.
+    if abs(math.log(r)) <= max(math.log(ru.TOTAL_NOISE), t.get("noise") or 0):
+        return "within noise"
+    what = "more" if r > 1 else "less"
+    return f"<b>×{r:.2f} {what}</b> ({shown(b)} → {shown(h)})"
 
 
 def usage_table(sections, with_details=True):
@@ -307,6 +309,10 @@ def usage_table(sections, with_details=True):
     elif changed:
         out += [f"_{len(changed)} tests changed: too many to list here._", ""]
     notes = []
+    if any(total(j, m) == "within noise" for j in jobs for m in ru.METRICS):
+        notes.append(f"Within noise: the total differs from `main`'s by less than "
+                     f"{(ru.TOTAL_NOISE - 1) * 100:.0f}%, or by no more than earlier builds of `main` differ "
+                     f"from each other.")
     for j in jobs:
         if j.get("new") or j.get("gone"):
             notes.append(f"{j['label']}: {j['count']:,} tests compared"
