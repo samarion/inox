@@ -32,8 +32,6 @@ abstract class Z3Unrolling(override val program: Program)
 
   override def resourceLimitReached: Boolean = underlying.resourceLimitReached
 
-  override def resourceUsage: ResourceUsage = underlying.resourceUsage
-
   override val templates =
     new TemplatesImpl(targetProgram, context)(using targetSemantics)
 

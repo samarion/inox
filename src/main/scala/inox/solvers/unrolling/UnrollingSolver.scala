@@ -215,6 +215,12 @@ abstract class AbstractUnrollingSolver private
   private var unrollBoundHit: Boolean = false
   override def unrollBoundReached: Boolean = unrollBoundHit
 
+  // The unrollings that each check performed, see `resourceUsage`
+  @volatile private var unrollCounts: Vector[Int] = Vector.empty
+
+  override def resourceUsage: ResourceUsage =
+    underlying.resourceUsage.copy(unrollings = unrollCounts)
+
   protected val freeVars  = new IncrementalMap[Variable, Encoded]()
   private val constraints = new IncrementalSeq[Expr]()
 
@@ -1362,7 +1368,10 @@ abstract class AbstractUnrollingSolver private
     // then one more level with each unrolling (see [[LambdaTemplates.witnessEqualities]])
     private var witnessLevel: Int = 0
 
-    def run(): config.Response[Model, Assumptions] = {
+    def run(): config.Response[Model, Assumptions] =
+      try runStates() finally unrollCounts :+= unrollCount
+
+    private def runStates(): config.Response[Model, Assumptions] = {
       var currentState: CheckState = ModelCheck
       while (!currentState.isInstanceOf[CheckResult]) {
         currentState = currentState match {
