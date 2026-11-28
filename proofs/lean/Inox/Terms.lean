@@ -1238,13 +1238,15 @@ def lastDisjunct : Term → Option Term
   | _ => none
 
 /-- A root step for each constant that ends the disjunction of a fact `(=> b (or … d))` or
-`(or … d)` and that neither the base clauses, the equations, the steps `fresh` nor the definitions
-`defs` mention, as the `diverges` of the decreases clauses: such a constant may be true. Nothing
-relies on this: the check decides that the steps are fresh. -/
+`(or … d)`, as the `diverges` of the decreases clauses, or whose negation implies a fact
+`(=> (not d) …)`, as the rest of a dispatch of an application, and that neither the base clauses,
+the equations, the steps `fresh` nor the definitions `defs` mention: such a constant may be true.
+Nothing relies on this: the check decides that the steps are fresh. -/
 def unconstrained (eqs : List Equation) (base : List Term) (fresh : List Step) (defs : List Term)
     (facts : List Term) : List Step :=
   let names := addClauseNames {} (base ++ eqs.map (·.term) ++ fresh.flatMap (·.clauses) ++ defs)
   let ends := facts.filterMap fun t => match t with
+    | .Apply (.Apply (.UOp .imp) (.Apply (.UOp .not) d@(.UConst _ _))) _ => some d
     | .Apply (.Apply (.UOp .imp) _) c => lastDisjunct c
     | c => lastDisjunct c
   let ok (c : Term) : Bool := match asConst (__eo_to_smt c) with

@@ -2,6 +2,7 @@
 import Inox.Reach
 import Inox.Quant
 import Inox.Source
+import Inox.Instantiate
 
 /-!
 # An accepted certificate: the query has no solution, whatever the calls of the program
@@ -196,6 +197,19 @@ def Paths.assumedQuery (p : Paths) (D : List Data) (S : List Sig) (Γ : List (Id
         assumesW D S Γ (fun t => t) (closeK p.defs p.defs.length (lits g true) ++ p.K0) ψ q
   | _ => false
 
+/-- `t` is `(=> g ψ)`, where `ψ` is an instance of a universal quantifier `Q` of `Qs` that is an
+assumption that the evaluation of an expression of the query `qs` goes through, under the literals
+that `g` makes known. -/
+def Paths.instQuery (p : Paths) (D : List Data) (S : List Sig) (Γ : List (Id × Ty))
+    (qs : List Expr) (Qs : List Term) : Term → Bool
+  | .Apply (.Apply (.UOp .imp) g) ψ =>
+    decide (__smtx_typeof (__eo_to_smt g) = .Bool) &&
+      decide (__smtx_typeof (__eo_to_smt ψ) = .Bool) &&
+      Qs.any fun Q => Inox.Instantiate.instanceOf Q ψ &&
+        qs.any fun q => assumesW D S Γ (fun t => t)
+          (closeK p.defs p.defs.length (lits (__eo_to_smt g) true) ++ p.K0) (__eo_to_smt Q) q
+  | _ => false
+
 /-- The fact `t` holds where the calls that evaluation goes through have values: it holds without
 the defining equations, or it is, as it is or as the clause of an instance of a template, an
 instance of a defining equation whose guard guards its call, or an assumption of a call whose
@@ -210,8 +224,9 @@ def reachedCovered (r : TermSteps) : Term → Bool :=
   let ok := fun φ => guardedEq r.equations J φ || p.assumed D S J φ || p.assumedQuery D S Γ qs φ
   let sub := (substituted r).filter fun q => ok q.2
   let inst := Std.HashSet.ofList (sub.map Prod.fst)
+  let Qs := r.query.flatMap Inox.Instantiate.foralls
   fun t => ({ r with equations := [] } : TermSteps).covered t || ok (__eo_to_smt t) ||
-    inst.contains t
+    inst.contains t || p.instQuery D S Γ qs Qs t
 
 /-- No fresh symbol is a function of `S` or a variable of `Γ`. -/
 def apart (D : List Data) (S : List Sig) (Γ : List (Id × Ty)) (r : TermSteps) : Bool :=
@@ -527,6 +542,35 @@ theorem assumedQuery_sound (hO : O.Sound) (hty : LogosTyping) (hS : SigOk D S) (
       exact eval_imp_true hty hM.wf hg
   · simp at h
 
+/-- A clause that states an instance of a quantifier that is an assumption of the query is true,
+where the query has values. -/
+theorem instQuery_sound (hO : O.Sound) (hty : LogosTyping) (hS : SigOk D S) (hP : ProgTy D S P)
+    {Γ : List (Id × Ty)} {env : Env} (hEnv : EnvTy D Γ env) {p : Paths} {M : SmtModel}
+    (hM : Ctx O P D S Γ env p M) {qs : List Expr}
+    (hqs : ∀ q ∈ qs, (∃ q', QTy D S Γ q q') ∧ ∃ n v, eval O P n env q = .Ok v)
+    {Qs : List Term} {t : Term} (h : p.instQuery D S Γ qs Qs t = true) :
+    __smtx_model_eval M (__eo_to_smt t) = SmtValue.Boolean true := by
+  unfold Paths.instQuery at h
+  split at h
+  · next g ψ =>
+    simp only [Bool.and_eq_true, decide_eq_true_eq, List.any_eq_true] at h
+    obtain ⟨⟨hg, hψ⟩, Q, _, hi, q, hq, ha⟩ := h
+    show __smtx_model_eval_imp (__smtx_model_eval M (__eo_to_smt g))
+      (__smtx_model_eval M (__eo_to_smt ψ)) = _
+    obtain ⟨bg, hbg⟩ := eval_bool hty hM.wf hg
+    cases bg
+    · obtain ⟨b, hb⟩ := eval_bool hty hM.wf hψ
+      rw [hbg, hb]
+      cases b <;> rfl
+    · have hK := kSound_append (kSound_closeK hM.defs p.defs.length (lits_sound _ true hbg))
+        hM.known
+      obtain ⟨⟨q', hqt⟩, n, v, hn⟩ := hqs q hq
+      have hQv := q_holds_of_assumes hO hty hS hP.2 (call_ty' hO hty hS hP n) hqt env v hEnv hn M
+        hM.wf (hM.calls n) hM.vars _ hK _ ha
+      rw [Inox.Instantiate.instanceOf_sound hM.wf hi hQv]
+      exact eval_imp_true hty hM.wf hg
+  · simp at h
+
 end Sound
 
 /-! ## The steps of a certificate -/
@@ -677,7 +721,7 @@ theorem holds_reachedCovered (hO : O.Sound) (hty : LogosTyping) (hS : SigOk D S)
       exact assumedQuery_sound hO hty hS hP hEnv hM hqs hφ
   simp only [reachedCovered, Bool.or_eq_true, Std.HashSet.contains_ofList,
     List.contains_iff_mem] at h
-  rcases h with (h | h) | h
+  rcases h with ((h | h) | h) | h
   · exact holds_covered hty (r := { r with equations := [] }) h hsub M
       (fun e he => by cases he) hsat
   · exact hok _ (by simpa using h)
@@ -685,6 +729,8 @@ theorem holds_reachedCovered (hO : O.Sound) (hty : LogosTyping) (hS : SigOk D S)
     obtain ⟨q, ⟨hmem, hg⟩, rfl⟩ := h
     rw [eval_of_substituted hty hsub hsat hmem]
     exact hok _ (by simpa using hg)
+  · subst hSr hΓr
+    exact instQuery_sound hO hty hS hP hEnv hM hqs h
 
 end Steps
 
