@@ -3,6 +3,7 @@ import Inox.Reach
 import Inox.Quant
 import Inox.Source
 import Inox.Instantiate
+import Inox.Entailed
 
 /-!
 # An accepted certificate: the query has no solution, whatever the calls of the program
@@ -31,7 +32,9 @@ The check, `reachedCheck`:
   that make the guard of the call true (`Paths.assumed`, with the bodies read with their
   assumptions, `bodyOf`), or the same of an expression of the query (`Paths.assumedQuery`, with
   the query read with its assumptions, `TermSteps.query`), as it is or once the definitions of
-  the local symbols of its instance are in place;
+  the local symbols of its instance are in place, or that is an instance of a universal
+  quantifier that the query assumes (`Paths.instQuery`), or that follows from the clauses of the
+  steps and the facts that it accepts otherwise (`entailedBy` of `Inox/Entailed.lean`);
 - `apart`: no fresh symbol is a function of the program or a variable of the query, so that
   reinterpreting one keeps the models where the calls and the variables agree.
 
@@ -214,7 +217,7 @@ def Paths.instQuery (p : Paths) (D : List Data) (S : List Sig) (Γ : List (Id ×
 the defining equations, or it is, as it is or as the clause of an instance of a template, an
 instance of a defining equation whose guard guards its call, or an assumption of a call whose
 guard holds, or one of the query. -/
-def reachedCovered (r : TermSteps) : Term → Bool :=
+def reachedCovered0 (r : TermSteps) : Term → Bool :=
   let J := guardedCalls r
   let p := pathsOf r
   let D := dataOf r
@@ -227,6 +230,14 @@ def reachedCovered (r : TermSteps) : Term → Bool :=
   let Qs := r.query.flatMap Inox.Instantiate.foralls
   fun t => ({ r with equations := [] } : TermSteps).covered t || ok (__eo_to_smt t) ||
     inst.contains t || p.instQuery D S Γ qs Qs t
+
+/-- The fact `t` holds where the calls that evaluation goes through have values: as
+`reachedCovered0` decides, or since it follows from the clauses of the steps and the facts that
+`reachedCovered0` accepts. -/
+def reachedCovered (r : TermSteps) : Term → Bool :=
+  let covered := reachedCovered0 r
+  let C := (extend r.base r.fresh ++ r.facts.filter covered).map __eo_to_smt
+  fun t => covered t || entailedBy [] C r.baseLits (__eo_to_smt t)
 
 /-- No fresh symbol is a function of `S` or a variable of `Γ`. -/
 def apart (D : List Data) (S : List Sig) (Γ : List (Id × Ty)) (r : TermSteps) : Bool :=
@@ -688,8 +699,8 @@ theorem eval_of_substituted (hty : LogosTyping) {r : TermSteps} {M : SmtModel}
     exact defBinding_sound hty hsat.1 hb (hsat.2 d (hsub hd.2))
   exact (eval_subst2 hσ hnb).symm
 
-/-- A fact that `reachedCovered` accepts holds in the models that the check is about. -/
-theorem holds_reachedCovered (hO : O.Sound) (hty : LogosTyping) (hS : SigOk D S)
+/-- A fact that `reachedCovered0` accepts holds in the models that the check is about. -/
+theorem holds_reachedCovered0 (hO : O.Sound) (hty : LogosTyping) (hS : SigOk D S)
     (hP : ProgTy D S P) {Γ : List (Id × Ty)} {env : Env} (hEnv : EnvTy D Γ env) {r : TermSteps}
     (hbase : ∀ t ∈ r.base, ∃ q, HasTy D S Γ q .BooleanType ∧ __eo_to_smt t = tr D S Γ q ∧
       ∃ n v, eval O P n env q = .Ok v)
@@ -697,7 +708,7 @@ theorem holds_reachedCovered (hO : O.Sound) (hty : LogosTyping) (hS : SigOk D S)
     (hΓr : Γ = varsOf (sigsR r) r.query)
     (hqs : ∀ q ∈ queryOf r.query, (∃ q', QTy D S Γ q q') ∧ ∃ n v, eval O P n env q = .Ok v)
     {t : Term}
-    (h : reachedCovered r t = true) {assums : List Term}
+    (h : reachedCovered0 r t = true) {assums : List Term}
     (hsub : extend r.base r.fresh ⊆ assums) :
     Holds (fun M => Agrees O P D S Γ env M ∧ ∀ st ∈ r.fresh, st.Only M) assums t := by
   subst hDr
@@ -719,7 +730,7 @@ theorem holds_reachedCovered (hO : O.Sound) (hty : LogosTyping) (hS : SigOk D S)
       · exact assumed_sound hO hty hS hP hM hE hJ (hSr ▸ hφ)
     · subst hSr hΓr
       exact assumedQuery_sound hO hty hS hP hEnv hM hqs hφ
-  simp only [reachedCovered, Bool.or_eq_true, Std.HashSet.contains_ofList,
+  simp only [reachedCovered0, Bool.or_eq_true, Std.HashSet.contains_ofList,
     List.contains_iff_mem] at h
   rcases h with ((h | h) | h) | h
   · exact holds_covered hty (r := { r with equations := [] }) h hsub M
@@ -731,6 +742,33 @@ theorem holds_reachedCovered (hO : O.Sound) (hty : LogosTyping) (hS : SigOk D S)
     exact hok _ (by simpa using hg)
   · subst hSr hΓr
     exact instQuery_sound hO hty hS hP hEnv hM hqs h
+
+/-- A fact that `reachedCovered` accepts holds in the models that the check is about. -/
+theorem holds_reachedCovered (hO : O.Sound) (hty : LogosTyping) (hS : SigOk D S)
+    (hP : ProgTy D S P) {Γ : List (Id × Ty)} {env : Env} (hEnv : EnvTy D Γ env) {r : TermSteps}
+    (hbase : ∀ t ∈ r.base, ∃ q, HasTy D S Γ q .BooleanType ∧ __eo_to_smt t = tr D S Γ q ∧
+      ∃ n v, eval O P n env q = .Ok v)
+    (hDr : D = dataOf r) (hSr : S = sigsR r) (hE : ∀ e ∈ r.equations, EqBody P D S e)
+    (hΓr : Γ = varsOf (sigsR r) r.query)
+    (hqs : ∀ q ∈ queryOf r.query, (∃ q', QTy D S Γ q q') ∧ ∃ n v, eval O P n env q = .Ok v)
+    {t : Term}
+    (h : reachedCovered r t = true) {assums : List Term}
+    (hsub : extend r.base r.fresh ⊆ assums) :
+    Holds (fun M => Agrees O P D S Γ env M ∧ ∀ st ∈ r.fresh, st.Only M) assums t := by
+  intro M hG hsat
+  simp only [reachedCovered, Bool.or_eq_true] at h
+  rcases h with h | h
+  · exact holds_reachedCovered0 hO hty hS hP hEnv hbase hDr hSr hE hΓr hqs h hsub M hG hsat
+  · have hC : ∀ c ∈ (extend r.base r.fresh ++ r.facts.filter (reachedCovered0 r)).map
+        __eo_to_smt, __smtx_model_eval M c = SmtValue.Boolean true := by
+      intro c hc
+      obtain ⟨u, hu, rfl⟩ := List.mem_map.mp hc
+      rcases List.mem_append.mp hu with hu | hu
+      · exact hsat.2 u (hsub hu)
+      · exact holds_reachedCovered0 hO hty hS hP hEnv hbase hDr hSr hE hΓr hqs
+          (List.of_mem_filter hu) hsub M hG hsat
+    exact entailedBy_sound hty (eqs := []) (fun e he => by cases he) hsat.1 hC
+      (kSound_baseLits hty hsat.1 fun t ht => hsat.2 t (hsub ht)) h
 
 end Steps
 

@@ -1237,23 +1237,39 @@ def lastDisjunct : Term → Option Term
     | _ => lastDisjunct r
   | _ => none
 
+/-- The constants that conclude implications in `t`. -/
+def concluded : Term → List Term
+  | .Apply (.Apply (.UOp .imp) a) c => (match c with
+      | .UConst _ _ => [c]
+      | _ => concluded c) ++ concluded a
+  | .Apply f a => concluded f ++ concluded a
+  | _ => []
+
 /-- A root step for each constant that ends the disjunction of a fact `(=> b (or … d))` or
 `(or … d)`, as the `diverges` of the decreases clauses, or whose negation implies a fact
 `(=> (not d) …)`, as the rest of a dispatch of an application, and that neither the base clauses,
-the equations, the steps `fresh` nor the definitions `defs` mention: such a constant may be true.
-Nothing relies on this: the check decides that the steps are fresh. -/
+the equations, the steps `fresh` nor the definitions `defs` mention, or that concludes an
+implication in the value of a definition of `fresh`, as the result of a function that no clause
+constrains in the conjunction of a typing, and that is not the constant of a step: such a constant
+may be true. Nothing relies on this: the check decides that the steps are fresh. -/
 def unconstrained (eqs : List Equation) (base : List Term) (fresh : List Step) (defs : List Term)
     (facts : List Term) : List Step :=
-  let names := addClauseNames {} (base ++ eqs.map (·.term) ++ fresh.flatMap (·.clauses) ++ defs)
+  let names0 := addClauseNames {} (base ++ eqs.map (·.term) ++ defs)
+  let names := addClauseNames names0 (fresh.flatMap (·.clauses))
+  let consts := addClauseNames {} (fresh.map (·.const))
   let ends := facts.filterMap fun t => match t with
     | .Apply (.Apply (.UOp .imp) (.Apply (.UOp .not) d@(.UConst _ _))) _ => some d
     | .Apply (.Apply (.UOp .imp) _) c => lastDisjunct c
     | c => lastDisjunct c
-  let ok (c : Term) : Bool := match asConst (__eo_to_smt c) with
+  let results := fresh.flatMap fun st => match st with
+    | .define _ rhs => concluded rhs
+    | _ => []
+  let ok (names : Std.HashSet SmtEval.native_String) (c : Term) : Bool :=
+    match asConst (__eo_to_smt c) with
     | some (s, T) => T == SmtType.Bool && decide (Unreserved s) && !names.contains s &&
-        eqs.all fun e => !e.params.contains (s, T)
+        !consts.contains s && eqs.all fun e => !e.params.contains (s, T)
     | none => false
-  (ends.eraseDups.filter ok).map Step.root
+  ((ends.filter (ok names) ++ results.filter (ok names0)).eraseDups).map Step.root
 
 /-- The source expressions among the clauses `terms` of the second parse, which come last. -/
 def expressionTerms (checked : Checked) (terms : List Term) : List Term :=
@@ -1456,6 +1472,13 @@ def andR (x y : SmtTerm) : SmtTerm :=
   else if y = .Boolean true ∧ __smtx_typeof x = .Bool then x
   else .and x y
 
+/-- `(=> x y)`, where a Boolean operand that is a literal decides it. -/
+def impR (x y : SmtTerm) : SmtTerm :=
+  if x = .Boolean false ∧ __smtx_typeof y = .Bool then .Boolean true
+  else if y = .Boolean true ∧ __smtx_typeof x = .Bool then .Boolean true
+  else if x = .Boolean true ∧ __smtx_typeof y = .Bool then y
+  else .imp x y
+
 /-- `r`, unless `K` gives `t` a value. -/
 def lookupOr (K : List (SmtTerm × Bool)) (t r : SmtTerm) : SmtTerm :=
   match known K t with
@@ -1475,6 +1498,7 @@ def red (K : List (SmtTerm × Bool)) : SmtTerm → SmtTerm
     | x' => .not x')
   | .or x y => lookupOr K (.or x y) (orR (red K x) (red K y))
   | .and x y => lookupOr K (.and x y) (andR (red K x) (red K y))
+  | .imp x y => lookupOr K (.imp x y) (impR (red K x) (red K y))
   | .eq x y =>
     lookupOr K (.eq x y) (if red K x = red K y then .Boolean true else .eq (red K x) (red K y))
   | t => lookupOr K t t

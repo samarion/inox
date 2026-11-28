@@ -101,6 +101,24 @@ theorem eval_andR (hty : LogosTyping) {M : SmtModel} (hwf : model_wf M) (x y : S
     rw [h.1, hb]; cases b <;> rfl
   rfl
 
+theorem eval_impR (hty : LogosTyping) {M : SmtModel} (hwf : model_wf M) (x y : SmtTerm) :
+    __smtx_model_eval M (impR x y) =
+      __smtx_model_eval_imp (__smtx_model_eval M x) (__smtx_model_eval M y) := by
+  unfold impR
+  split
+  · next h =>
+    obtain ⟨b, hb⟩ := eval_bool hty hwf h.2
+    rw [h.1, hb]; cases b <;> rfl
+  split
+  · next h =>
+    obtain ⟨b, hb⟩ := eval_bool hty hwf h.2
+    rw [h.1, hb]; cases b <;> rfl
+  split
+  · next h =>
+    obtain ⟨b, hb⟩ := eval_bool hty hwf h.2
+    rw [h.1, hb]; cases b <;> rfl
+  rfl
+
 /-- Reducing a term under literals that have their values keeps its value. -/
 theorem eval_red (hty : LogosTyping) {M : SmtModel} (hwf : model_wf M) {K : List (SmtTerm × Bool)}
     (hK : KSound M K) (t : SmtTerm) : __smtx_model_eval M (red K t) = __smtx_model_eval M t := by
@@ -128,6 +146,10 @@ theorem eval_red (hty : LogosTyping) {M : SmtModel} (hwf : model_wf M) {K : List
     simp only [red]
     apply eval_lookupOr hK
     rw [eval_andR hty hwf, eval_red hty hwf hK x, eval_red hty hwf hK y]; rfl
+  case imp x y =>
+    simp only [red]
+    apply eval_lookupOr hK
+    rw [eval_impR hty hwf, eval_red hty hwf hK x, eval_red hty hwf hK y]; rfl
   case eq x y =>
     simp only [red]
     apply eval_lookupOr hK
