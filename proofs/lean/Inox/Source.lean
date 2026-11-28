@@ -1210,6 +1210,18 @@ theorem lookup_ctor_of : ∀ {D : List Data} {c : Id} {d : Data} {i : Nat} {fs :
       simp only [hl, Option.map_none] at h
       exact lookup_ctor_of h
 
+theorem findCtor_of_lookup : ∀ {D : List Data} {c : Id} {k : Constructor},
+    lookup_ctor (D.flatMap ctorsOfData) c = .Ok k → ∃ d i fs, findCtor D c = some (d, i, fs)
+  | [], _, _, h => by simp [lookup_ctor] at h
+  | a :: D, c, k, h => by
+    rw [List.flatMap_cons, ctorsOfData, lookup_ctor_data] at h
+    simp only [findCtor, List.findSome?_cons, ctorIn]
+    cases hl : lookupIdx c a.ctors with
+    | some r => exact ⟨a, r.1, r.2, by simp⟩
+    | none =>
+      simp only [hl] at h
+      simpa [findCtor, ctorIn] using findCtor_of_lookup h
+
 theorem lookup_sort_of : ∀ {D : List Data} {d : Data}, d ∈ D →
     lookup_sort (D.map fun d => ADTSort.Sort d.name [] none none) d.name =
       .Ok (.Sort d.name [] none none)
@@ -1300,8 +1312,9 @@ def programOf (D : List Data) (eqs : List Equation) : Program :=
 
 theorem progData_programOf (D : List Data) (eqs : List Equation) :
     ProgData D (programOf D eqs) := by
-  intro c d i fs h
-  exact ⟨lookup_ctor_of h, lookup_sort_of (findCtor_spec h).1⟩
+  simp only [programOf, ProgData]
+  exact ⟨fun c d i fs h => ⟨lookup_ctor_of h, lookup_sort_of (findCtor_spec h).1⟩,
+    fun c k h => findCtor_of_lookup h⟩
 
 /-- The functions of the signatures `U`, with the bodies `bodies`. -/
 def freeDefs (U : List Sig) (bodies : List Expr) : List FunDef :=
@@ -1324,8 +1337,9 @@ theorem programWith_nil (D : List Data) (eqs : List Equation) :
 
 theorem progData_programWith (D : List Data) (eqs : List Equation) (extra : List FunDef) :
     ProgData D (programWith D eqs extra) := by
-  intro c d i fs h
-  exact ⟨lookup_ctor_of h, lookup_sort_of (findCtor_spec h).1⟩
+  simp only [programWith, ProgData]
+  exact ⟨fun c d i fs h => ⟨lookup_ctor_of h, lookup_sort_of (findCtor_spec h).1⟩,
+    fun c k h => findCtor_of_lookup h⟩
 
 /-- The free variables of the clauses `base`: their constants, other than the functions of `S`. -/
 def varsOf (S : List Sig) (base : List Term) : List (Id × Ty) :=
@@ -1356,19 +1370,28 @@ def eqCheck (D : List Data) (S : List Sig) (e : Equation) : Bool :=
 def varsCheck (D : List Data) (S : List Sig) (Γ : List (Id × Ty)) : Bool :=
   Γ.all fun p => (kind D p.2).isSome && S.all fun s => p.1 != s.name
 
-/-- Whether `T` is the type of a parameter of a quantifier: an integer or a Boolean. -/
-def bindsTy : Ty → Bool
-  | .IntegerType | .BooleanType => true
-  | _ => false
+/-- Whether `T` is the type of a parameter of a quantifier: an integer, a Boolean, or a datatype
+of `D` when the fields of the datatypes of `D` are integers, Booleans or datatypes. -/
+def bindsTy (D : List Data) (T : Ty) : Bool :=
+  simpleTy T && (kind D T).isSome && match T with
+    | .IntegerType | .BooleanType => true
+    | _ => simpleData D
 
-theorem bindsTy_spec {T : Ty} (h : bindsTy T = true) : T = .IntegerType ∨ T = .BooleanType := by
-  cases T <;> simp_all [bindsTy]
+theorem bindsTy_spec {D : List Data} {S : List Sig} {x : Id} {T : Ty} (h : bindsTy D T = true)
+    (hx : ∀ s ∈ S, x ≠ s.name) (hu : Unreserved (nm x)) : QBinder D S x T := by
+  simp only [bindsTy, Bool.and_eq_true] at h
+  obtain ⟨⟨hs, hk⟩, hd⟩ := h
+  refine ⟨⟨hs, fragTy_of_kind hk⟩, ?_, hx, hu⟩
+  split at hd
+  · exact .inl rfl
+  · exact .inr (.inl rfl)
+  · exact .inr (.inr hd)
 
 /-- Whether `p` is an assumption of the query (`Formula`): a Boolean, or the universal
-quantifier of one parameter, an integer or a Boolean named after no function, over a Boolean. -/
+quantifier of one parameter of a type of `bindsTy`, named after no function, over a Boolean. -/
 def formulaCheck (D : List Data) (S : List Sig) (Γ : List (Id × Ty)) : Expr → Bool
   | .Forall [.Param x T] b =>
-    bindsTy T && S.all (fun s => x != s.name) &&
+    bindsTy D T && S.all (fun s => x != s.name) &&
       decide (Unreserved (nm x)) && decide (infer D S ((x, T) :: Γ) b = some .bool)
   | p => decide (infer D S Γ p = some .bool)
 
@@ -1558,7 +1581,7 @@ theorem formula_sound (hD : DataOk D) (S : List Sig) (Γ : List (Id × Ty)) (p :
   · rename_i x T b
     simp only [Bool.and_eq_true, decide_eq_true_eq, List.all_eq_true, bne_iff_ne] at h
     obtain ⟨⟨⟨hT, hx⟩, hu⟩, hb⟩ := h
-    exact .forall_ ⟨bindsTy_spec hT, fun s hs => hx s hs, hu⟩ (infer_sound hD S _ b .bool hb)
+    exact .forall_ (bindsTy_spec hT (fun s hs => hx s hs) hu) (infer_sound hD S _ b .bool hb)
   · exact .leaf (infer_sound hD S Γ p .bool (by simpa using h))
 
 mutual

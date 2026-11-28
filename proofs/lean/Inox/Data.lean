@@ -1107,11 +1107,12 @@ theorem subset_of {D : List Data} (hO : O.Sound) (P : Program) (ys : List Value)
       exact fun h => hin h.1
 
 /-- The program has the constructors of `D`, with their fields, in datatypes without type
-parameters, without invariants and without an equality of their own. -/
+parameters, without invariants and without an equality of their own, and no other constructor. -/
 def ProgData (D : List Data) : Program → Prop
-  | .Program _ cs ss _ _ => ∀ c d i fs, findCtor D c = some (d, i, fs) →
+  | .Program _ cs ss _ _ => (∀ c d i fs, findCtor D c = some (d, i, fs) →
       lookup_ctor cs c = .Ok (.Constructor c d.name (fs.map fun f => .Param f.1 f.2)) ∧
-      lookup_sort ss d.name = .Ok (.Sort d.name [] none none)
+      lookup_sort ss d.name = .Ok (.Sort d.name [] none none)) ∧
+    ∀ c k, lookup_ctor cs c = .Ok k → ∃ d i fs, findCtor D c = some (d, i, fs)
 
 /-- The values of a datatype of `D` are compared structurally. -/
 theorem sort_equality_of {D : List Data} {P : Program} (hPD : ProgData D P) {c : Id} {d : Data}
@@ -1119,7 +1120,7 @@ theorem sort_equality_of {D : List Data} {P : Program} (hPD : ProgData D P) {c :
     sort_equality P c = none := by
   cases P with
   | Program fns cs ss is eq =>
-  obtain ⟨hlc, hls⟩ := hPD c d i fs hc
+  obtain ⟨hlc, hls⟩ := hPD.1 c d i fs hc
   simp only [sort_equality, hlc, hls]
 
 open Classical in

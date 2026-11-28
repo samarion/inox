@@ -11,8 +11,8 @@ negation of the body, whose constants of the parameters are the bound variables 
 appear as assumptions, which the translation leaves out. This module adds them to the
 expressions of the query (`QTy e e'`): the Booleans `e'` of the fragment with assumptions around
 Booleans, under conjunctions, disjunctions, negations and the branches of conditionals, where an
-assumption is a Boolean of the fragment or the universal quantifier of one parameter, an integer
-or a Boolean, whose body is (`Formula`).
+assumption is a Boolean of the fragment or the universal quantifier of one parameter, an integer,
+a Boolean or a datatype whose fields are such values, whose body is (`Formula`).
 
 The term of such an expression is that of `e'`, and so is its value where it has one
 (`tr_of_q`, `eval_of_q`), so what the theorems on the query use of the agreement and of the calls
@@ -24,7 +24,10 @@ which is, by `eval_subst`, the body where the constant of the parameter has that
 where the calls and the variables agree, for the environment where the parameter has the value of
 Inox of that value. Inox's quantifier is true where its body is true at every value of the type
 of its parameter (`Oracle.Sound.forall_result`), and the values of integers and Booleans are
-those of the values of Logos of their sorts. No assumption that the evaluation of the body of a
+those of the values of Logos of their sorts, as are those of datatypes whose fields are integers,
+Booleans or such datatypes: a value of Logos of such a datatype is a constructor applied to values
+of the sorts of its fields (`value_of_sort_k`), and Inox gives its values the type exactly when
+the bridge does (`has_type_iff_k`). No assumption that the evaluation of the body of a
 quantifier goes through is taken to hold, since it is evaluated at values that are not those of
 the query.
 -/
@@ -149,6 +152,23 @@ theorem applyAll_push (M : SmtModel) (s : native_String) (T : SmtType) (w : SmtV
     rw [model_eval_apply_push]
     exact applyAll_push M s T w _ ws
 
+/-- The types that a quantifier may range over, and the fields of the datatypes that it may range
+over: integers, Booleans and datatypes. -/
+def simpleTy : Ty → Bool
+  | .IntegerType | .BooleanType => true
+  | .ADTType _ args => args.isEmpty
+  | _ => false
+
+/-- The fields of the datatypes `D` are of the types of `simpleTy`. -/
+def simpleData (D : List Data) : Bool :=
+  D.all fun d => d.ctors.all fun c => c.2.all fun f => simpleTy f.2
+
+theorem simpleTy_field {D : List Data} (h : simpleData D = true) {d : Data} (hd : d ∈ D)
+    {c : Id × List (Id × Ty)} (hc : c ∈ d.ctors) {f : Id × Ty} (hf : f ∈ c.2) :
+    simpleTy f.2 = true := by
+  simp only [simpleData, List.all_eq_true] at h
+  exact h d hd c hc f hf
+
 section Agree
 variable {O : Oracle} {P : Program} {S : List Sig}
 
@@ -160,10 +180,12 @@ theorem callsOk_push {n : Int} {M : SmtModel} (hc : CallsOk O P D S n M) (s : na
   rw [applyAll_push, lookup_push]
   exact this
 
-/-- What a quantifier asks of its parameter: an integer or a Boolean, not named after a function,
+/-- What a quantifier asks of its parameter: an integer, a Boolean or a datatype whose fields, as
+those of the datatypes they mention, are such values (`simpleTy`), not named after a function,
 with a name that Logos doesn't reserve. -/
-structure QBinder (S : List Sig) (x : Id) (T : Ty) : Prop where
-  ty : T = .IntegerType ∨ T = .BooleanType
+structure QBinder (D : List Data) (S : List Sig) (x : Id) (T : Ty) : Prop where
+  ty : simpleTy T = true ∧ FragTy D T
+  data : T = .IntegerType ∨ T = .BooleanType ∨ simpleData D = true
   fresh : ∀ s ∈ S, x ≠ s.name
   unreserved : Unreserved (nm x)
 
@@ -179,7 +201,7 @@ theorem bindingValues_bound (M : SmtModel) (x : Id) (T : Ty) (w : SmtValue) :
 /-- The term of the body of a quantifier, with the bound variable for the constant of its
 parameter, has, where the bound variable has the value `w`, the value of the term in the model
 where the constant has it. -/
-theorem eval_bound {S : List Sig} {x : Id} {T : Ty} (hB : QBinder S x T) (M : SmtModel)
+theorem eval_bound {S : List Sig} {x : Id} {T : Ty} (hB : QBinder D S x T) (M : SmtModel)
     (w : SmtValue) {Γ : List (Id × Ty)} {b : Expr} {U : Ty} (hb : HasTy D S ((x, T) :: Γ) b U) :
     __smtx_model_eval (native_model_push M (nm x) (trT D T) w)
         (substSmt (boundSubst (ptys D [(x, T)])) (tr D S ((x, T) :: Γ) b)) =
@@ -218,7 +240,7 @@ theorem lookup_bound_self (M : SmtModel) (x : Id) (T : Ty) (w : SmtValue) :
   rw [boundModel, lookup_setConsts]
   simp [bindingOf]
 
-theorem callsOk_bound {S : List Sig} {x : Id} {T : Ty} (hB : QBinder S x T) {n : Int}
+theorem callsOk_bound {S : List Sig} {x : Id} {T : Ty} (hB : QBinder D S x T) {n : Int}
     {M : SmtModel} (hc : CallsOk O P D S n M) (w : SmtValue) :
     CallsOk O P D S n (boundModel D M x T w) := by
   intro s' hs' tenv vs v hvs hcall
@@ -396,6 +418,241 @@ theorem bool_of_typeof {w : SmtValue} (h : __smtx_typeof_value w = .Bool) :
   case Char => simp only [__smtx_typeof_value, native_ite] at h; split at h <;> cases h
   all_goals simp [__smtx_typeof_value] at h
 
+/-! ## Values of datatypes -/
+
+theorem chainT_inj {s s' : native_String} {dd dd' : SmtDatatypeDecl} :
+    ∀ {Us Vs : List SmtType}, chainT (.Datatype s dd) Us = chainT (.Datatype s' dd') Vs →
+      s = s' ∧ dd = dd' ∧ Us = Vs
+  | [], [], h => by simp only [chainT, SmtType.Datatype.injEq] at h; exact ⟨h.1, h.2, rfl⟩
+  | [], _ :: _, h | _ :: _, [], h => by simp [chainT] at h
+  | U :: Us, V :: Vs, h => by
+    simp only [chainT, SmtType.DtcAppType.injEq] at h
+    obtain ⟨h1, h2, h3⟩ := chainT_inj h.2
+    exact ⟨h1, h2, by rw [h.1, h3]⟩
+
+theorem chainT_shape (s : native_String) (dd : SmtDatatypeDecl) (Us : List SmtType) :
+    chainT (.Datatype s dd) Us = .Datatype s dd ∨
+      ∃ A B, chainT (.Datatype s dd) Us = .DtcAppType A B := by
+  cases Us
+  · exact .inl rfl
+  · exact .inr ⟨_, _, rfl⟩
+
+/-- A value of a datatype, or of a constructor applied to some of its fields, is a constructor
+applied to values of the sorts of its fields. -/
+theorem spine_of_typeof {s0 : native_String} {dd0 : SmtDatatypeDecl} :
+    ∀ (w : SmtValue) (Us : List SmtType),
+      __smtx_typeof_value w = chainT (.Datatype s0 dd0) Us →
+      ∃ s dd i as Vs, w = applyVs (.DtCons s dd i) as ∧
+        __smtx_typeof_value (.DtCons s dd i) = chainT (.Datatype s0 dd0) (Vs ++ Us) ∧
+        List.Forall₂ (fun a V => __smtx_typeof_value a = V) as Vs
+  | .DtCons s dd i, Us, h => ⟨s, dd, i, [], [], rfl, h, .nil⟩
+  | .Apply f a, Us, h => by
+    have hne := chainT_ne (T := .Datatype s0 dd0) (by simp) Us
+    simp only [__smtx_typeof_value] at h
+    generalize hf : __smtx_typeof_value f = F at h
+    cases F
+    case DtcAppType A B =>
+      simp only [__smtx_typeof_apply_value, __smtx_typeof_guard, native_ite, native_Teq] at h
+      by_cases h1 : A = SmtType.None
+      · simp [h1] at h; exact absurd h.symm hne
+      · by_cases h2 : A = __smtx_typeof_value a
+        · have h1' : decide (A = SmtType.None) = false := by simpa using h1
+          have h2' : decide (A = __smtx_typeof_value a) = true := by simpa using h2
+          simp only [h1', h2', Bool.false_eq_true, ↓reduceIte] at h
+          subst h
+          obtain ⟨s, dd, i, as, Vs, rfl, hc, hs⟩ := spine_of_typeof f (A :: Us) (by rw [hf]; rfl)
+          refine ⟨s, dd, i, as ++ [a], Vs ++ [A], (applyVs_snoc _ _ _).symm, ?_, ?_⟩
+          · simpa using hc
+          · exact forall₂_snoc hs h2.symm
+        · simp [h1, h2] at h; exact absurd h.symm hne
+    all_goals simp [__smtx_typeof_apply_value] at h; exact absurd h.symm hne
+  | .Binary w x, Us, h => by
+    simp only [__smtx_typeof_value, native_ite] at h
+    rcases chainT_shape s0 dd0 Us with h' | ⟨_, _, h'⟩ <;> rw [h'] at h <;> split at h <;> cases h
+  | .Map m, Us, h => by
+    simp only [__smtx_typeof_value] at h
+    rcases chainT_shape s0 dd0 Us with h' | ⟨_, _, h'⟩ <;> rw [h'] at h <;>
+      rcases typeof_map_value_shape m with ⟨_, _, h''⟩ | h'' <;> rw [h''] at h <;> cases h
+  | .Set m, Us, h => by
+    simp only [__smtx_typeof_value] at h
+    rcases chainT_shape s0 dd0 Us with h' | ⟨_, _, h'⟩ <;> rw [h'] at h <;>
+      rcases typeof_map_value_shape m with ⟨A, B, h''⟩ | h'' <;> rw [h''] at h <;>
+      first | (cases B <;> simp [__smtx_map_to_set_type] at h) | simp [__smtx_map_to_set_type] at h
+  | .Seq q, Us, h => by
+    simp only [__smtx_typeof_value] at h
+    rcases chainT_shape s0 dd0 Us with h' | ⟨_, _, h'⟩ <;> rw [h'] at h <;>
+      rcases typeof_seq_value_shape q with ⟨_, h''⟩ | h'' <;> rw [h''] at h <;> cases h
+  | .Char c, Us, h => by
+    simp only [__smtx_typeof_value, native_ite] at h
+    rcases chainT_shape s0 dd0 Us with h' | ⟨_, _, h'⟩ <;> rw [h'] at h <;> split at h <;> cases h
+  | .NotValue, Us, h | .Boolean _, Us, h | .Numeral _, Us, h | .Real _, Us, h
+  | .Fun _ _ _, Us, h | .UValue _ _, Us, h | .RegLan _, Us, h => by
+    simp only [__smtx_typeof_value] at h
+    rcases chainT_shape s0 dd0 Us with h' | ⟨_, _, h'⟩ <;> rw [h'] at h <;> cases h
+
+theorem sizeOf_le_applyVs : ∀ (as : List SmtValue) (f : SmtValue), sizeOf f ≤ sizeOf (applyVs f as)
+  | [], f => by simp [applyVs]
+  | a :: as, f => by
+    have := sizeOf_le_applyVs as (.Apply f a)
+    simp only [applyVs, List.foldl_cons] at this ⊢
+    simp only [SmtValue.Apply.sizeOf_spec] at this
+    omega
+
+theorem sizeOf_lt_applyVs : ∀ (as : List SmtValue) (f : SmtValue) {a : SmtValue}, a ∈ as →
+    sizeOf a < sizeOf (applyVs f as)
+  | [], _, _, h => by cases h
+  | b :: as, f, a, h => by
+    rcases List.mem_cons.mp h with rfl | h
+    · have := sizeOf_le_applyVs as (.Apply f a)
+      simp only [applyVs, List.foldl_cons] at this ⊢
+      simp only [SmtValue.Apply.sizeOf_spec] at this
+      omega
+    · exact sizeOf_lt_applyVs as (.Apply f b) h
+
+theorem forall₂_imp_mem2 {α β : Type} {R Q : α → β → Prop} :
+    ∀ {l : List α} {m : List β}, List.Forall₂ R l m → (∀ a ∈ l, ∀ b ∈ m, R a b → Q a b) →
+      List.Forall₂ Q l m
+  | [], [], _, _ => .nil
+  | _ :: _, _ :: _, .cons h hs, f =>
+    .cons (f _ (.head _) _ (.head _) h)
+      (forall₂_imp_mem2 hs fun a ha b hb => f a (.tail _ ha) b (.tail _ hb))
+
+theorem values_of_forall₂ {D : List Data} : ∀ {as : List SmtValue} {Ts : List Ty},
+    List.Forall₂ (fun a T => ∃ u, trV D u = a ∧ HasV D u T) as Ts →
+    ∃ us, us.map (trV D) = as ∧ List.Forall₂ (HasV D) us Ts
+  | [], [], .nil => ⟨[], rfl, .nil⟩
+  | _ :: _, _ :: _, .cons ⟨u, hu, hT⟩ hs => by
+    obtain ⟨us, rfl, hus⟩ := values_of_forall₂ hs
+    exact ⟨u :: us, by simp [hu], .cons hT hus⟩
+
+/-- A value of Logos of the sort of a type of `simpleTy`, in datatypes whose fields are of such
+types, is that of a value of Inox of the type. -/
+theorem value_of_sort_k {D : List Data} (hD : DataOk D) (hsd : simpleData D = true) :
+    ∀ (k : Nat) (w : SmtValue) (T : Ty), sizeOf w < k → simpleTy T = true → FragTy D T →
+      __smtx_typeof_value w = trT D T → ∃ u, trV D u = w ∧ HasV D u T
+  | 0, _, _, h, _, _, _ => by omega
+  | k + 1, w, T, hk, hs, hT, h => by
+    cases T <;> simp only [simpleTy, List.isEmpty_iff] at hs <;> try cases hs
+    · obtain ⟨i, rfl⟩ := int_of_typeof h
+      exact ⟨.IntV i, rfl, trivial⟩
+    · obtain ⟨b, rfl⟩ := bool_of_typeof h
+      exact ⟨.BoolV b, rfl, trivial⟩
+    · rename_i s
+      simp only [FragTy, Option.isSome_iff_exists] at hT
+      obtain ⟨d, hfd⟩ := hT
+      obtain ⟨hd, rfl⟩ := findData_spec hfd
+      rw [trT_data hD hd] at h
+      obtain ⟨s', dd, i, as, Vs, rfl, hc, has⟩ :=
+        spine_of_typeof (s0 := nm d.name) (dd0 := d.decl) w [] h
+      simp only [List.append_nil, __smtx_typeof_value, cons_value_rec] at hc
+      cases hcf : ctorFields (__smtx_dt_resolve (__smtx_dd_lookup s' dd) dd) i with
+      | none =>
+        rw [hcf] at hc
+        exact absurd hc.symm (chainT_ne (by simp) Vs)
+      | some Fs =>
+        rw [hcf] at hc
+        obtain ⟨rfl, rfl, rfl⟩ := chainT_inj hc
+        rw [ctorFields_data hD hd] at hcf
+        cases hci : d.ctors[i]? with
+        | none => rw [hci] at hcf; cases hcf
+        | some cf =>
+          obtain ⟨c, fs⟩ := cf
+          rw [hci] at hcf
+          simp only [Option.map_some, Option.some.injEq] at hcf
+          subst hcf
+          have hcD := findCtor_of hD hd hci
+          have hmem : (c, fs) ∈ d.ctors := List.mem_of_getElem? hci
+          have hall : List.Forall₂ (fun a T => ∃ u, trV D u = a ∧ HasV D u T) as
+              (fs.map Prod.snd) := by
+            rw [List.forall₂_map_right_iff] at has ⊢
+            refine forall₂_imp_mem2 has fun a ha f hf hR => ?_
+            have := sizeOf_lt_applyVs as (.DtCons (nm d.name) d.decl i) ha
+            exact value_of_sort_k hD hsd k a f.2 (by omega) (simpleTy_field hsd hd hmem hf)
+              (hD.fields d hd _ hmem f hf) hR
+          obtain ⟨us, rfl, hus⟩ := values_of_forall₂ hall
+          refine ⟨.ADTV c [] us, ?_, hasV_adt hcD hus⟩
+          simp only [trV, hcD, trVs_eq]
+
+theorem pht_iff {O : Oracle} (hO : O.Sound) {P : Program} {D : List Data} {k : Nat}
+    (ih : ∀ u T env, sizeOf u < k → simpleTy T = true → FragTy D T →
+      (O.has_type P env u T = true ↔ HasV D u T)) :
+    ∀ (vs : List Value) (fs : List (Id × Ty)) (env : Env), (∀ v ∈ vs, sizeOf v < k) →
+      (∀ f ∈ fs, simpleTy f.2 = true ∧ FragTy D f.2) →
+      (O.params_have_types P env vs (fs.map fun f => .Param f.1 f.2) = true ↔
+        HasVs D vs (fs.map Prod.snd))
+  | [], [], _, _, _ => by simp [hO.params_have_types, HasVs]
+  | [], _ :: _, _, _, _ => by simp [hO.params_have_types, HasVs]
+  | _ :: _, [], _, _, _ => by simp [hO.params_have_types, HasVs]
+  | v :: vs, f :: fs, env, hv, hf => by
+    rw [hO.params_have_types]
+    simp only [List.map_cons, HasVs, Bool.and_eq_true]
+    rw [ih v f.2 env (hv v (.head _)) (hf f (.head _)).1 (hf f (.head _)).2,
+      pht_iff hO ih vs fs _ (fun w hw => hv w (.tail _ hw)) (fun g hg => hf g (.tail _ hg))]
+
+/-- The values of Inox of a type of `simpleTy`, in datatypes whose fields are of such types, are
+those that the bridge gives the type. -/
+theorem has_type_iff_k {O : Oracle} (hO : O.Sound) {D : List Data} (hD : DataOk D)
+    (hsd : simpleData D = true) {P : Program} (hPD : ProgData D P) :
+    ∀ (k : Nat) (u : Value) (T : Ty) (env : Env), sizeOf u < k → simpleTy T = true →
+      FragTy D T → (O.has_type P env u T = true ↔ HasV D u T)
+  | 0, _, _, _, h, _, _ => by omega
+  | k + 1, u, T, env, hk, hs, hT => by
+    cases T <;> simp only [simpleTy, List.isEmpty_iff] at hs <;> try cases hs
+    · rw [hO.has_type]; cases u <;> simp [HasV]
+    · rw [hO.has_type]; cases u <;> simp [HasV]
+    · rename_i s
+      cases u
+      case ADTV c tps vs =>
+        have hv : ∀ v ∈ vs, sizeOf v < k := fun v hv => by
+          have := List.sizeOf_lt_of_mem hv
+          simp only [Value.ADTV.sizeOf_spec] at hk
+          omega
+        cases P with
+        | Program fns cs ss is eq =>
+        rw [hO.has_type]
+        simp only [HasV]
+        cases hl : lookup_ctor cs c with
+        | Ok kc =>
+          obtain ⟨d, i, fs, hc⟩ := hPD.2 c kc hl
+          obtain ⟨hlc, hls⟩ := hPD.1 c d i fs hc
+          obtain ⟨hd, hi⟩ := findCtor_spec hc
+          have hmem : (c, fs) ∈ d.ctors := List.mem_of_getElem? hi
+          have hf : ∀ f ∈ fs, simpleTy f.2 = true ∧ FragTy D f.2 := fun f hf =>
+            ⟨simpleTy_field hsd hd hmem hf, hD.fields d hd _ hmem f hf⟩
+          rw [hlc] at hl
+          cases hl
+          by_cases hsn : s = d.name
+          · subst hsn
+            simp only [hls, decide_true, Bool.true_and, Bool.and_true, Bool.and_eq_true,
+              decide_eq_true_eq, hO.resolve_all]
+            rw [pht_iff hO (has_type_iff_k hO hD hsd hPD k) vs fs _ hv hf]
+            constructor
+            · intro ⟨h1, h2⟩
+              exact ⟨h1, d, i, fs, hc, rfl, h2⟩
+            · intro ⟨h1, d', i', fs', hc', _, h2⟩
+              rw [hc] at hc'
+              cases hc'
+              exact ⟨h1, h2⟩
+          · constructor
+            · intro h
+              simp only at h
+              split at h
+              · simp only [hsn, decide_false, Bool.false_and] at h
+                cases h
+              · cases h
+            · intro ⟨_, d', i', fs', hc', hn, _⟩
+              rw [hc] at hc'
+              cases hc'
+              exact absurd hn.symm hsn
+        | _ =>
+          constructor
+          · intro h; simp at h
+          · intro ⟨_, d', i', fs', hc', _, _⟩
+            obtain ⟨hlc, _⟩ := hPD.1 c d' i' fs' hc'
+            rw [hlc] at hl
+            cases hl
+      all_goals rw [hO.has_type]; simp [HasV]
+
 /-! ## The agreement -/
 
 section Agree
@@ -412,23 +669,28 @@ theorem pht_one (hO : O.Sound) (P : Program) (env : Env) (x : Id) (T : Ty) (vs :
     | nil => simp [hO.params_have_types]
     | cons _ _ => simp [hO.params_have_types]
 
-theorem hasV_of_has_type (hO : O.Sound) {P : Program} {env : Env} {T : Ty}
-    (hT : T = .IntegerType ∨ T = .BooleanType) {u : Value} (h : O.has_type P env u T = true) :
-    HasV D u T := by
-  rw [hO.has_type] at h
-  rcases hT with rfl | rfl <;> cases u <;> simp_all [HasV]
+theorem hasV_of_has_type (hO : O.Sound) (hD : DataOk D) {P : Program} (hPD : ProgData D P)
+    {env : Env} {x : Id} {T : Ty} (hB : QBinder D S x T) {u : Value}
+    (h : O.has_type P env u T = true) : HasV D u T := by
+  rcases hB.data with rfl | rfl | hsd
+  · rw [hO.has_type] at h; cases u <;> simp_all [HasV]
+  · rw [hO.has_type] at h; cases u <;> simp_all [HasV]
+  · exact (has_type_iff_k hO hD hsd hPD _ u T env (Nat.lt_succ_self _) hB.ty.1 hB.ty.2).mp h
 
-/-- A value of Logos of the sort of an integer or a Boolean is that of a value of Inox of its
-type. -/
-theorem value_of_typeof (hO : O.Sound) (P : Program) (env : Env) {T : Ty}
-    (hT : T = .IntegerType ∨ T = .BooleanType) {w : SmtValue}
+/-- A value of Logos of the sort of the type of the parameter of a quantifier is that of a value
+of Inox of its type. -/
+theorem value_of_typeof (hO : O.Sound) (hD : DataOk D) {P : Program} (hPD : ProgData D P)
+    (env : Env) {x : Id} {T : Ty} (hB : QBinder D S x T) {w : SmtValue}
     (h : __smtx_typeof_value w = trT D T) :
     ∃ u, trV D u = w ∧ HasV D u T ∧ O.has_type P env u T = true := by
-  rcases hT with rfl | rfl
+  rcases hB.data with rfl | rfl | hsd
   · obtain ⟨i, rfl⟩ := int_of_typeof h
     exact ⟨.IntV i, rfl, trivial, by rw [hO.has_type]⟩
   · obtain ⟨b, rfl⟩ := bool_of_typeof h
     exact ⟨.BoolV b, rfl, trivial, by rw [hO.has_type]⟩
+  · obtain ⟨u, hu, hv⟩ := value_of_sort_k hD hsd _ w T (Nat.lt_succ_self _) hB.ty.1 hB.ty.2 h
+    exact ⟨u, hu, hv,
+      (has_type_iff_k hO hD hsd hPD _ u T env (Nat.lt_succ_self _) hB.ty.1 hB.ty.2).mpr hv⟩
 
 theorem instance_one (env : Env) (x : Id) (T : Ty) (u : Value) (b : Expr) (n : Int) :
     instance_ O P n env [.Param x T] [u] b =
@@ -470,8 +732,9 @@ theorem eval_exists_false {M : SmtModel} {s : native_String} {T : SmtType} {body
   rw [dite_eq_right (fun ⟨w, hT, hc, hv⟩ => h w hT hc hv)]
 
 /-- The agreement of a universal quantifier. -/
-theorem ev_forall (hO : O.Sound) (hS : SigOk D S) {n : Int} {Γ : List (Id × Ty)} {x : Id}
-    {T : Ty} {b : Expr} (hB : QBinder S x T) (hb : HasTy D S ((x, T) :: Γ) b .BooleanType)
+theorem ev_forall (hO : O.Sound) (hS : SigOk D S) (hPD : ProgData D P) {n : Int}
+    {Γ : List (Id × Ty)} {x : Id}
+    {T : Ty} {b : Expr} (hB : QBinder D S x T) (hb : HasTy D S ((x, T) :: Γ) b .BooleanType)
     (ih : Ev O P D S n ((x, T) :: Γ) b .BooleanType) :
     Ev O P D S n Γ (.Forall [.Param x T] b) .BooleanType := by
   intro env v hE he
@@ -486,7 +749,7 @@ theorem ev_forall (hO : O.Sound) (hS : SigOk D S) {n : Int} {Γ : List (Id × Ty
     obtain ⟨hp, hi⟩ := hvs
     obtain ⟨u, rfl, hu⟩ := (pht_one hO P _ x T vs).1 hp
     cases he
-    have huT : HasV D u T := hasV_of_has_type hO hB.ty hu
+    have huT : HasV D u T := hasV_of_has_type hO hS.data hPD hB hu
     rw [instance_one] at hi
     obtain ⟨_, hM⟩ := ih _ _ (envTy_bound hE huT) hi
     refine ⟨trivial, fun M hw hc hV => ?_⟩
@@ -505,7 +768,7 @@ theorem ev_forall (hO : O.Sound) (hS : SigOk D S) {n : Int} {Γ : List (Id × Ty
       rw [tr_forall, eval_not_def, eval_exists_false]
       · rfl
       intro w hwT hwc hwv
-      obtain ⟨u, rfl, huT, hu⟩ := value_of_typeof hO P (.Env tys vars) hB.ty hwT
+      obtain ⟨u, rfl, huT, hu⟩ := value_of_typeof hO hS.data hPD (.Env tys vars) hB hwT
       simp only [decide_eq_true_eq] at h3
       have hi := h3 [u]
       rw [(pht_one hO P _ x T [u]).2 ⟨u, rfl, hu⟩] at hi
@@ -525,7 +788,7 @@ end Agree
 one parameter whose bodies are. -/
 inductive Formula (D : List Data) (S : List Sig) (Γ : List (Id × Ty)) : Expr → Prop where
   | leaf {p : Expr} : HasTy D S Γ p .BooleanType → Formula D S Γ p
-  | forall_ {x : Id} {T : Ty} {b : Expr} : QBinder S x T →
+  | forall_ {x : Id} {T : Ty} {b : Expr} : QBinder D S x T →
       HasTy D S ((x, T) :: Γ) b .BooleanType → Formula D S Γ (.Forall [.Param x T] b)
 
 /-- The expressions of the query: `QTy e e'` where `e` is the Boolean `e'` of the fragment with
@@ -697,7 +960,7 @@ theorem ev_formula (hO : O.Sound) (hty : LogosTyping) (hS : SigOk D S) (hPD : Pr
     Ev O P D S n Γ p .BooleanType := by
   cases h with
   | leaf h => exact ev hO hty hS hPD hct h
-  | forall_ hB hb => exact ev_forall hO hS hB hb (ev hO hty hS hPD hct hb)
+  | forall_ hB hb => exact ev_forall hO hS hPD hB hb (ev hO hty hS hPD hct hb)
 
 /-- What `q_holds_of_assumes` says of `e`: `Assumed` with the terms as they are. -/
 def QAssumed (O : Oracle) (P : Program) (D : List Data) (S : List Sig) (n : Int)

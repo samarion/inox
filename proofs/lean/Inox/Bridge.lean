@@ -1865,7 +1865,7 @@ theorem ev (hO : O.Sound) (hty : LogosTyping) (hS : SigOk D S) (hPD : ProgData D
     have hv : v = .ADTV c [] vs := by
       cases P with
       | Program fns cs ss is eq =>
-      obtain ⟨hlc, hls⟩ := hPD c d i fs hc
+      obtain ⟨hlc, hls⟩ := hPD.1 c d i fs hc
       rw [construct] at he
       simp only [hlc, hls, hO.resolve_all] at he
       cases he; rfl
@@ -1926,7 +1926,7 @@ theorem ev (hO : O.Sound) (hty : LogosTyping) (hS : SigOk D S) (hPD : ProgData D
     have hsel : select_field (fs'.map fun f => Param.Param f.1 f.2) vs x = .Ok v := by
       cases P with
       | Program fns cs ss is eq =>
-      obtain ⟨hlc, _⟩ := hPD c' d' i' fs' hc'
+      obtain ⟨hlc, _⟩ := hPD.1 c' d' i' fs' hc'
       simp only [hlc] at he
       exact he
     obtain ⟨j', T', hj', hvj⟩ := select_field_spec fs' vs hsel
