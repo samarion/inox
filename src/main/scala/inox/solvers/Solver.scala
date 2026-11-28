@@ -15,10 +15,11 @@ case object DebugSectionSolver extends DebugSection("solver")
   * (`--z3-rlimit`, `--cvc5-rlimit`), and the unrollings that it needed (`--unroll-bound`).
   *
   * @param perCheck   what each check of the underlying SMT solver spent, in the order of the checks
-  * @param unrollings the unrollings that each check of an unrolling solver performed, in the order
-  *                   of the checks; one such check can make many checks of the underlying solver
+  * @param unrollingsPerCheck the unrollings that each check of an unrolling solver performed, in the
+  *                           order of the checks; one such check can make many checks of the
+  *                           underlying solver
   */
-case class ResourceUsage(perCheck: Seq[Long], unrollings: Seq[Int] = Seq.empty) {
+case class ResourceUsage(perCheck: Seq[Long], unrollingsPerCheck: Seq[Int] = Seq.empty) {
   /** What the solver spent, as counted by the limit that the user can set: the maximum over the
     * checks, as the limits of z3 (`rlimit`) and of cvc5 (`--rlimit-per`) bound each check. `None`
     * when no check was recorded.
@@ -28,10 +29,10 @@ case class ResourceUsage(perCheck: Seq[Long], unrollings: Seq[Int] = Seq.empty) 
   /** The most unrollings that a check needed, which `--unroll-bound` bounds. `None` when no check
     * of an unrolling solver was recorded.
     */
-  def maxUnrollings: Option[Int] = if (unrollings.isEmpty) None else Some(unrollings.max)
+  def unrollings: Option[Int] = if (unrollingsPerCheck.isEmpty) None else Some(unrollingsPerCheck.max)
 
   def ++(that: ResourceUsage): ResourceUsage =
-    ResourceUsage(perCheck ++ that.perCheck, unrollings ++ that.unrollings)
+    ResourceUsage(perCheck ++ that.perCheck, unrollingsPerCheck ++ that.unrollingsPerCheck)
 }
 
 object ResourceUsage {

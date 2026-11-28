@@ -219,7 +219,7 @@ abstract class AbstractUnrollingSolver private
   @volatile private var unrollCounts: Vector[Int] = Vector.empty
 
   override def resourceUsage: ResourceUsage =
-    underlying.resourceUsage.copy(unrollings = unrollCounts)
+    underlying.resourceUsage.copy(unrollingsPerCheck = unrollCounts)
 
   protected val freeVars  = new IncrementalMap[Variable, Encoded]()
   private val constraints = new IncrementalSeq[Expr]()
