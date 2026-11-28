@@ -684,6 +684,13 @@ integers, fractions, Booleans, strings and unit, `ADT`, `IsConstructor`,
 (they go through the oracle and classical choice), the floating-point literals
 and rounding modes, and the string, bit-vector and floating-point operations.
 
+[`Inox/MonoAll.lean`](Inox/MonoAll.lean) proves it of every expression, in
+every program, where the oracle is sound (`eval_mono_all`, `call_mono_all`,
+`apply_mono_all`): a quantifier's result is that of its instances at the same
+fuel (`le_forall`), and the other answers of the oracle don't depend on the
+fuel. So a closure applied to values has at most one result, whatever the
+fuel (`apply_ok_unique`).
+
 **The agreement theorem** ([`Inox/Bridge.lean`](Inox/Bridge.lean)). The
 translation is for integers, Booleans, reals, bit-vectors, datatypes without
 type parameters and sets ([`Inox/Data.lean`](Inox/Data.lean)). `D : List Data`
