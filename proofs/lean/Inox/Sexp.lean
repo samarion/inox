@@ -38,9 +38,16 @@ def mkImplies (l r : Sexp) : Sexp := app "=>" [l, r]
 def mkEq (l r : Sexp) : Sexp := app "=" [l, r]
 
 /-- `e` with its testers `((_ is C) e)` and `(is-C e)` as cvc5 prints them in its proofs,
-`(is C e)`, and otherwise as it is. -/
+`(is C e)`, likewise its extractions and extensions of bit-vectors `((_ extract i j) e)` as
+`(extract i j e)`, and otherwise as it is. -/
 partial def testers : Sexp → Sexp
   | .expr (.expr [.atom "_", .atom "is", c] :: args) => .expr (.atom "is" :: c :: args.map testers)
+  | .expr [.expr (.atom "_" :: .atom "extract" :: indices), x] =>
+    .expr (.atom "extract" :: indices ++ [testers x])
+  | .expr [.expr (.atom "_" :: .atom "zero_extend" :: indices), x] =>
+    .expr (.atom "zero_extend" :: indices ++ [testers x])
+  | .expr [.expr (.atom "_" :: .atom "sign_extend" :: indices), x] =>
+    .expr (.atom "sign_extend" :: indices ++ [testers x])
   | .expr (.atom op :: args) =>
     if op.startsWith "is-" then .expr (.atom "is" :: .atom (op.drop 3).toString :: args.map testers)
     else .expr (.atom op :: args.map testers)
@@ -76,5 +83,38 @@ partial def substitute (values : Std.HashMap String Sexp) (terms : List (String 
     match if terms.isEmpty then none else terms.lookup (text (.expr items)) with
     | some value => value
     | none => .expr (items.map (substitute values terms))
+
+/-- The symbols of `e`. -/
+partial def symbols : Sexp → List String
+  | .atom a => [a]
+  | .expr items => items.flatMap symbols
+
+/-- The names that the binders of `e` bind, and all the symbols of a `match`, whose patterns
+bind names. -/
+partial def boundNames : Sexp → List String
+  | e@(.expr (.atom "match" :: _)) => symbols e
+  | .expr [.atom k, .expr decls, body] =>
+    if ["let", "forall", "exists", "lambda", "choose"].contains k then
+      decls.filterMap (fun d => match d with | .expr (.atom x :: _) => some x | _ => none) ++
+        decls.flatMap boundNames ++ boundNames body
+    else decls.flatMap boundNames ++ boundNames body
+  | .expr items => items.flatMap boundNames
+  | .atom _ => []
+
+/-- `e` with each `let` replaced by its body with the terms of its bindings for its variables,
+as in SMT-LIB, where terms always have a value. A `let` whose body binds a name of a symbol of
+its terms, which the substitution would capture, or one of its own variables, stays. -/
+partial def inlined : Sexp → Sexp
+  | .expr [.atom "let", .expr bindings, body] =>
+    let pairs := bindings.filterMap fun b => match b with
+      | .expr [.atom x, v] => some (x, inlined v)
+      | _ => none
+    let inner := inlined body
+    let names := pairs.map (·.1) ++ pairs.flatMap (fun (_, v) => symbols v)
+    if pairs.length != bindings.length || (boundNames inner).any names.contains then
+      .expr [.atom "let", .expr (pairs.map fun (x, v) => .expr [.atom x, v]), inner]
+    else substitute (Std.HashMap.ofList pairs) [] inner
+  | .expr items => .expr (items.map inlined)
+  | atom => atom
 
 end Inox

@@ -13,24 +13,33 @@ which each update their own sections as soon as they complete:
   timings-coverage   test durations of the Inox coverage workflow
   timings-inox       test durations of Inox CI
   timings-stainless  test durations of the Stainless downstream CI
+  usage-stainless    the solvers' work on each test of the Stainless downstream CI
 
 The test durations are JSON (see `scripts/test_timings.py section`), and the
-comment shows those of all workflows in one table. The JSON is kept in the
+comment shows those of all workflows in one table. The solvers' work is JSON
+too (see `scripts/resource_usage.py section`). The JSON is kept in the
 comment, hidden, for the next updates.
 """
 
 import base64
 import json
+import math
 import re
 import sys
 import zlib
 
-from test_timings import MAX_LISTED, MIN_FACTOR, MIN_SECONDS, factor, interval, seconds, show
+import resource_usage as ru
+from test_timings import (MAJOR_FACTOR, MAJOR_FACTOR_COVERED, MAJOR_NEW_SECONDS, MAJOR_SECONDS,
+                          MAJOR_SECONDS_COVERED, MAX_LISTED, MIN_FACTOR,
+                          MIN_SECONDS, MIN_SECONDS_SINGLE, factor, interval, seconds, show)
 
 MARKER = "<!-- inox-coverage -->"
 MARKDOWN = ["stainless-skip", "coverage"]
 TIMINGS = ["timings-coverage", "timings-inox", "timings-stainless"]
-SECTIONS = MARKDOWN + TIMINGS
+USAGE = ["usage-stainless"]
+# The sections whose JSON the comment keeps.
+DATA = TIMINGS + USAGE
+SECTIONS = MARKDOWN + DATA
 
 
 def encode(data):
@@ -47,7 +56,7 @@ def parse(body):
         if m.group(1) in MARKDOWN:
             sections[m.group(1)] = m.group(2).strip("\n")
     for m in re.finditer(r"<!-- data:([\w-]+) ([A-Za-z0-9+/=]+) -->", body):
-        if m.group(1) in TIMINGS:
+        if m.group(1) in DATA:
             try:
                 sections[m.group(1)] = decode(m.group(2))
             except (ValueError, zlib.error):
@@ -76,11 +85,15 @@ def timings_table(sections, with_details=True):
     the jobs of a group (the word their labels start with, such as Inox) run
     the same tests on different runners, and noise rarely makes the same test
     slower, or faster, in two of them. A group with a single job needs enough
-    history for its tests' noise to be estimated well."""
+    history for its tests' noise to be estimated well. Major slowdowns are
+    too large for noise, and are shown first, in every job that has them."""
     parts = [sections[s] for s in TIMINGS if s in sections]
     if not parts:
         return ""
     jobs = [j for p in parts for j in p.get("jobs", [])]
+    if not jobs:
+        # No job has timings to compare yet: an empty table would only be a header.
+        return ""
     notes = []
     for p in parts:
         for n in p.get("notes", []):
@@ -102,32 +115,66 @@ def timings_table(sections, with_details=True):
             for t in j.get("tests", []):
                 seen.setdefault((t["key"], 1 if t["rel"] > 0 else -1), []).append((j, t))
         for (key, sign), occ in seen.items():
-            if len(gj) >= 2 and len(occ) >= 2 or len(gj) == 1 and gj[0].get("history", 0) >= MIN_HISTORY:
+            single = (len(gj) == 1 and gj[0].get("history", 0) >= MIN_HISTORY
+                      and abs(occ[0][1]["head"] - occ[0][1]["base"]) >= MIN_SECONDS_SINGLE)
+            if len(gj) >= 2 and len(occ) >= 2 or single:
                 listed[sign].append(occ)
             else:
                 unconfirmed += 1
+    def gained(t):
+        return t["head"] - t["base"]
+
     for sign in listed:
-        listed[sign].sort(key=lambda occ: -max(t["rel"] * sign for _, t in occ))
+        listed[sign].sort(key=lambda occ: -max(gained(t) * sign for _, t in occ))
+    # Major slowdowns, per test: [(job, test)].
+    major = {}
+    for j in jobs:
+        for t in j.get("major", []):
+            major.setdefault(t["key"], []).append((j, t))
+    major = sorted(major.values(), key=lambda occ: -max(t["head"] - (t["base"] or 0) for _, t in occ))
     counts = {}
     for sign in listed:
         for occ in listed[sign]:
             for j, _ in occ:
                 counts.setdefault(id(j), {1: 0, -1: 0})[sign] += 1
 
-    out = ["### Test durations", "", "| Job | Total time | Tests |", "|---|---:|---|"]
+    out = ["### Test durations", ""]
+    if major:
+        covered = any(j.get("covered") for j in jobs)
+        out += [f"**Much slower** (by {MAJOR_FACTOR:g}× and {MAJOR_SECONDS:g} s or more than the slowest "
+                f"earlier build of `main`"
+                + (f", {MAJOR_FACTOR_COVERED:g}× and {MAJOR_SECONDS_COVERED:g} s for tests whose solver work "
+                   f"is compared" if covered else "")
+                + f", or new and over {MAJOR_NEW_SECONDS:g} s):", ""]
+        for occ in major[:MAX_LISTED]:
+            j, t = max(occ, key=lambda jt: jt[1]["head"])
+            others = [short(o) for o, _ in occ if o is not j]
+            change = (f"{seconds(t['base'])} → {seconds(t['head'])}, {factor(t['rel'])}"
+                      if t.get("base") is not None else f"new, {seconds(t['head'])}")
+            out.append(f"- {show(t['key'])}: {change} on {short(j)}"
+                       + (f"; also on {', '.join(others)}" if others else ""))
+        if len(major) > MAX_LISTED:
+            out.append(f"- and {len(major) - MAX_LISTED} more")
+        out.append("")
+    out += ["| Job | Total time | Tests |", "|---|---:|---|"]
     for j in jobs:
         if not j.get("enough"):
             out.append(f"| {j['label']} | too few tests | |")
             continue
         if j.get("ci"):
             lo, hi = j["ci"]
-            total = f"{factor(j['total'])} ({interval(lo, hi)})"
+            # A total whose interval holds no change is the same as main's.
             if lo > 0 or hi < 0:
-                total = f"<b>{total}</b>"
+                what = "slower" if lo > 0 else "faster"
+                total = f"<b>{factor(j['total'])} {what}</b> ({interval(lo, hi)})"
+            else:
+                total = "within noise"
         else:
             total = "–"
         c = counts.get(id(j), {1: 0, -1: 0})
         tests = ", ".join(f"{c[sign]} {what}" for sign, what in ((1, "slower"), (-1, "faster")) if c[sign])
+        if j.get("major"):
+            tests = ", ".join(x for x in (f"<b>{len(j['major'])} much slower</b>", tests) if x)
         out.append(f"| {j['label']} | {total} | {tests or '–'} |")
     out.append("")
 
@@ -149,17 +196,133 @@ def timings_table(sections, with_details=True):
     explain = (f"Changes are relative to each job's median test, which absorbs the runners' speed. "
                f"A test is listed when its change is significant (Bonferroni) and at least "
                f"{MIN_FACTOR:g}× and {MIN_SECONDS:g} s in two jobs, or, for a single job, once "
-               f"{MIN_HISTORY} earlier builds of `main` give each test's own noise.")
+               f"{MIN_HISTORY} earlier builds of `main` give each test's own noise and the change "
+               f"is of {MIN_SECONDS_SINGLE:g} s or more.")
     if unconfirmed:
         explain += f" {unconfirmed} change{'s' if unconfirmed > 1 else ''} seen in a single job only {'were' if unconfirmed > 1 else 'was'} left out."
     if n and with_details:
         out += [f"<details><summary>Tests that changed ({n})</summary>", "", *lines, explain, "", "</details>", ""]
     elif n:
         out += [f"_{n} tests changed: too many to list here._", ""]
+    if any(j.get("ci") and j["ci"][0] <= 0 <= j["ci"][1] for j in jobs):
+        notes.insert(0, "Within noise: the total differs from `main`'s by no more than earlier "
+                        "builds of `main` differ from each other.")
     if any(j.get("enough") and not j.get("ci") for j in jobs):
         notes.insert(0, "A total is shown once 2 earlier builds of `main` give its interval.")
+    for j in jobs:
+        if j.get("covered"):
+            notes.append(f"{j['covered']:,} tests of {j['label']} are compared by their solvers' work "
+                         f"instead, and only their major slowdowns by their durations.")
     if notes:
         out.append("<sub>" + " ".join(x.strip("_") for x in notes) + "</sub>")
+    return "\n".join(out).strip("\n")
+
+
+def work(v):
+    """Resources, in the millions of units of the solvers' limits."""
+    m = v / ru.MILLION
+    return f"{m:,.0f} M" if m >= 10 else f"{m:,.1f} M" if m >= 1 else f"{m:.2f} M"
+
+
+def change(metric, b, h):
+    show_value = work if metric == "resources" else (lambda v: f"{v:,}")
+    f = f", ×{(h + 1) / (b + 1):.2f}" if (h + 1) / (b + 1) >= 0.1 else f", ×1/{(b + 1) / (h + 1):,.0f}"
+    return f"{metric} {show_value(b)} → {show_value(h)}{f}"
+
+
+def describe(t):
+    parts = []
+    for m in ru.METRICS:
+        if m in t:
+            parts.append(change(m, *t[m]))
+    if "inconclusive" in t:
+        b, h = t["inconclusive"]
+        parts.append(f"inconclusive VCs {b} → {h}")
+    return f"- {show(t['key'])}: " + "; ".join(parts)
+
+
+def total(job, metric):
+    t = job.get(metric) or {}
+    if not t.get("count"):
+        return "–"
+    b, h = t["base"], t["head"]
+    shown = work if metric == "resources" else (lambda v: f"{v:,}")
+    r = (h + 1) / (b + 1)
+    # Totals move a little with the names of the symbols, as the builds of
+    # main show: a change within that is the same as main's.
+    if abs(math.log(r)) <= max(math.log(ru.TOTAL_NOISE), t.get("noise") or 0):
+        return "within noise"
+    what = "more" if r > 1 else "less"
+    return f"<b>×{r:.2f} {what}</b> ({shown(b)} → {shown(h)})"
+
+
+def usage_table(sections, with_details=True):
+    """The work of the solvers on the tests of each job that recorded it: the
+    resources that z3 and cvc5 count and the unrollings of Inox's unrolling
+    solver, which don't depend on the runner, so that any test whose work
+    changes is listed, without the statistics that durations need."""
+    jobs = [sections[s] for s in USAGE if sections.get(s, {}).get("count")]
+    if not jobs:
+        return ""
+    out = ["### Solver work", ""]
+    major = [(j, t) for j in jobs for t in j.get("major", [])]
+    if major:
+        out += [f"**Much more work** (by {ru.MAJOR_RESOURCES_FACTOR:g}× and {work(ru.MAJOR_RESOURCES_MIN)} "
+                f"resources, or {ru.MAJOR_UNROLLINGS_FACTOR:g}× and {ru.MAJOR_UNROLLINGS_MIN} unrollings, "
+                f"or more inconclusive VCs):", ""]
+        for j, t in major[:MAX_LISTED]:
+            out.append(describe(t) + (f" on {j['label']}" if len(jobs) > 1 else ""))
+        if len(major) > MAX_LISTED:
+            out.append(f"- and {len(major) - MAX_LISTED} more")
+        out.append("")
+    out += ["| Job | Resources | Unrollings | Tests |", "|---|---:|---:|---|"]
+    for j in jobs:
+        c = j.get("changed", {})
+        tests = ", ".join(x for x in (
+            f"<b>{len(j['major'])} much more</b>" if j.get("major") else "",
+            f"{c['more']} more" if c.get("more") else "",
+            f"{c['less']} less" if c.get("less") else "") if x)
+        out.append(f"| {j['label']} | {total(j, 'resources')} | {total(j, 'unrollings')} | {tests or '–'} |")
+    out.append("")
+    changed = [(j, t) for j in jobs for t in j.get("tests", [])]
+    lines = []
+    for what, more in (("More work", True), ("Less work", False)):
+        ts = [(j, t) for j, t in changed if ru.more_work(t) == more]
+        if not ts:
+            continue
+        lines += [f"{what}:", ""]
+        for j, t in ts[:MAX_LISTED]:
+            lines.append(describe(t) + (f" on {j['label']}" if len(jobs) > 1 else ""))
+        if len(ts) > MAX_LISTED:
+            lines.append(f"- and {len(ts) - MAX_LISTED} more")
+        lines.append("")
+    explain = (f"Resources are the work that z3 and cvc5 count for their resource limits (in millions "
+               f"of units), over all the checks of a test; unrollings are those of all its VCs. A test is "
+               f"listed when its resources change by {ru.RESOURCES_FACTOR:g}× and {work(ru.RESOURCES_MIN)} "
+               f"or more, its unrollings by {ru.UNROLLINGS_FACTOR:g}× and {ru.UNROLLINGS_MIN} or more, "
+               f"beyond what they were in earlier builds of `main`, or when its inconclusive VCs change. "
+               f"Without {ru.MIN_HISTORY} earlier builds of `main`, the factor of the resources is "
+               f"{ru.NO_HISTORY_MARGIN:g} times larger.")
+    if changed and with_details:
+        out += [f"<details><summary>Tests whose work changed ({len(changed)})</summary>", "", *lines,
+                explain, "", "</details>", ""]
+    elif changed:
+        out += [f"_{len(changed)} tests changed: too many to list here._", ""]
+    notes = []
+    if any(total(j, m) == "within noise" for j in jobs for m in ru.METRICS):
+        notes.append(f"Within noise: the total differs from `main`'s by less than "
+                     f"{(ru.TOTAL_NOISE - 1) * 100:.0f}%, or by no more than earlier builds of `main` differ "
+                     f"from each other.")
+    for j in jobs:
+        if j.get("new") or j.get("gone"):
+            notes.append(f"{j['label']}: {j['count']:,} tests compared"
+                         + (f", {j['new']:,} new" if j.get("new") else "")
+                         + (f", {j['gone']:,} no longer recorded" if j.get("gone") else "") + ".")
+        if j.get("history", 0) < ru.MIN_HISTORY:
+            notes.append(f"Fewer than {ru.MIN_HISTORY} earlier builds of `main` show how much the work of "
+                         f"{j['label']}'s tests varies, so the factor of the resources is {ru.NO_HISTORY_MARGIN:g} times larger.")
+    if notes:
+        out.append("<sub>" + " ".join(notes) + "</sub>")
     return "\n".join(out).strip("\n")
 
 
@@ -168,10 +331,13 @@ def render(sections, with_details=True):
     for s in MARKDOWN:
         if s in sections:
             parts.append(f"<!-- begin:{s} -->\n{sections[s]}\n<!-- end:{s} -->")
+    table = usage_table(sections, with_details)
+    if table:
+        parts.append(table)
     table = timings_table(sections, with_details)
     if table:
         parts.append(table)
-    for s in TIMINGS:
+    for s in DATA:
         if s in sections:
             parts.append(f"<!-- data:{s} {encode(sections[s])} -->")
     body = "\n\n".join(parts)
@@ -191,7 +357,7 @@ def main(args):
     content = open(args[2]).read().strip("\n")
     if not content:
         sections.pop(args[1], None)
-    elif args[1] in TIMINGS:
+    elif args[1] in DATA:
         sections[args[1]] = json.loads(content)
     else:
         sections[args[1]] = content

@@ -7,14 +7,17 @@ usage:
       the duration and outcome of every test case.
   test_timings.py merge <out.json> <in.json>...
       Merges collected timings, for builds that ran their tests in several jobs.
-  test_timings.py section <groups.tsv> [<note.md>]
+  test_timings.py section <groups.tsv> [<note.md> [<covered.txt>]]
       Prints, as JSON, the results for the comment's table of test durations of
       the jobs of a workflow, and the tests that changed significantly. Each
       line of `groups.tsv` describes a job: its label, then, separated by
       tabs, the timings of the pull request build (head), of the build of
       main (base), and of earlier builds of main (history), used to estimate
       how much the durations of two builds vary without any change to the
-      code. The notes of `note.md` are shown below the table.
+      code. The notes of `note.md` are shown below the table. The tests named
+      in `covered.txt`, one per line, are compared by the work of their
+      solvers instead (see scripts/resource_usage.py): only their major
+      slowdowns are reported.
 
 Test durations on CI runners vary a lot between builds of the same code, as a
 whole, because runners differ in speed and load, and test by test. The
@@ -33,7 +36,17 @@ comparison accounts for both:
   them bounds its noise from below, for tests that vary more than others.
   Tests are only listed when the change is significant after a Bonferroni
   correction for the number of tests compared, and changes the duration by
-  at least 50% and 1 s.
+  at least 50% and 1 s. The comment needs more for a job that no other job
+  confirms (see scripts/pr_comment.py).
+- A test that becomes slower by at least 5× and 30 s, or a new test of more
+  than 2 minutes, is a major slowdown. The slowdown is measured from the
+  slowest that the test was in the builds of main, so that a test that
+  main's builds already vary that much for doesn't count, and new tests are
+  those that no build of main ran. A test whose solver work is compared (see
+  scripts/resource_usage.py) needs 10× and 2 minutes, since its work already
+  shows what the solvers spend. No runner noise accounts for a major
+  slowdown, so it is reported on its own, ahead of the other changes,
+  without the statistics.
 """
 
 import json
@@ -55,6 +68,20 @@ BUCKETS = [0.2, 1, 5, 30]
 # Listed tests change by at least this factor, and this many seconds.
 MIN_FACTOR = 1.5
 MIN_SECONDS = 1.0
+# A change that only one job sees needs this many seconds: tests of a few
+# seconds often move by that much between runners, in a single job.
+MIN_SECONDS_SINGLE = 5.0
+# Major slowdowns: tests that become slower by at least this factor and this
+# many seconds (relative to the build's overall speed), and new tests that
+# take at least this long.
+MAJOR_FACTOR = 5.0
+MAJOR_SECONDS = 30.0
+MAJOR_NEW_SECONDS = 120.0
+# The tests whose solver work is compared only need their durations for what
+# the work doesn't show (time spent outside the solvers): a major slowdown of
+# theirs needs this factor and this many seconds.
+MAJOR_FACTOR_COVERED = 10.0
+MAJOR_SECONDS_COVERED = 120.0
 MAX_LISTED = 15
 # The changed tests of each job kept in the comment's data.
 MAX_STORED = 40
@@ -175,7 +202,7 @@ def show(key):
 class Comparison:
     """The comparison of one job's build with the build of main."""
 
-    def __init__(self, label, head_path, base_path, history_paths):
+    def __init__(self, label, head_path, base_path, history_paths, covered=frozenset()):
         # Labels come from artifact names, which pull request builds choose.
         self.label = SAFE.sub("?", label)[:60].replace("<", "‹").replace(">", "›").replace("&", "+")
         head, base = passed(load(head_path)), passed(load(base_path))
@@ -183,6 +210,7 @@ class Comparison:
         self.head, self.base = head, base
         common = sorted(head.keys() & base.keys())
         self.common = common
+        self.major = []
         self.enough = len(common) >= 10
         if not self.enough:
             return
@@ -243,8 +271,39 @@ class Comparison:
             return (r / s > z_crit and r > math.log(MIN_FACTOR)
                     and abs(head[k] - base[k]) >= MIN_SECONDS)
 
-        self.listed = {sign: sorted((k for k in measured if significant(k, sign)),
-                                    key=lambda k: -rel[k] * sign)
+        # The time a test gains or loses, at the head build's speed.
+        def gained(k):
+            return head[k] - base[k] * math.exp(speed)
+
+        # The slowest that a test was in the builds of main, relative to the
+        # base: a test that sometimes takes 10 times longer on main, as some
+        # do on loaded runners, isn't slower when it does so again.
+        def slowest(k):
+            return max([0.0] + [r[k] for _, _, r in hist_rel if k in r])
+
+        def major(k):
+            fac, secs = ((MAJOR_FACTOR_COVERED, MAJOR_SECONDS_COVERED) if k in covered
+                         else (MAJOR_FACTOR, MAJOR_SECONDS))
+            above = rel[k] - slowest(k)
+            gained_above = head[k] - base[k] * math.exp(speed + slowest(k))
+            return above > math.log(fac) and gained_above >= secs
+
+        self.major = sorted((k for k in measured if major(k)), key=lambda k: -gained(k))
+        # New tests: those that neither the base nor the history ran.
+        ran = set(base).union(*history)
+        self.major += sorted((k for k in head.keys() - ran
+                              if head[k] >= MAJOR_NEW_SECONDS),
+                             key=lambda k: -head[k])
+        # Major slowdowns are reported apart, and the others by the time they
+        # gain or lose: a test that is 3 minutes slower matters more than one
+        # that is 10 times slower by a few seconds.
+        # The tests whose solver work is compared don't need their durations
+        # compared too, apart from their major slowdowns, which their work may
+        # not show (such as time spent outside the solvers).
+        self.covered = sum(1 for k in measured if k in covered)
+        self.listed = {sign: sorted((k for k in measured if significant(k, sign) and k not in self.major
+                                     and k not in covered),
+                                    key=lambda k: -gained(k) * sign)
                        for sign in (1, -1)}
 
     def data(self):
@@ -257,6 +316,11 @@ class Comparison:
         if not self.per_test:
             return job
         job.update(history=self.history, speed=self.speed)
+        if self.covered:
+            job["covered"] = self.covered
+        job["major"] = [{"key": k, "base": self.base.get(k), "head": self.head[k],
+                         "rel": round(self.rel[k], 4) if k in self.rel else None}
+                        for k in self.major[:MAX_STORED]]
         z95 = NORMAL.inv_cdf(0.975)
         for sign in (1, -1):
             for k in self.listed[sign][:MAX_STORED]:
@@ -266,16 +330,17 @@ class Comparison:
         return job
 
 
-def section(groups_path, note_path=None):
+def section(groups_path, note_path=None, covered_path=None):
     """Prints, as JSON, the results of the jobs of a workflow for the comment's
     table of test durations (see scripts/pr_comment.py, which shows those of
     all workflows together). Each line of `groups_path` holds a job's label,
     then its head, base and history timings, separated by tabs."""
+    covered = frozenset(line.rstrip("\n") for line in open(covered_path)) if covered_path else frozenset()
     comparisons = []
     for line in open(groups_path):
         fields = line.rstrip("\n").split("\t")
         if len(fields) >= 3:
-            comparisons.append(Comparison(fields[0], fields[1], fields[2], fields[3:]))
+            comparisons.append(Comparison(fields[0], fields[1], fields[2], fields[3:], covered))
     notes = []
     if note_path:
         note = open(note_path).read().strip()
@@ -302,7 +367,7 @@ def main(args):
         collect(args[1], args[2:])
     elif len(args) >= 3 and args[0] == "merge":
         merge(args[1], args[2:])
-    elif len(args) in (2, 3) and args[0] == "section":
+    elif len(args) in (2, 3, 4) and args[0] == "section":
         section(*args[1:])
     else:
         sys.exit(__doc__)

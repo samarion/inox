@@ -157,8 +157,8 @@ jobs:
     - name: Compare the test durations with main
       run: |
         .github/scripts/test-timings-comment.sh stainless-downstream-CI.yml "$RUN_ID" stainless-test-timings- merged \
-          Stainless timings.json > tested
+          Stainless timings.json usage.json > tested
         read -r pr pr_head < tested || true
         # A run that tested main, or several pull requests merged together.
         [ -n "$pr" ] || { echo "No single pull request tested in this build"; exit 0; }
-        .github/scripts/update-pr-comment.sh "$pr" "$pr_head" timings-stainless timings.json
+        .github/scripts/update-pr-comment.sh "$pr" "$pr_head" timings-stainless timings.json usage-stainless usage.json

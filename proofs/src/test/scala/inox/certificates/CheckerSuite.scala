@@ -16,7 +16,7 @@ class CheckerSuite extends AnyFunSuite {
   // A template with the parameters `s` and `p` and its own symbol `c`, instantiated once under
   // the root blocker, a definition, an implication between blockers and an assumption.
   val certificate: String =
-    """(inox-certificate 4
+    """(inox-certificate 6
       |(script
       |(declare-const start Bool)
       |(declare-const b Bool)
@@ -55,6 +55,10 @@ class CheckerSuite extends AnyFunSuite {
       |(source-symbols
       |(p variable "p$2" "BigInt" Int)
       |)
+      |(simplifications
+      |(function-equality none)
+      |)
+      |(input)
       |(cpc
       |(assume @p1 start)
       |(define @t1 () (> x 0))
@@ -97,7 +101,7 @@ class CheckerSuite extends AnyFunSuite {
   }
 
   test("A certificate of another version is refused") {
-    assert(refused(changed("(inox-certificate 4", "(inox-certificate 2")).contains("version 2"))
+    assert(refused(changed("(inox-certificate 6", "(inox-certificate 2")).contains("version 2"))
   }
 
   test("An assert that no rule names is refused") {
@@ -146,6 +150,15 @@ class CheckerSuite extends AnyFunSuite {
     assert(refused(changed("(define @t1 () (> x 0))", "(define @t1 () (> x 1))")).contains("the proof assumes"))
   }
 
+  test("A proof may assume an assertion with its bindings inlined, unless they would be captured") {
+    def inlined(text: String): String = Checker.inlined(parse(text).head).toString
+    assert(inlined("(=> start (let ((y (+ x 1))) (> y 0)))") == "(=> start (> (+ x 1) 0))")
+    assert(inlined("(let ((y 1)) (let ((z (+ y 1))) (= z y)))") == "(= (+ 1 1) 1)")
+    // a binder of the body would capture a symbol of a binding, or rebinds its variable
+    assert(inlined("(let ((y x)) (forall ((x Int)) (> y x)))") == "(let ((y x)) (forall ((x Int)) (> y x)))")
+    assert(inlined("(let ((y 1)) (exists ((y Int)) (> y 0)))") == "(let ((y 1)) (exists ((y Int)) (> y 0)))")
+  }
+
   /** Inox's command line, which exits by throwing. */
   private class Exit extends Exception
   private class Main extends InoxMain {
@@ -178,6 +191,56 @@ class CheckerSuite extends AnyFunSuite {
   // (see `proofs/lean`)
   val answersDir: Option[java.nio.file.Path] = sys.env.get("INOX_ANSWERS_DIR").map(Paths.get(_))
 
+  test("A symbol that a lambda's template or a definition by an expression introduces, and something else too, is refused") {
+    assume(solvers.SolverFactory.hasCVC5, "needs cvc5")
+    val text = answers("src/it/resources/regression/smtlib3/function-semantics/extensional-lambdas-in-sets.smt3")
+    assume(!text.contains("(error \"certificates need cvc5"))
+    // the first comparison of the lambdas of the query, of the bodies `body!0` and `body!1`, and
+    // its probe, whose result is `agree!0`
+    val certificate = certificates(text).head
+    check(certificate)
+    // the certificate where the instances give `to` for the symbol `from` of their templates, and
+    // the script and the proof have `to` for it
+    def renamed(from: String, to: String): SExpr = {
+      def rename(e: SExpr): SExpr = e match {
+        case Atom(`from`) => Atom(to)
+        case SList(items) => SList(items.map(rename))
+        case a => a
+      }
+      // the templates whose clauses have `from`, whose instances that don't give it a value keep it
+      val templates = certificate match {
+        case SList(_ :: _ :: _ :: SList(_ :: SList(_ :: script) :: lines) :: _) =>
+          val asserts = script.collect { case SList(List(Atom("assert"), clause)) => clause }
+          lines.collect { case SList(n :: _ :: _ :: indices) if indices.exists {
+            case Atom(i) => rename(asserts(i.toInt)) != asserts(i.toInt)
+            case _ => false
+          } => n }.toSet
+        case _ => Set.empty[SExpr]
+      }
+      def renameValues(rule: SExpr): SExpr = rule match {
+        case SList(kind :: args :: rest) => SList(kind :: rename(args) :: rest.map {
+          case SList(List(i @ Atom("instance"), n, SList(values))) => SList(List(i, n, SList(values.map {
+            case SList(List(symbol, value)) => SList(List(symbol, rename(value)))
+            case other => other
+          } ++ (if (templates(n) && !values.exists { case SList(List(Atom(`from`), _)) => true; case _ => false })
+            List(SList(List(Atom(from), Atom(to)))) else Nil))))
+          case other => other
+        })
+        case other => other
+      }
+      certificate match {
+        case SList(header :: version :: script :: templates :: SList(rules :: ruleLines) :: assumptions :: rest) =>
+          SList(header :: version :: rename(script) :: templates :: SList(rules :: ruleLines.map(renameValues)) ::
+            assumptions :: (rest.init :+ rename(rest.last)))
+        case other => fail(s"$other is not a certificate")
+      }
+    }
+    // the body of a template is that of another lambda
+    assert(intercept[Failure](check(renamed("body!1", "body!0"))).getMessage.contains("body!0 is introduced by both an instance of template"))
+    // the probe defines a symbol that a hypothesis introduces
+    assert(intercept[Failure](check(renamed("agree!0", "b_eq!0"))).getMessage.contains("b_eq!0 is introduced by both"))
+  }
+
   for (file <- corpus) test(s"The certificates of $file hold") {
     assume(solvers.SolverFactory.hasCVC5, "needs cvc5")
     val text = answers(file)
@@ -192,6 +255,7 @@ class CheckerSuite extends AnyFunSuite {
     }
     for ((certificate, n) <- found.zipWithIndex) {
       val checked = check(certificate)
+      if (!checked.original) info(s"certificate ${n + 1} is over the simplified program: ${checked.unexplained.head.take(300)}")
       for (dir <- cpcDir) {
         Files.createDirectories(dir)
         val name = file.replace('/', '_') + s".${n + 1}.cpc"

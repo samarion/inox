@@ -96,6 +96,10 @@ jobs:
       JAVA_OPTS_TMP_DIR: /tmp/tmp_${{ github.run_id }}_${{ github.run_attempt }}
       INOX_DIR: ${{ github.workspace }}/inox
       STAINLESS_DIR: ${{ github.workspace }}/stainless
+      # Where Stainless's integration tests record the work of the solvers on
+      # each benchmark (see `Calibration` in Stainless's Budgets.scala), which
+      # the pull request comment compares with main.
+      RESOURCE_USAGE_DIR: ${{ github.workspace }}/stainless-resource-usage
     steps:
     # The self-hosted runners keep the workspace between runs, and a run that is
     # stopped while checking out can leave a repository that the next checkout
@@ -178,9 +182,12 @@ jobs:
       # run: each run publishes them to an Ivy home of its own, as Stainless's CI does, since runs
       # that share ~/.ivy2/local overwrite each other's jars while they are in use (and fail with
       # NoClassDefFoundError).
+      # -Dresource-usage makes the integration tests record the solvers' work
+      # (Stainless versions without the option ignore it).
       run: |
           PROCESSORS=$(( $(nproc) < 16 ? $(nproc) : 16 )) && \
-          echo "JAVA_OPTS=$JAVA_OPTS -XX:ActiveProcessorCount=$PROCESSORS -Djava.io.tmpdir=$JAVA_OPTS_TMP_DIR" >> "$GITHUB_ENV" && \
+          rm -rf "$RESOURCE_USAGE_DIR" && \
+          echo "JAVA_OPTS=$JAVA_OPTS -XX:ActiveProcessorCount=$PROCESSORS -Djava.io.tmpdir=$JAVA_OPTS_TMP_DIR -Dresource-usage=$RESOURCE_USAGE_DIR" >> "$GITHUB_ENV" && \
           echo "SBT_OPTS=-Djava.io.tmpdir=$JAVA_OPTS_TMP_DIR --sbt-dir $JAVA_OPTS_TMP_DIR --ivy $JAVA_OPTS_TMP_DIR/ivy2" >> "$GITHUB_ENV"
     - name: Creating temp folder
       run: rm -rf "$JAVA_OPTS_TMP_DIR" && mkdir -p "$JAVA_OPTS_TMP_DIR" && chmod 777 "$JAVA_OPTS_TMP_DIR"
@@ -208,13 +215,17 @@ jobs:
       if: always()
       run: rm -rf "${JAVA_OPTS_TMP_DIR:?}"
     # Read by the coverage comment workflow, which compares the duration of
-    # each Stainless test of a pull request build with that of main.
+    # each Stainless test of a pull request build with that of main, and the
+    # work of the solvers on it.
     - name: Collect test durations
       if: ${{ !cancelled() }}
       run: |
         out="$GITHUB_WORKSPACE/stainless-test-timings"
         rm -rf "$out" && mkdir -p "$out"
         python3 "$INOX_DIR/scripts/test_timings.py" collect "$out/timings.json" "$STAINLESS_DIR"
+        if [ -d "$RESOURCE_USAGE_DIR" ]; then
+          python3 "$INOX_DIR/scripts/resource_usage.py" collect "$out/usage.json" "$RESOURCE_USAGE_DIR"
+        fi
         git -C "$STAINLESS_DIR" rev-parse HEAD > "$out/stainless-sha"
         git -C "$INOX_DIR" rev-parse HEAD > "$out/tested-sha"
         # The pull request that this build tested, and the commit of main that

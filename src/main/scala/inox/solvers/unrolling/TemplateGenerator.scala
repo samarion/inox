@@ -35,6 +35,13 @@ trait TemplateGenerator { self: Templates =>
   import program.trees._
   import program.symbols.{given, _}
 
+  /** Whether the equalities of a sort with the equality function `id` are also encoded by the
+    * body of the function where their polarity is known: the simplifier inlines the calls of the
+    * function, for the polarity of its quantifiers, and keeps the equalities of the sort (see
+    * `FormulaSimplifier.inlines`). */
+  private def inlinedEquality(id: Identifier): Boolean =
+    formulaSimplifier(using PurityOptions(context)).inlines(id)
+
   /** The clauses that [[mkExprClauses]] generates for an expression, before [[Template.encode]]
     * encodes them.
     *
@@ -158,10 +165,12 @@ trait TemplateGenerator { self: Templates =>
       case uc @ UninterpretedCall(id, tps, args, _) if uninterpretedFunctions.contains(id -> tps) =>
         val f = uninterpretedFunctions(id -> tps)._1
         val (app, resTpe) = uninterpretedApplication(uc, f, args)
-        val (baseTpe, preds) = refinements(resTpe, app)
+        val (baseTpe, preds) = typeOps.refinements(resTpe, app)
         Some(Assume(freeTyping(f.tpe, f), Assume(andJoin(freeTyping(baseTpe, app) +: preds), app)))
       // a construction needs the sort's invariant (see the case of [[ADT]] in [[mkExprClauses]])
       case adt: ADT if guard(adt).isDefined => constructionInvariant(adt).map(Assume(_, adt))
+      // an equality that is unrolled is an application of the equality symbol of its type
+      case Equals(e1, e2) if unrollEquality(e1.getType) => Some(Application(equalitySymbol(e1.getType)._1, Seq(e1, e2)))
       case _ => None
     }(named(expr, Set.empty))
   }
@@ -175,14 +184,6 @@ trait TemplateGenerator { self: Templates =>
       case FunctionType(_, to) => to
       case tpe => throw new IllegalArgumentException(s"Uninterpreted call with type $tpe: $uc")
     })
-  }
-
-  /** The type that `tpe` refines, with what its refinements say of `value`. */
-  private def refinements(tpe: Type, value: Expr): (Type, Seq[Expr]) = tpe match {
-    case RefinementType(vd, pred) =>
-      val (base, preds) = refinements(vd.tpe, value)
-      (base, preds :+ exprOps.replaceFromSymbols(Map(vd -> value), pred))
-    case _ => (tpe, Seq.empty)
   }
 
   private def guard(expr: Expr): Option[Expr] =
@@ -328,10 +329,22 @@ trait TemplateGenerator { self: Templates =>
         newBlocker
       })
 
+      // An argument that differs between the branches is named by a fresh variable: passing the
+      // `if` itself would copy both branches into the callee's arguments at each unrolling, which
+      // doubles the terms of recursions such as `f(if (c) x - 1 else -(x + 1))`
       val newArgs = (thenCall.args zip elseCall.args).map { case (thenArg, elseArg) =>
-        val (newArg, argClauses) = mkExprClauses(newBlocker, ifExpr(condVar, thenArg, elseArg), builder.localSubst)
+        val merged = ifExpr(condVar, thenArg, elseArg)
+        val (newArg, argClauses) = mkExprClauses(newBlocker, merged, builder.localSubst)
         builder ++= argClauses
-        newArg
+        newArg match {
+          case v: Variable => v
+          case _ if thenArg == elseArg => newArg
+          case _ =>
+            val argVar: Variable = Variable.fresh("arg", merged.getType, true)
+            builder.storeExpr(argVar)
+            builder.storeDefinition(newBlocker, argVar, newArg)
+            argVar
+        }
       }
 
       val newCall = thenCall.tfd.applied(newArgs)
@@ -564,10 +577,10 @@ trait TemplateGenerator { self: Templates =>
       quantifications :+= quantification
 
     var equalities: Map[Encoded, Set[Equality]] = VectorMap.empty
-    @inline def storeEquality(guardVar: Variable, e1: Expr, e2: Expr): Unit = {
+    @inline def storeEquality(guardVar: Variable, e1: Expr, e2: Expr, defined: Boolean = false): Unit = {
       val b = encodedCond(guardVar)
       val encoder: Expr => Encoded = mkEncoder(localSubst)
-      equalities = equalities `merge` (b -> Equality(e1.getType, encoder(e1), encoder(e2)))
+      equalities = equalities `merge` (b -> Equality(e1.getType, encoder(e1), encoder(e2), defined))
     }
 
     @inline def localSubst: Map[Variable, Encoded] =
@@ -678,7 +691,7 @@ trait TemplateGenerator { self: Templates =>
 
         // The refinements of the result are assumed under the path, and the type that they refine
         // is the type of the result
-        val (baseTpe, preds) = refinements(resTpe, newExpr)
+        val (baseTpe, preds) = typeOps.refinements(resTpe, newExpr)
 
         val (tpeExpr, tmplClauses) = mkTypeClauses(pathVar, baseTpe, newExpr, localSubst)(using FreeGenerator)
         storeGuarded(pathVar, tpeExpr)
@@ -692,6 +705,8 @@ trait TemplateGenerator { self: Templates =>
         storeFailure(pathVar, BooleanLiteral(false))
         val newExpr = Variable.fresh("err", tpe, true)
         storeExpr(newExpr)
+        // The symbol stands for the error of the source, which no clause defines it as
+        storeMeaning(newExpr, expr)
         newExpr
 
       case l @ Let(i, e: Lambda, b) =>
@@ -881,8 +896,25 @@ trait TemplateGenerator { self: Templates =>
         val (v, _) = equalitySymbol(e1.getType)
         val re1 = rec(pathVar, e1, pol)
         val re2 = rec(pathVar, e2, pol)
-        storeEquality(pathVar, re1, re2)
-        Application(v, Seq(re1, re2))
+        val app = Application(v, Seq(re1, re2))
+        // The equality of a sort is unfolded without a polarity, like the body of a function
+        // (see [[EqualityTemplate]]). Where the polarity of the equality is known, the body of an
+        // equality function that quantifies is encoded here instead, at that polarity, as what
+        // the equality symbol is of these terms: the equality is not unfolded, and still has
+        // the rules of its symbol (see [[instantiateEquality]]).
+        (e1.getType, pol) match {
+          case (adt: ADTType, Some(_)) if adt.getSort.hasEquality && inlinedEquality(adt.getSort.equality.get.id) =>
+            storeEquality(pathVar, re1, re2, defined = true)
+            val definition = adt.getSort.equality.get.applied(Seq(re1, re2)).inlined
+            rec(pathVar, definition, pol) match {
+              // an equality that holds has its axioms, and nothing else to say
+              case BooleanLiteral(true) =>
+              case encoded => storeGuarded(pathVar, Equals(app, encoded))
+            }
+          case _ =>
+            storeEquality(pathVar, re1, re2)
+        }
+        app
 
       case adt: ADT if guard(adt).isDefined =>
         // The construction fails unless the value satisfies the sort's invariant, which may call the
@@ -927,7 +959,14 @@ trait TemplateGenerator { self: Templates =>
   private val callsMayFalsifyPath: MutableMap[Identifier, Boolean] = MutableMap.empty
 
   private def callMayFalsifyPath(id: Identifier): Boolean = callsMayFalsifyPath.getOrElseUpdate(id,
-    (transitiveCallees(id) + id).exists(fid => exprOps.exists(containsAssumption)(getFunction(fid).fullBody)))
+    reachableFunctions(id).exists(fid => exprOps.exists(containsAssumption)(getFunction(fid).fullBody)))
+
+  private val reachable: MutableMap[Identifier, Set[Identifier]] = MutableMap.empty
+
+  /** The functions that calls of `id` reach. The symbols of each solver are new, so their call graph, which
+    * covers the whole program, would be computed again for each solver. */
+  private[unrolling] def reachableFunctions(id: Identifier): Set[Identifier] =
+    reachable.getOrElseUpdate(id, program.symbols.reachableFunctions(id))
 
   /** Whether checking that a value belongs to `tpe` may falsify the path condition. */
   private def mayFalsifyPath(tpe: Type): Boolean = typeOps.exists {
