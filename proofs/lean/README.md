@@ -1311,35 +1311,42 @@ without type parameters, but only a lemma (`call_tenv`) shows it.
   what Logos reads of its lowering, whose symbols have other names, whose
   errors are assumptions that fail and whose sums and products of two integers
   end in `+ 0` and `* 1`, and proves that where the expression evaluates to a
-  value, so does what it is lowered to (`lowers_eval`). `no_input_solution`
-  says that where `no_solution_of_reached` holds and the constraints after
-  their steps and the functions of the input are lowered to the query and the
-  program that Logos reads (`linkCheck`), no values of the variables of the
-  input, of their types, make all its constraints evaluate to `true` in its
-  program. It covers first-order inputs, with type parameters, over
-  integers, booleans, reals and datatypes, whose constructors, testers and
-  selectors have other names in the reading of Logos, and whose fields of
-  integers are known to be integers, with lets, which the lowering inlines or
-  drops, where each step of a constraint is of these rules, and variables of
+  value, so does what it is lowered to with as much fuel or more
+  (`lowers_eval`). `no_input_solution` says that where `no_solution_of_reached`
+  holds and the constraints after their steps and the functions of the input
+  are lowered to the query and the program that Logos reads (`linkCheck`), no
+  values of the variables of the input, of their types, make all its
+  constraints evaluate to `true` in its program. It covers first-order inputs,
+  with type parameters, over integers, booleans, reals and datatypes, whose
+  constructors, testers and selectors have other names in the reading of Logos,
+  and whose fields of integers are known to be integers, with lets, which the
+  lowering inlines or drops, and universal quantifiers over integers and
+  booleans, where each step of a constraint is of these rules, and variables of
   datatypes, which the steps remove or which are of datatypes of Logos. A
-  construction of a sort with an
-  invariant is lowered to the assumption of the invariant of its arguments
-  (`instInv`), where the body of the invariant doesn't depend on the fuel or
-  the types, and a variable of a signed bit-vector to the signed view of the
-  unsigned variable of Logos. On the corpus, it holds of the 3 certificates
-  of `error-is-infeasible`, the 1st, 2nd, 3rd and 5th of
+  construction of a sort with an invariant is lowered to the assumption of the
+  invariant of its arguments (`instInv`), where the body of the invariant
+  doesn't depend on the fuel or the types, and a variable of a signed
+  bit-vector to the signed view of the unsigned variable of Logos. A constraint
+  that the query assumes is lowered to the assumption of what it is lowered to
+  (`holdsCheck`), the query may assume boolean variables of its own (`litOk`),
+  and the functions that it calls and that no equation defines have the bodies
+  that those of the input are lowered to (`freeBodies`), which the theorem of
+  `no_solution_of_reached` allows. On the corpus, it holds of the 3
+  certificates of `error-is-infeasible`, the first 5 of
   `lets-and-assumptions-around-partial-terms`, the first 5 of
-  `ground-terms-that-evaluate`, the first 3 of
+  `ground-terms-that-evaluate`, the first 4 of
   `arithmetic-over-partial-operands`, the 1st, 3rd and 4th of
   `selections-of-constructions-with-partial-fields`, the first of
   `real-division-by-zero-is-infeasible` and the 1st and 3rd of
   `constructions-under-invariants`, that of
   `bitvector-division-by-zero-is-total`, the first of
   `empty-function-codomains`, the first of
-  `quantifiers-in-connectives-over-partial-bodies`, that of `size-negative`
-  the 2nd, 3rd and 6th of `lambdas-with-partial-bodies-extensional`, the 4
-  of `functions-in-sets-and-fields-extensional` and the regression
-  certificate of `LambdaPointers-Issue115`, as `inox-solution --input` says.
+  `quantifiers-in-connectives-over-partial-bodies`, that of `size-negative`,
+  the first of `none-comparisons-with-constructors-without-functions`, the 2nd,
+  3rd and 6th of `lambdas-with-partial-bodies-extensional`, the 4 of
+  `functions-in-sets-and-fields-extensional` and the regression certificates of
+  `LambdaPointers-Issue115` and `FunctionMatchers`, 37 in all, as
+  `inox-solution --input` says.
   The encoders aren't in this theorem yet.
 - **The link between the proof and the script.** The checker checks that each
   assumption of the proof is the text of an assert of the script, up to how

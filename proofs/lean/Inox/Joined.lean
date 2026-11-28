@@ -25,6 +25,14 @@ the query where its type is lowered to a datatype of Logos, without type paramet
 constructors are those of its sort, of fields of the types that those of the sort are lowered
 to (`dataMapOk`): its value in the query is then its value, with the constructors of Logos
 (`lowerV`).
+
+A constraint is lowered to an expression of the query, or, where the query assumes that it holds,
+to the assumption of that expression, conjunct by conjunct (`holdsCheck`). The query may also
+assume Boolean variables of its own, which no variable of the input is matched with, and that
+values of the variables of the query make true (`litOk`). The functions that the query calls and
+that no equation defines are those of the input that they are matched with: the theorem of
+`no_solution_of_reached` holds whatever their bodies are, so it holds of the bodies that those of
+the input are lowered to (`freeBodies`).
 -/
 
 namespace Inox.Joined
@@ -427,6 +435,9 @@ def pairs : Nat → Expr → Expr → Names
       ({ fields := [(f, f')] } : Names).app (pairs n a a')
     | .Plus a b, .Plus a' (.Plus b' (.IntegerLiteral 0)) => all [a, b] [a', b']
     | .Times a b, .Times a' (.Times b' (.IntegerLiteral 1)) => all [a, b] [a', b']
+    | .Forall _ b, .Forall _ b' => pairs n b b'
+    | e, .Assume p (.BooleanLiteral true) => pairs n e p
+    | .Not (.Implies a b), .And [a', b'] => all [a, .Not b] [a', b']
     | e, e' =>
       match kids e, kids e' with
       | some (i, es), some (j, es') => if i == j then all es es' else {}
@@ -464,13 +475,21 @@ structure Link where
   /-- the types of datatypes of the input, with the datatypes of Logos -/
   μ : List (Ty × Id)
 
+/-- Whether an expression of the query is a Boolean variable or its negation, which the solver
+may assume of its own, or `true`. -/
+def litShape : Expr → Bool
+  | .Variable _ | .Not (.Variable _) | .BooleanLiteral true => true
+  | _ => false
+
 def Link.of (R : InputRead) (r : TermSteps) : Link :=
   let P := r.equations.map funOf
-  let N0 := ((R.final.zip (queryOf r.query)).map fun (q, q') => pairs 1000 q q').foldl
-    Names.app {}
+  let Qt := queryOf r.query
+  -- the expressions of the query that are those of the constraints, position by position
+  let Qc := if Qt.length == R.final.length then Qt else Qt.filter (!litShape ·)
+  let N0 := ((R.final.zip Qc).map fun (q, q') => pairs 1000 q q').foldl Names.app {}
   let N := funPairs R P (R.funs.length + 1) N0
   let D := dataOf r
-  let Γt := varsOf (sigsOf r.equations) r.query
+  let Γt := varsOf (sigsR r) r.query
   -- the constructors of the sorts of the variables of the query, and of their fields
   let κ0 := N.ctors ++ N.vars.flatMap fun (x, y) =>
     match (R.vars.lookup x).bind sortOfTy, (Γt.lookup y).bind sortOfTy with
@@ -534,6 +553,58 @@ def Link.ctx (L : Link) (R : InputRead) : Id → Option (Expr × LK) := fun x =>
 /-- The variable of the input that is matched with the variable `y` of the query. -/
 def Link.pre (L : Link) (y : Id) : Option Id := (L.ρ.find? (·.2 == y)).map (·.1)
 
+/-- Whether the constraint `q` of the input is lowered to the expression `q'` of the query where
+it holds: as an expression (`lowersCheck`), as the assumption that it holds, `(assume q' true)`,
+conjunct by conjunct, or, the negation of an implication, as the conjunction of its premise and
+of the negation of its conclusion. -/
+def holdsCheck (S : LSig) (Γ : Id → Option (Expr × LK)) : Nat → Expr → Expr → Bool
+  | 0, _, _ => false
+  | n + 1, q, q' =>
+    lowersCheck S 1000 Γ q q' .any ||
+    match q, q' with
+    | q, .Assume p (.BooleanLiteral true) => holdsCheck S Γ n q p
+    | .And qs, .And qs' =>
+      qs.length == qs'.length && (qs.zip qs').all fun (a, a') => holdsCheck S Γ n a a'
+    | .Not (.Implies a b), .And [a', b'] =>
+      holdsCheck S Γ n a a' && holdsCheck S Γ n (.Not b) b'
+    | _, _ => false
+
+/-- Whether the variable `y` of the query is negated in `Qt`. -/
+def negated (Qt : List Expr) (y : Id) : Bool :=
+  Qt.any fun | .Not (.Variable z) => z == y | _ => false
+
+/-- An expression of the query that no constraint of the input is lowered to, but that values of
+the variables of the query make true whatever the values of those of the input: `true`, or a
+Boolean variable of the query that is matched with no variable of the input, or its negation,
+when the variable isn't also negated, in which case it is false. -/
+def litOk (L : Link) (Γt : List (Id × Ty)) (Qt : List Expr) : Expr → Bool
+  | .BooleanLiteral true => true
+  | .Variable y => L.pre y == none && Γt.any (·.1 == y) && !negated Qt y
+  | .Not (.Variable y) => L.pre y == none && Γt.any (·.1 == y)
+  | _ => false
+
+/-- The body of the function of the program of Logos that the function `s` of the query, which
+no equation defines, is: that of the function of the input that is matched with it, with the
+parameters named after those of `s`. -/
+def freeBody (R : InputRead) (L : Link) (s : Sig) : Option Expr :=
+  match L.φ.find? (·.2 == s.name) with
+  | some (f, _) => match lookup_fun R.funs f with
+    | .Ok (.FunDef _ _ ps b) =>
+      if ps.length == s.params.length then
+        (ps.zip s.params).foldlM (fun e (x, y, _) => Inox.Simplified.subst x (.Variable y) 1000 e)
+          b
+      else none
+    | _ => none
+  | none => none
+
+/-- The bodies of the functions of the query that no equation defines. -/
+def freeBodies (R : InputRead) (r : TermSteps) : List Expr :=
+  (freeSigs r).map fun s => ((freeBody R (Link.of R r) s).getD (.BooleanLiteral true))
+
+/-- The program of Logos, with the functions that no equation defines lowered from the input. -/
+def linkProgram (R : InputRead) (r : TermSteps) : Program :=
+  programWith (dataOf r) r.equations (freeDefs (freeSigs r) (freeBodies R r))
+
 /-- The function `f` of the input is lowered to the function `g` of `P`. -/
 def funCheck (S : LSig) (fs P : List FunDef) (f g : Id) (ks : List LK) (k : LK) : Bool :=
   match lookup_fun fs f, lookup_fun P g with
@@ -594,21 +665,25 @@ theorem ctorOf_of {cs : List Constructor} {ss : List ADTSort} {c s : Id} {fs : L
   · cases hs
 
 /-- The input is lowered to the program and the query that Logos reads from the certificate:
-the equations define every function that the query calls, each expression of the query is what
-the constraint at its position is lowered to, the functions that they call are lowered to those
-of the program, and each variable of the query is a variable of the input of its type, matched
-with no other. -/
+the equations define every function that the query calls, each expression of the query is what a
+constraint is lowered to or one that the solver assumed of its own (`litOk`), the functions that
+they call are lowered to those of the program, and each variable of the query is a variable of
+the input of its type, matched with no other, or a Boolean. -/
 def linkCheck (R : InputRead) (r : TermSteps) : Bool :=
   let L := Link.of R r
   let S := L.sig R
   let Γ := L.ctx R
-  let Γt := varsOf (sigsOf r.equations) r.query
+  let Γt := varsOf (sigsR r) r.query
   let Qt := queryOf r.query
-  (freeSigs r).isEmpty && R.vars.all (fun p => isPrimTy p.2 || isDataTy p.2) &&
-    Qt.length == R.final.length &&
-    (R.final.zip Qt).all (fun (q, q') => lowersCheck S 1000 Γ q q' .any) &&
+  let D := dataOf r
+  ((freeSigs r).zip (freeBodies R r)).all (fun (s, b) =>
+    (kind D s.ret).isSome && infer D (sigsR r) s.params b == kind D s.ret) &&
+    R.vars.all (fun p => isPrimTy p.2 || isDataTy p.2) &&
+    Qt.all (fun q' => litOk L Γt Qt q' ||
+      R.final.any fun q => holdsCheck S Γ 1000 q q') &&
     L.φ.all (fun (f, _) => match S.funs f with
-      | some (g, ks, k) => funCheck S R.funs (r.equations.map funOf) f g ks k
+      | some (g, ks, k) => funCheck S R.funs
+          (r.equations.map funOf ++ freeDefs (freeSigs r) (freeBodies R r)) f g ks k
       | none => true) &&
     Γt.all (fun (y, T) => match L.pre y with
       | some x =>
@@ -618,7 +693,7 @@ def linkCheck (R : InputRead) (r : TermSteps) : Bool :=
         (match Γ x with
           | some (e, _) => ctxVar e == some y
           | _ => false)
-      | none => false) &&
+      | none => T matches .BooleanType) &&
     L.ρ.all (fun (x, _) => match Γ x with
       | some (e, _) => match ctxVar e with
         | some y => L.pre y == some x && Γt.any (·.1 == y)
@@ -826,16 +901,94 @@ theorem forall₂_map {D : List Data} (g : Id → Value) : ∀ {Γ : List (Id ×
   | [], _ => .nil
   | p :: Γ, h => .cons (h p (by simp)) (forall₂_map g fun q hq => h q (by simp [hq]))
 
-theorem mem_zip_right {α β : Type} {b : β} : ∀ {l : List α} {l' : List β},
-    l'.length = l.length → b ∈ l' → ∃ a, (a, b) ∈ l.zip l'
-  | [], [], _, h => by simp at h
-  | a :: l, b' :: l', hl, h => by
-    rcases List.mem_cons.mp h with rfl | h
-    · exact ⟨a, by simp⟩
-    · obtain ⟨a', ha'⟩ := mem_zip_right (l := l) (by simpa using hl) h
-      exact ⟨a', List.mem_cons_of_mem _ ha'⟩
-  | [], _ :: _, hl, _ => by simp at hl
-  | _ :: _, [], _, h => by simp at h
+theorem eval_and_true {O : Oracle} {P : Program} {f : Int} {env : Env} :
+    ∀ es : List Expr, eval_and O P f env es = .Ok (.BoolV true) ↔
+      ∀ e ∈ es, eval O P f env e = .Ok (.BoolV true)
+  | [] => by rw [eval_and]; simp
+  | e :: es => by
+    rw [eval_and]
+    have ih := eval_and_true (O := O) (P := P) (f := f) (env := env) es
+    unfold eval_bool
+    cases he : eval O P f env e with
+    | Ok v =>
+      cases v
+      case BoolV b => cases b <;> simp [ih, he]
+      all_goals simp [he]
+    | Stuck => simp [he]
+    | OutOfFuel => simp [he]
+
+theorem not_implies_true {O : Oracle} {P : Program} {f : Int} {env : Env} {a b : Expr}
+    (h : eval O P f env (.Not (.Implies a b)) = .Ok (.BoolV true)) :
+    eval O P f env a = .Ok (.BoolV true) ∧ eval O P f env (.Not b) = .Ok (.BoolV true) := by
+  simp only [eval, eval_bool] at h ⊢
+  revert h
+  cases ha : eval O P f env a with
+  | Ok va =>
+    cases va with
+    | BoolV x =>
+      cases x
+      · simp
+      · cases hb : eval O P f env b with
+        | Ok vb =>
+          cases vb with
+          | BoolV y => cases y <;> simp
+          | _ => simp
+        | _ => simp
+    | _ => simp
+  | _ => simp
+
+theorem forall_zip_holds {α : Type} {p : α → α → Prop} {f : α → α → Bool} :
+    ∀ {as bs : List α}, as.length = bs.length → (∀ x ∈ as.zip bs, f x.1 x.2 = true) →
+      (∀ a b, f a b = true → p a b) → ∀ b ∈ bs, ∃ a ∈ as, p a b
+  | [], [], _, _, _, b, hb => by simp at hb
+  | a :: as, b' :: bs, hl, h, hp, b, hb => by
+    rcases List.mem_cons.mp hb with rfl | hb
+    · exact ⟨a, List.mem_cons_self, hp _ _ (h (a, b) List.mem_cons_self)⟩
+    · obtain ⟨a', ha', hpa⟩ := forall_zip_holds (by simpa using hl)
+        (fun x hx => h x (List.mem_cons_of_mem _ hx)) hp b hb
+      exact ⟨a', List.mem_cons_of_mem _ ha', hpa⟩
+  | [], _ :: _, hl, _, _, _, _ => by simp at hl
+  | _ :: _, [], hl, _, _, _, _ => by simp at hl
+
+/-- Where a constraint of the input holds, the expression of the query that it is lowered to
+holds (`holdsCheck`). -/
+theorem holds_sound {O : Oracle} {Ps P : Program} {S : LSig} (hO : O.Sound) (hF : Funs Ps P S)
+    (hC : Ctors Ps P S) {Γ : Id → Option (Expr × LK)} {B : Int} {env env' : Env}
+    (hE : EnvOk O P S.ctors S.kinds B Γ env env') :
+    ∀ (n : Nat) (q q' : Expr) (fuel : Int), holdsCheck S Γ n q q' = true →
+      eval O Ps fuel env q = .Ok (.BoolV true) →
+      ∀ f, max fuel B ≤ f → eval O P f env' q' = .Ok (.BoolV true)
+  | 0, _, _, _, h, _ => by simp [holdsCheck] at h
+  | n + 1, q, q', fuel, h, hq => by
+    unfold holdsCheck at h
+    simp only [Bool.or_eq_true] at h
+    rcases h with h | h
+    · obtain ⟨_, v', rv, hm⟩ := lowers_eval hO hF hC fuel.toNat ((lowers_sound _ 1000).1 _ _ _ _ h)
+        B env env' hE fuel (Int.self_le_toNat fuel) _ hq
+      rw [vr_bool rv] at hm
+      exact hm
+    · split at h
+      · next p =>
+        intro f hf
+        have := holds_sound hO hF hC hE n q p fuel h hq f hf
+        simp only [eval, eval_bool, this, dite_true]
+      · next qs qs' _ =>
+        simp only [Bool.and_eq_true, beq_iff_eq, List.all_eq_true] at h
+        intro f hf
+        simp only [eval] at hq ⊢
+        rw [eval_and_true] at hq ⊢
+        intro e' he'
+        obtain ⟨e, he, hh⟩ := forall_zip_holds h.1 h.2
+          (fun a b hab => holds_sound hO hF hC hE n a b fuel hab) e' he'
+        exact hh (hq e he) f hf
+      · next a b a' b' =>
+        simp only [Bool.and_eq_true] at h
+        intro f hf
+        obtain ⟨h1, h2⟩ := not_implies_true hq
+        have e1 := holds_sound hO hF hC hE n _ _ fuel h.1 h1 f hf
+        have e2 := holds_sound hO hF hC hE n _ _ fuel h.2 h2 f hf
+        simp only [eval, eval_and, eval_bool, e1, e2, dite_true]
+      · cases h
 
 /-- The input has no solution: where the theorem of `no_solution_of_reached` holds of a
 certificate and its input is lowered to the program and the query that Logos reads from it
@@ -850,11 +1003,11 @@ theorem no_input_solution {O : Oracle} (sound : LogosSound) (hO : O.Sound)
     ∀ vs, ¬ InputSolution O R vs := by
   intro vs ⟨hvs, bs, hbs, hsol⟩
   unfold linkCheck at hlink
-  simp only [Bool.and_eq_true, List.all_eq_true, beq_iff_eq, List.isEmpty_iff] at hlink
-  obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨hfree, hprim⟩, hlen⟩, hq⟩, hfuns⟩, hvars⟩, hρ⟩, hctors⟩, hκ⟩, hσ⟩, hfk⟩,
+  simp only [Bool.and_eq_true, List.all_eq_true] at hlink
+  obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨hfree, hprim⟩, hq⟩, hfuns⟩, hvars⟩, hρ⟩, hctors⟩, hκ⟩, hσ⟩, hfk⟩,
     hdm⟩ := hlink
   generalize hL : Link.of R r = L at hq hfuns hvars hρ hctors hκ hσ hfk hdm
-  have hF : Funs R.program (programOf (dataOf r) r.equations) (L.sig R) := by
+  have hF : Funs R.program (linkProgram R r) (L.sig R) := by
     intro f g ks k hf
     have hf' := hf
     simp only [Link.sig] at hf'
@@ -871,7 +1024,7 @@ theorem no_input_solution {O : Oracle} (sound : LogosSound) (hO : O.Sound)
         exact ⟨tp, ps, ps', b, b', hb, hb', hnd, hl1, hl2, (lowers_sound _ 1000).1 _ _ _ _ hl⟩
       · cases hc
     · cases hf'
-  have hC : Ctors R.program (programOf (dataOf r) r.equations) (L.sig R) := by
+  have hC : Ctors R.program (linkProgram R r) (L.sig R) := by
     refine ⟨fun c c' hc => ?_, fun c d c' hc hd => ?_, fun f g f' hf hg => ?_,
       fun c s ks hk => ?_, fun c p fs B hv => ?_⟩
     · have hk := hctors (c, c') (Inox.Lowered.mem_of_lookup hc)
@@ -935,15 +1088,15 @@ theorem no_input_solution {O : Oracle} (sound : LogosSound) (hO : O.Sound)
     | some x => match lookup_var bs x with
       | .Ok v => lowerV (L.sig R).ctors v
       | _ => .UnitV
-    | none => .UnitV
+    | none => .BoolV (!negated (queryOf r.query) y)
   have hg : ∀ x T y, R.vars.lookup x = some T → L.pre y = some x →
       ∃ v, lookup_var bs x = .Ok v ∧ OfTy R.ctors R.sorts T v ∧
         g y = lowerV (L.sig R).ctors v := by
     intro x T y hx hy
     obtain ⟨v, hv1, hv2⟩ := bind_lookup_typed R.vars vs bs hbs hvs x T hx
     exact ⟨v, hv1, hv2, by simp only [g, hy, hv1]⟩
-  obtain ⟨bs', hbs', hl'⟩ := bind_map g ((varsOf (sigsOf r.equations) r.query).map Prod.fst)
-  have hEnv : EnvOk O (programOf (dataOf r) r.equations) (L.sig R).ctors (L.sig R).kinds
+  obtain ⟨bs', hbs', hl'⟩ := bind_map g ((varsOf (sigsR r) r.query).map Prod.fst)
+  have hEnv : EnvOk O (linkProgram R r) (L.sig R).ctors (L.sig R).kinds 0
       (L.ctx R) (Env.Env [] bs) (Env.Env [] bs') := by
     intro x y k hx
     have hx' := hx
@@ -970,12 +1123,12 @@ theorem no_input_solution {O : Oracle} (sound : LogosSound) (hO : O.Sound)
         cases hyk
         cases hv2 <;> simp [isSignedTy] at hs
         subst hs
-        refine ⟨.prim rfl, _, 0, .prim rfl, fun _ _ => ?_⟩
+        refine ⟨.prim rfl, _, .prim rfl, fun _ _ => ?_⟩
         simp only [eval, hlv, lowerV]
       · next hs =>
         cases hyk
         have hk := has_of_typed (K := (L.sig R).kinds) hv2
-        refine ⟨hk, lowerV (L.sig R).ctors v, 0, ?_, fun _ _ => by simp only [eval, hlv]⟩
+        refine ⟨hk, lowerV (L.sig R).ctors v, ?_, fun _ _ => by simp only [eval, hlv]⟩
         rcases hc'.1 with hp | hd
         · have hTp := primEq_prim hp
           have hu : lowerV (L.sig R).ctors v = v := by
@@ -986,8 +1139,8 @@ theorem no_input_solution {O : Oracle} (sound : LogosSound) (hO : O.Sound)
         · exact (lower_ty hdm hv2 hd).1
     · cases hx'
   have hvs' : List.Forall₂ (HasV (dataOf r))
-      (((varsOf (sigsOf r.equations) r.query).map Prod.fst).map g)
-      ((varsOf (sigsOf r.equations) r.query).map Prod.snd) := by
+      (((varsOf (sigsR r) r.query).map Prod.fst).map g)
+      ((varsOf (sigsR r) r.query).map Prod.snd) := by
     refine forall₂_map g fun p hp => ?_
     have hc := hvars p hp
     split at hc
@@ -1003,11 +1156,52 @@ theorem no_input_solution {O : Oracle} (sound : LogosSound) (hO : O.Sound)
           exact hasV_query hT hv
         · exact (lower_ty hdm hv hT).2
       · cases hT
-    · cases hc
-  refine no_solution_of_reached_closed sound hO hty hAccept hr hcheck hsrc hreached hfree _
+    · next hpre =>
+      obtain ⟨y, T⟩ := p
+      cases T <;> simp at hc
+      simp only [g, hpre, HasV]
+  have hbodies : FreeBodies (dataOf r) (sigsR r) (freeSigs r) (freeBodies R r) := by
+    refine ⟨by simp [freeBodies], fun p hp => ?_⟩
+    have hsrc' := hsrc
+    simp only [sourceCheck, Bool.and_eq_true] at hsrc'
+    have hD := dataOk_of_check hsrc'.1.1.1.1
+    have h := hfree p hp
+    simp only [beq_iff_eq] at h
+    obtain ⟨k, hk⟩ := Option.isSome_iff_exists.mp h.1
+    rw [kind_spec hk]
+    exact infer_sound hD _ _ _ k (h.2.trans hk)
+  have hns : ∀ vs, ¬ Solution O (linkProgram R r) (dataOf r) (varsOf (sigsR r) r.query)
+      (queryOf r.query) vs :=
+    no_solution_of_reached sound hO hty hAccept hr hcheck hsrc hreached hbodies
+  refine hns _
     ⟨hvs', bs', hbs', fun q' hq' => ?_⟩
-  obtain ⟨q, hqq⟩ := mem_zip_right hlen hq'
-  obtain ⟨q0, hq0, hfq⟩ := List.mem_map.mp (List.of_mem_zip hqq).1
+  have hq1 := hq q' hq'
+  simp only [Bool.or_eq_true, List.any_eq_true] at hq1
+  rcases hq1 with hlit | ⟨q, hqf, hqq⟩
+  · -- an expression that the solver assumed of its own
+    have hlv : ∀ y, (varsOf (sigsR r) r.query).any (·.1 == y) = true →
+        L.pre y = none → lookup_var (env_vars (Env.Env [] bs')) y =
+          .Ok (.BoolV (!negated (queryOf r.query) y)) := by
+      intro y hy hpre
+      obtain ⟨p, hp, hpy⟩ := List.any_eq_true.mp hy
+      have hl := hl' y (List.mem_map.mpr ⟨p, hp, beq_iff_eq.mp hpy⟩)
+      simp only [g, hpre] at hl
+      simp only [env_vars, hl]
+    unfold litOk at hlit
+    split at hlit
+    · exact ⟨0, by simp only [eval]⟩
+    · next y =>
+      simp only [Bool.and_eq_true, beq_iff_eq, Bool.not_eq_true'] at hlit
+      obtain ⟨⟨hpre, hy⟩, hn⟩ := hlit
+      exact ⟨0, by simp only [eval, hlv y hy hpre, hn, Bool.not_false]⟩
+    · next y =>
+      simp only [Bool.and_eq_true, beq_iff_eq] at hlit
+      obtain ⟨hpre, hy⟩ := hlit
+      have hn : negated (queryOf r.query) y = true :=
+        List.any_eq_true.mpr ⟨_, hq', by simp⟩
+      exact ⟨0, by simp only [eval, eval_bool, hlv y hy hpre, hn, Bool.not_true, Bool.not_false]⟩
+    · cases hlit
+  obtain ⟨q0, hq0, hfq⟩ := List.mem_map.mp hqf
   obtain ⟨n, hn0⟩ := hsol q0 hq0
   have hfacts : ∀ f ∈ R.facts, f.Holds O R.program n (Env.Env [] bs) := by
     intro f hf
@@ -1026,9 +1220,6 @@ theorem no_input_solution {O : Oracle} (sound : LogosSound) (hO : O.Sound)
       · cases hpf
   obtain ⟨_, hn, hx⟩ := finalOf_refines hO R q0 n _ _ hfacts hn0
   rw [Inox.Closures.ext_bool hx, hfq] at hn
-  have hl := (lowers_sound _ 1000).1 _ _ _ _ (hq (q, q') hqq)
-  obtain ⟨_, v', m, rv, hm⟩ := lowers_eval hO hF hC n.toNat hl _ _ hEnv n (Int.self_le_toNat n) _ hn
-  rw [vr_bool rv] at hm
-  exact ⟨m, hm m (Int.le_refl m)⟩
+  exact ⟨_, holds_sound hO hF hC hEnv 1000 q q' n hqq hn _ (Int.le_refl _)⟩
 
 end Inox.Joined
