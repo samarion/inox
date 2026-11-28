@@ -553,6 +553,17 @@ theorem exists_zip_right {α β : Type} :
     · obtain ⟨a', ha'⟩ := exists_zip_right (l := l) (by simpa using hl) hb
       exact ⟨a', by simp [ha']⟩
 
+theorem exists_zip_left {α β : Type} :
+    ∀ {l : List α} {m : List β}, l.length = m.length → ∀ {a : α}, a ∈ l → ∃ b, (a, b) ∈ l.zip m
+  | [], [], _, _, ha => by simp at ha
+  | [], _ :: _, hl, _, _ => by simp at hl
+  | _ :: _, [], hl, _, _ => by simp at hl
+  | a' :: l, b :: m, hl, a, ha => by
+    rcases List.mem_cons.mp ha with rfl | ha
+    · exact ⟨b, by simp⟩
+    · obtain ⟨b', hb'⟩ := exists_zip_left (l := l) (m := m) (by simpa using hl) ha
+      exact ⟨b', by simp [hb']⟩
+
 theorem map_zip_eq {α β : Type} (f : α → β) :
     ∀ {l m : List α}, l.length = m.length → (∀ p ∈ l.zip m, f p.1 = f p.2) → l.map f = m.map f
   | [], [], _, _ => rfl

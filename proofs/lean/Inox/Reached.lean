@@ -204,7 +204,7 @@ def reachedCovered (r : TermSteps) : Term → Bool :=
   let J := guardedCalls r
   let p := pathsOf r
   let D := dataOf r
-  let S := sigsOf r.equations
+  let S := sigsR r
   let Γ := varsOf S r.query
   let qs := queryOf r.query
   let ok := fun φ => guardedEq r.equations J φ || p.assumed D S J φ || p.assumedQuery D S Γ qs φ
@@ -224,7 +224,7 @@ def apart (D : List Data) (S : List Sig) (Γ : List (Id × Ty)) (r : TermSteps) 
 /-- The check: the fresh symbols are apart from the program and the query, and every fact is
 covered where the calls that evaluation goes through have values. -/
 def reachedCheck (r : TermSteps) : Bool :=
-  apart (dataOf r) (sigsOf r.equations) (varsOf (sigsOf r.equations) r.query) r &&
+  apart (dataOf r) (sigsR r) (varsOf (sigsR r) r.query) r &&
     r.facts.all (reachedCovered r)
 
 /-! ## Applications and substitutions -/
@@ -649,8 +649,8 @@ theorem holds_reachedCovered (hO : O.Sound) (hty : LogosTyping) (hS : SigOk D S)
     (hP : ProgTy D S P) {Γ : List (Id × Ty)} {env : Env} (hEnv : EnvTy D Γ env) {r : TermSteps}
     (hbase : ∀ t ∈ r.base, ∃ q, HasTy D S Γ q .BooleanType ∧ __eo_to_smt t = tr D S Γ q ∧
       ∃ n v, eval O P n env q = .Ok v)
-    (hDr : D = dataOf r) (hSr : S = sigsOf r.equations) (hE : ∀ e ∈ r.equations, EqBody P D S e)
-    (hΓr : Γ = varsOf (sigsOf r.equations) r.query)
+    (hDr : D = dataOf r) (hSr : S = sigsR r) (hE : ∀ e ∈ r.equations, EqBody P D S e)
+    (hΓr : Γ = varsOf (sigsR r) r.query)
     (hqs : ∀ q ∈ queryOf r.query, (∃ q', QTy D S Γ q q') ∧ ∃ n v, eval O P n env q = .Ok v)
     {t : Term}
     (h : reachedCovered r t = true) {assums : List Term}
@@ -664,8 +664,8 @@ theorem holds_reachedCovered (hO : O.Sound) (hty : LogosTyping) (hS : SigOk D S)
     (r.facts.filterMap (fun t => candOf (__eo_to_smt t)) ++
       (substituted r).filterMap fun q => candOf q.2)
   have hok : ∀ φ, (guardedEq r.equations (guardedCalls r) φ ||
-      (pathsOf r).assumed (dataOf r) (sigsOf r.equations) (guardedCalls r) φ ||
-      (pathsOf r).assumedQuery (dataOf r) (sigsOf r.equations) (varsOf (sigsOf r.equations) r.query)
+      (pathsOf r).assumed (dataOf r) (sigsR r) (guardedCalls r) φ ||
+      (pathsOf r).assumedQuery (dataOf r) (sigsR r) (varsOf (sigsR r) r.query)
         (queryOf r.query) φ) = true →
       __smtx_model_eval M φ = SmtValue.Boolean true := by
     intro φ hφ
@@ -690,60 +690,69 @@ end Steps
 
 /-! ## The theorem -/
 
-/-- What the check of `Inox/Source.lean` gives for a function of the equations, with its body. -/
-theorem eqBody_of_check {D : List Data} (hD : DataOk D) {eqs : List Equation}
-    (hS : sigCheck D (sigsOf eqs) = true) {e : Equation} (he : e ∈ eqs)
-    (h : eqCheck D (sigsOf eqs) e = true) : EqBody (programOf D eqs) D (sigsOf eqs) e := by
+/-- What the check of `Inox/Source.lean` gives for a function of the equations, with its body, in
+a program that has the functions `extra` after them. -/
+theorem eqBody_of_check {D : List Data} (hD : DataOk D) {eqs : List Equation} {U : List Sig}
+    {extra : List FunDef} (hS : sigCheck D (sigsOf eqs ++ U) = true) {e : Equation} (he : e ∈ eqs)
+    (h : eqCheck D (sigsOf eqs ++ U) e = true) :
+    EqBody (programWith D eqs extra) D (sigsOf eqs ++ U) e := by
+  refine ⟨List.mem_append_left _ (List.mem_map_of_mem he), ?_⟩
   simp only [eqCheck, Bool.and_eq_true, decide_eq_true_eq] at h
   obtain ⟨⟨⟨hp, ht⟩, hk⟩, hi⟩ := h
   obtain ⟨k, hk⟩ := Option.isSome_iff_exists.mp hk
-  refine ⟨List.mem_map_of_mem he, lookup_funOf (sigOk_of_check hD hS).nodup e he, ?_, hp, ht⟩
+  have hnd := (sigOk_of_check hD hS).nodup
+  rw [List.map_append] at hnd
+  refine ⟨lookup_fun_append_left extra (lookup_funOf (List.nodup_append.mp hnd).1 e he), ?_, hp,
+    ht⟩
   rw [kind_spec hk]
   exact infer_sound hD _ _ _ k (hi.trans hk)
 
 /-- The query of an accepted certificate has no solution in the program of the certificate, when
-the checks of `Inox/Source.lean` and of this file hold. Nothing is assumed of the calls of the
-program: those that the evaluation of a solution goes through give values, and the checker has
-checked that the certificate only uses the defining equations of such calls. -/
+the checks of `Inox/Source.lean` and of this file hold, whatever the bodies of the functions that
+it calls and that no equation defines (`freeSigs`), among those of their types. Nothing is
+assumed of the calls of the program: those that the evaluation of a solution goes through give
+values, and the checker has checked that the certificate only uses the defining equations of such
+calls. -/
 theorem no_solution_of_reached {O : Oracle} (sound : LogosSound) (hO : O.Sound)
     (hty : LogosTyping) {certificate : Logos.Sexp} {checked : Checked} {r : TermSteps}
     (hAccept : accept certificate = .ok checked) (hr : termSteps checked = .ok r)
     (hcheck : r.check = true) (hsrc : sourceCheck r = true)
-    (hreached : reachedCheck r = true) :
-    ∀ vs, ¬ Solution O (programOf (dataOf r) r.equations) (dataOf r)
-      (varsOf (sigsOf r.equations) r.query) (queryOf r.query) vs := by
+    (hreached : reachedCheck r = true) {bodies : List Expr}
+    (hbodies : FreeBodies (dataOf r) (sigsR r) (freeSigs r) bodies) :
+    ∀ vs, ¬ Solution O (programWith (dataOf r) r.equations (freeDefs (freeSigs r) bodies))
+      (dataOf r) (varsOf (sigsR r) r.query) (queryOf r.query) vs := by
   simp only [sourceCheck, Bool.and_eq_true] at hsrc
   obtain ⟨⟨⟨⟨hD', hS'⟩, hE'⟩, hΓ'⟩, hB'⟩ := hsrc
   have hD := dataOk_of_check hD'
   simp only [reachedCheck, Bool.and_eq_true] at hreached
   obtain ⟨hapart, hall⟩ := hreached
   have hS := sigOk_of_check hD hS'
-  have hPF := progFrag_of_check hD hS' hE'
-  have hP := progTy_of_check hD hS' hE'
-  have hE : ∀ e ∈ r.equations, EqBody (programOf (dataOf r) r.equations) (dataOf r)
-      (sigsOf r.equations) e :=
-    fun e he => eqBody_of_check hD hS' he (List.all_eq_true.mp hE' e he)
+  have hPF := progFrag_of_check hD hS' hE' hbodies
+  have hP := progTy_of_check hD hS' hE' hbodies
+  have hE : ∀ e ∈ r.equations, EqBody (programWith (dataOf r) r.equations
+      (freeDefs (freeSigs r) bodies)) (dataOf r) (sigsR r) e :=
+    fun e he => eqBody_of_check (U := freeSigs r) hD hS' he (List.all_eq_true.mp hE' e he)
   have hΓ := varsFresh_of_check hΓ'
   have hB := baseFor_of_check hD hB'
   intro vs ⟨hvs, bs, hbs, hsol⟩
   obtain ⟨cd⟩ := Codes.nonempty
   obtain ⟨M0, hM0⟩ := Smtm.model_wf_nonvacuous
-  have hEnv : EnvTy (dataOf r) (varsOf (sigsOf r.equations) r.query) (Env.Env [] bs) := by
+  have hEnv : EnvTy (dataOf r) (varsOf (sigsR r) r.query) (Env.Env [] bs) := by
     intro x T hx w hw'
     obtain ⟨u, hu, huT⟩ := bind_lookup _ vs bs hbs hvs x T hx
     rw [lookup_var_det hw' hu]; exact huT
-  have hbase : ∀ t ∈ r.base, ∃ q, HasTy (dataOf r) (sigsOf r.equations)
-      (varsOf (sigsOf r.equations) r.query) q .BooleanType ∧
-      __eo_to_smt t = tr (dataOf r) (sigsOf r.equations) (varsOf (sigsOf r.equations) r.query) q ∧
-      ∃ n v, eval O (programOf (dataOf r) r.equations) n (Env.Env [] bs) q = .Ok v := by
+  have hbase : ∀ t ∈ r.base, ∃ q, HasTy (dataOf r) (sigsR r) (varsOf (sigsR r) r.query) q
+      .BooleanType ∧ __eo_to_smt t = tr (dataOf r) (sigsR r) (varsOf (sigsR r) r.query) q ∧
+      ∃ n v, eval O (programWith (dataOf r) r.equations (freeDefs (freeSigs r) bodies)) n
+        (Env.Env [] bs) q = .Ok v := by
     intro t ht
     obtain ⟨q, hq, q', hqq, htr⟩ := hB t ht
     obtain ⟨n, hn⟩ := hsol q hq
     exact ⟨q', hasTy_of_q hqq, htr.trans (tr_of_q hqq), n, _, eval_of_q hqq _ _ hn⟩
   refine no_good_model_of_accept_only sound hty
-    (Agrees O (programOf (dataOf r) r.equations) (dataOf r) (sigsOf r.equations)
-      (varsOf (sigsOf r.equations) r.query)
-      (Env.Env [] bs)) hAccept hr hcheck (keeps_of_apart hapart)
+    (Agrees O (programWith (dataOf r) r.equations (freeDefs (freeSigs r) bodies)) (dataOf r)
+      (sigsR r) (varsOf (sigsR r) r.query) (Env.Env [] bs)) hAccept hr hcheck
+    (keeps_of_apart hapart)
     (factsHold_of_except_sub
       (fun _ h _ hsub => holds_reachedCovered hO hty hS hP hEnv hbase rfl rfl hE rfl
         (fun q hq => ⟨query_ty_of_check hD hB' q hq, (hsol q hq).imp fun _ hn => ⟨_, hn⟩⟩) h hsub)
@@ -756,5 +765,18 @@ theorem no_solution_of_reached {O : Oracle} (sound : LogosSound) (hO : O.Sound)
   obtain ⟨q, hq, q', hqq, htr⟩ := hB t ht
   obtain ⟨n, hn⟩ := hsol q hq
   exact ⟨q', hasTy_of_q hqq, htr.trans (tr_of_q hqq), n, eval_of_q hqq _ _ hn⟩
+
+/-- `no_solution_of_reached` for a certificate whose query and equations call only functions that
+the equations define: the query has no solution in the program of the equations. -/
+theorem no_solution_of_reached_closed {O : Oracle} (sound : LogosSound) (hO : O.Sound)
+    (hty : LogosTyping) {certificate : Logos.Sexp} {checked : Checked} {r : TermSteps}
+    (hAccept : accept certificate = .ok checked) (hr : termSteps checked = .ok r)
+    (hcheck : r.check = true) (hsrc : sourceCheck r = true)
+    (hreached : reachedCheck r = true) (hfree : freeSigs r = []) :
+    ∀ vs, ¬ Solution O (programOf (dataOf r) r.equations) (dataOf r)
+      (varsOf (sigsOf r.equations) r.query) (queryOf r.query) vs := by
+  have h := no_solution_of_reached (O := O) sound hO hty hAccept hr hcheck hsrc hreached
+    (bodies := []) ⟨by simp [hfree], by simp⟩
+  simpa [hfree, freeDefs, programWith_nil, sigsR] using h
 
 end Inox.Bridge

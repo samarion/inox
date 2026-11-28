@@ -194,6 +194,23 @@ def consts : SmtTerm → List (native_String × SmtType)
   | .Apply f a => consts f ++ consts a
   | _ => []
 
+/-- The constants that `t` applies, with their sorts. -/
+def heads : SmtTerm → List (native_String × SmtType)
+  | .ite c a b => heads c ++ heads a ++ heads b
+  | .not a | .uneg a | .bvneg a | .bvnot a | .extract _ _ a | .zero_extend _ a
+  | .sign_extend _ a | .set_singleton a | .exists _ _ a => heads a
+  | .xor a b => heads a ++ heads b
+  | .imp a b | .eq a b | .plus a b | .neg a b | .mult a b | .div a b | .mod a b | .lt a b
+  | .gt a b | .leq a b | .geq a b | .and a b | .or a b | .bvadd a b | .bvsub a b | .bvmul a b
+  | .bvudiv a b | .bvurem a b | .bvult a b | .bvugt a b | .bvule a b | .bvuge a b
+  | .qdiv a b | .bvsdiv a b | .bvsrem a b | .bvsmod a b | .bvslt a b | .bvsgt a b | .bvsle a b
+  | .bvsge a b | .bvand a b | .bvor a b | .bvxor a b | .bvshl a b | .bvashr a b
+  | .bvlshr a b | .set_union a b | .set_inter a b | .set_minus a b | .set_member a b
+  | .set_subset a b => heads a ++ heads b
+  | .Apply (.UConst s T) a => (s, T) :: heads a
+  | .Apply f a => heads f ++ heads a
+  | _ => []
+
 /-! ## Typing -/
 
 /-- The types of the fragment: the integers, the Booleans, the reals, the bit-vectors, the
@@ -1242,6 +1259,30 @@ def funOf (e : Equation) : FunDef :=
 /-- The signatures of the functions that the equations define. -/
 def sigsOf (eqs : List Equation) : List Sig := eqs.map sigOf
 
+/-- The sorts of the parameters of a function of sort `T`. -/
+def argSorts : SmtType → List SmtType
+  | .FunType A R => A :: argSorts R
+  | _ => []
+
+/-- The signature of a function that no equation defines, of the constant `h`: its parameters are
+named after their positions. -/
+def freeSig (h : native_String × SmtType) : Sig where
+  name := idOf h.1
+  params := ((List.range (argSorts h.2).length).zip (argSorts h.2)).map fun p =>
+    ("@p" ++ toString p.1, tyOf p.2)
+  ret := tyOf (resultTy (argSorts h.2).length h.2)
+
+/-- The signatures of the functions that the query and the equations of `r` call and that no
+equation defines. Nothing is known of them: the theorems hold whatever their bodies are, among
+those of their types. -/
+def freeSigs (r : TermSteps) : List Sig :=
+  (((r.query.map __eo_to_smt ++ r.equations.map fun e => __eo_to_smt e.term).flatMap
+      heads).eraseDups.filter fun h => (sigsOf r.equations).all fun s => s.name != idOf h.1).map
+    freeSig
+
+/-- The signatures of the functions of `r`: those that its equations define, then the others. -/
+def sigsR (r : TermSteps) : List Sig := sigsOf r.equations ++ freeSigs r
+
 /-- The datatypes of the certificate: those that its equations, with the sorts of their
 parameters, its base clauses and its query mention. -/
 def dataOf (r : TermSteps) : List Data :=
@@ -1259,6 +1300,30 @@ def programOf (D : List Data) (eqs : List Equation) : Program :=
 
 theorem progData_programOf (D : List Data) (eqs : List Equation) :
     ProgData D (programOf D eqs) := by
+  intro c d i fs h
+  exact ⟨lookup_ctor_of h, lookup_sort_of (findCtor_spec h).1⟩
+
+/-- The functions of the signatures `U`, with the bodies `bodies`. -/
+def freeDefs (U : List Sig) (bodies : List Expr) : List FunDef :=
+  (U.zip bodies).map fun p => .FunDef p.1.name [] (p.1.params.map Prod.fst) p.2
+
+/-- The bodies `bodies` of the functions of `U` are of their types, where the functions have the
+signatures `S`. -/
+def FreeBodies (D : List Data) (S U : List Sig) (bodies : List Expr) : Prop :=
+  bodies.length = U.length ∧ ∀ p ∈ U.zip bodies, HasTy D S p.1.params p.2 p.1.ret
+
+/-- The program of the functions that the equations define, then of the functions `extra`, with
+the datatypes `D`. -/
+def programWith (D : List Data) (eqs : List Equation) (extra : List FunDef) : Program :=
+  .Program (eqs.map funOf ++ extra) (D.flatMap ctorsOfData)
+    (D.map fun d => .Sort d.name [] none none) [] .NoFunctionEquality
+
+theorem programWith_nil (D : List Data) (eqs : List Equation) :
+    programWith D eqs [] = programOf D eqs := by
+  simp [programWith, programOf]
+
+theorem progData_programWith (D : List Data) (eqs : List Equation) (extra : List FunDef) :
+    ProgData D (programWith D eqs extra) := by
   intro c d i fs h
   exact ⟨lookup_ctor_of h, lookup_sort_of (findCtor_spec h).1⟩
 
@@ -1345,7 +1410,7 @@ def baseCheck (D : List Data) (S : List Sig) (Γ : List (Id × Ty)) (base query 
 query read from them, which are of the fragment, with the datatypes that they mention. -/
 def sourceCheck (r : TermSteps) : Bool :=
   let D := dataOf r
-  let S := sigsOf r.equations
+  let S := sigsR r
   let Γ := varsOf S r.query
   dataCheck D && sigCheck D S && r.equations.all (eqCheck D S) && varsCheck D S Γ &&
     baseCheck D S Γ r.base r.query
@@ -1378,39 +1443,108 @@ theorem lookup_funOf : ∀ {eqs : List Equation}, ((sigsOf eqs).map Sig.name).No
       · rename_i heq; exact absurd heq hne
       · exact lookup_funOf hnd.2 e he
 
+theorem lookup_fun_append_left {f : Id} {fd : FunDef} :
+    ∀ {l : List FunDef} (l' : List FunDef), lookup_fun l f = .Ok fd →
+      lookup_fun (l ++ l') f = .Ok fd
+  | [], _, h => by rw [lookup_fun] at h; cases h
+  | (.FunDef g _ _ _) :: l, l', h => by
+    rw [List.cons_append, lookup_fun]
+    rw [lookup_fun] at h
+    split
+    · rename_i hg; rw [dite_eq_left_of_eq_true (eq_true hg)] at h; exact h
+    · rename_i hg; rw [dite_eq_right_of_eq_false (eq_false hg)] at h
+      exact lookup_fun_append_left l' h
+
+/-- The name of the function `fd`. -/
+def fdName : FunDef → Id
+  | .FunDef g _ _ _ => g
+
+theorem lookup_fun_append_right {f : Id} :
+    ∀ {l : List FunDef} (l' : List FunDef), (∀ fd ∈ l, fdName fd ≠ f) →
+      lookup_fun (l ++ l') f = lookup_fun l' f
+  | [], _, _ => rfl
+  | (.FunDef g tps ps b) :: l, l', h => by
+    rw [List.cons_append, lookup_fun]
+    have hg : f ≠ g := fun hfg => h _ (.head _) (by simp [fdName, hfg])
+    rw [dite_eq_right_of_eq_false (eq_false hg)]
+    exact lookup_fun_append_right l' fun fd hfd => h fd (.tail _ hfd)
+
+theorem lookup_freeDefs : ∀ {U : List Sig} {bodies : List Expr}, (U.map Sig.name).Nodup →
+    ∀ p ∈ U.zip bodies, lookup_fun (freeDefs U bodies) p.1.name =
+      .Ok (.FunDef p.1.name [] (p.1.params.map Prod.fst) p.2)
+  | [], _, _, p, hp => by cases hp
+  | _ :: _, [], _, p, hp => by cases hp
+  | s :: U, b :: bodies, hnd, p, hp => by
+    simp only [List.map_cons, List.nodup_cons] at hnd
+    simp only [freeDefs, List.zip_cons_cons, List.map_cons, lookup_fun]
+    rw [List.zip_cons_cons] at hp
+    rcases List.mem_cons.mp hp with rfl | hp
+    · simp
+    · have hne : p.1.name ≠ s.name := fun heq =>
+        hnd.1 (heq ▸ List.mem_map_of_mem (List.of_mem_zip hp).1)
+      rw [dite_eq_right_of_eq_false (eq_false hne)]
+      exact lookup_freeDefs hnd.2 p hp
+
 variable {O : Oracle} {D : List Data}
 
-/-- What the check gives for a function of the equations. -/
-theorem eqCheck_spec (hD : DataOk D) {eqs : List Equation}
-    (hS : sigCheck D (sigsOf eqs) = true) {e : Equation} (he : e ∈ eqs)
-    (h : eqCheck D (sigsOf eqs) e = true) :
-    EqFor (programOf D eqs) D (sigsOf eqs) (sigOf e) e := by
+/-- What the check gives for a function of the equations, in a program that has the functions
+`extra` after them. -/
+theorem eqCheck_spec (hD : DataOk D) {eqs : List Equation} {U : List Sig}
+    {extra : List FunDef} (hS : sigCheck D (sigsOf eqs ++ U) = true) {e : Equation}
+    (he : e ∈ eqs) (h : eqCheck D (sigsOf eqs ++ U) e = true) :
+    EqFor (programWith D eqs extra) D (sigsOf eqs ++ U) (sigOf e) e := by
   simp only [eqCheck, Bool.and_eq_true, decide_eq_true_eq] at h
   obtain ⟨⟨⟨hp, ht⟩, hk⟩, hi⟩ := h
   obtain ⟨k, hk⟩ := Option.isSome_iff_exists.mp hk
-  refine ⟨bodyOf e, lookup_funOf (sigOk_of_check hD hS).nodup e he, ?_, hp, ht⟩
+  have hnd := (sigOk_of_check hD hS).nodup
+  rw [List.map_append] at hnd
+  refine ⟨bodyOf e, lookup_fun_append_left extra (lookup_funOf (List.nodup_append.mp hnd).1 e he),
+    ?_, hp, ht⟩
   rw [kind_spec hk]
   exact infer_sound hD _ _ _ k (hi.trans hk)
 
-theorem progTy_of_check (hD : DataOk D) {eqs : List Equation}
-    (hS : sigCheck D (sigsOf eqs) = true) (h : eqs.all (eqCheck D (sigsOf eqs)) = true) :
-    ProgTy D (sigsOf eqs) (programOf D eqs) := by
-  refine ⟨fun s hs => ?_, progData_programOf D eqs⟩
-  obtain ⟨e, he, rfl⟩ := List.mem_map.mp hs
-  obtain ⟨body, hb, hty, _⟩ := eqCheck_spec hD hS he (List.all_eq_true.mp h e he)
-  exact ⟨body, hb, hty⟩
+theorem progTy_of_check (hD : DataOk D) {eqs : List Equation} {U : List Sig}
+    {bodies : List Expr} (hS : sigCheck D (sigsOf eqs ++ U) = true)
+    (h : eqs.all (eqCheck D (sigsOf eqs ++ U)) = true)
+    (hB : FreeBodies D (sigsOf eqs ++ U) U bodies) :
+    ProgTy D (sigsOf eqs ++ U) (programWith D eqs (freeDefs U bodies)) := by
+  refine ⟨fun s hs => ?_, progData_programWith D eqs _⟩
+  rcases List.mem_append.mp hs with hs | hs
+  · obtain ⟨e, he, rfl⟩ := List.mem_map.mp hs
+    obtain ⟨body, hb, hty, _⟩ := eqCheck_spec hD hS he (List.all_eq_true.mp h e he)
+    exact ⟨body, hb, hty⟩
+  · have hnd := (sigOk_of_check hD hS).nodup
+    rw [List.map_append] at hnd
+    obtain ⟨hnd1, hnd2, hdis⟩ := List.nodup_append.mp hnd
+    obtain ⟨b, hp⟩ := exists_zip_left hB.1.symm hs
+    refine ⟨b, ?_, hB.2 _ hp⟩
+    show lookup_fun (eqs.map funOf ++ freeDefs U bodies) s.name = _
+    rw [lookup_fun_append_right _ (fun fd hfd heq => by
+      obtain ⟨e, he, rfl⟩ := List.mem_map.mp hfd
+      exact hdis _ (List.mem_map_of_mem (List.mem_map_of_mem he)) _
+        (List.mem_map_of_mem hs) heq)]
+    exact lookup_freeDefs hnd2 (s, b) hp
 
-theorem progFrag_of_check (hD : DataOk D) {eqs : List Equation}
-    (hS : sigCheck D (sigsOf eqs) = true) (h : eqs.all (eqCheck D (sigsOf eqs)) = true) :
-    ProgFrag (programOf D eqs) := by
+theorem progFrag_of_check (hD : DataOk D) {eqs : List Equation} {U : List Sig}
+    {bodies : List Expr} (hS : sigCheck D (sigsOf eqs ++ U) = true)
+    (h : eqs.all (eqCheck D (sigsOf eqs ++ U)) = true)
+    (hB : FreeBodies D (sigsOf eqs ++ U) U bodies) :
+    ProgFrag (programWith D eqs (freeDefs U bodies)) := by
   intro g tps ps body hmem
-  obtain ⟨e, he, heq⟩ := List.mem_map.mp hmem
-  obtain ⟨body', hb, hty, _⟩ := eqCheck_spec hD hS he (List.all_eq_true.mp h e he)
-  have hl := lookup_funOf (sigOk_of_check hD hS).nodup e he
-  simp only [HasBody, programOf] at hb
-  rw [hl, heq] at hb
-  cases hb
-  exact hty.frag
+  rcases List.mem_append.mp hmem with hmem | hmem
+  · obtain ⟨e, he, heq⟩ := List.mem_map.mp hmem
+    obtain ⟨body', hb, hty, _⟩ :=
+      eqCheck_spec (extra := []) hD hS he (List.all_eq_true.mp h e he)
+    have hnd := (sigOk_of_check hD hS).nodup
+    rw [List.map_append] at hnd
+    have hl := lookup_funOf (List.nodup_append.mp hnd).1 e he
+    simp only [HasBody, programWith, List.append_nil] at hb
+    rw [hl, heq] at hb
+    cases hb
+    exact hty.frag
+  · obtain ⟨p, hp, heq⟩ := List.mem_map.mp hmem
+    cases heq
+    exact (hB.2 p hp).frag
 
 theorem varsFresh_of_check {S : List Sig} {Γ : List (Id × Ty)} (h : varsCheck D S Γ = true) :
     VarsFresh D S Γ := by
@@ -1516,18 +1650,20 @@ theorem no_solution_of_check (sound : LogosSound) (hO : O.Sound) (hty : LogosTyp
     {certificate : Logos.Sexp} {checked : Checked} {r : TermSteps}
     (hAccept : accept certificate = .ok checked) (hr : termSteps checked = .ok r)
     (hcheck : r.check = true) (hkeeps : r.keeps = true) (hsrc : sourceCheck r = true)
-    (htot : Total O (programOf (dataOf r) r.equations) (dataOf r) (sigsOf r.equations))
+    {bodies : List Expr} (hB : FreeBodies (dataOf r) (sigsR r) (freeSigs r) bodies)
+    (htot : Total O (programWith (dataOf r) r.equations (freeDefs (freeSigs r) bodies)) (dataOf r)
+      (sigsR r))
     (hfacts : FactsHoldExcept (Good r.equations) r.covered (extend r.base r.fresh) r.facts) :
-    ∀ vs, ¬ Solution O (programOf (dataOf r) r.equations) (dataOf r)
-      (varsOf (sigsOf r.equations) r.query) (queryOf r.query) vs := by
+    ∀ vs, ¬ Solution O (programWith (dataOf r) r.equations (freeDefs (freeSigs r) bodies))
+      (dataOf r) (varsOf (sigsR r) r.query) (queryOf r.query) vs := by
   simp only [sourceCheck, Bool.and_eq_true] at hsrc
-  obtain ⟨⟨⟨⟨hD, hS⟩, hE⟩, hΓ⟩, hB⟩ := hsrc
+  obtain ⟨⟨⟨⟨hD, hS⟩, hE⟩, hΓ⟩, hB'⟩ := hsrc
   have hD := dataOk_of_check hD
-  exact no_solution sound hO hty (sigOk_of_check hD hS) (progFrag_of_check hD hS hE)
-    (progTy_of_check hD hS hE) htot hAccept hr hcheck hkeeps
-    (fun e he => ⟨sigOf e, List.mem_map_of_mem he,
-      eqCheck_spec hD hS he (List.all_eq_true.mp hE e he)⟩)
-    (varsFresh_of_check hΓ) (baseFor_of_check hD hB) hfacts
+  exact no_solution sound hO hty (sigOk_of_check hD hS) (progFrag_of_check hD hS hE hB)
+    (progTy_of_check hD hS hE hB) htot hAccept hr hcheck hkeeps
+    (fun e he => ⟨sigOf e, List.mem_append_left _ (List.mem_map_of_mem he),
+      eqCheck_spec (U := freeSigs r) hD hS he (List.all_eq_true.mp hE e he)⟩)
+    (varsFresh_of_check hΓ) (baseFor_of_check hD hB') hfacts
 
 /-- As `no_solution_of_check`, for a certificate of which the check covers every fact
 (`hcovered`): nothing is assumed of its clauses. -/
@@ -1536,10 +1672,12 @@ theorem no_solution_of_covered (sound : LogosSound) (hO : O.Sound) (hty : LogosT
     (hAccept : accept certificate = .ok checked) (hr : termSteps checked = .ok r)
     (hcheck : r.check = true) (hkeeps : r.keeps = true) (hsrc : sourceCheck r = true)
     (hcovered : r.facts.all r.covered = true)
-    (htot : Total O (programOf (dataOf r) r.equations) (dataOf r) (sigsOf r.equations)) :
-    ∀ vs, ¬ Solution O (programOf (dataOf r) r.equations) (dataOf r)
-      (varsOf (sigsOf r.equations) r.query) (queryOf r.query) vs :=
-  no_solution_of_check sound hO hty hAccept hr hcheck hkeeps hsrc htot
+    {bodies : List Expr} (hB : FreeBodies (dataOf r) (sigsR r) (freeSigs r) bodies)
+    (htot : Total O (programWith (dataOf r) r.equations (freeDefs (freeSigs r) bodies)) (dataOf r)
+      (sigsR r)) :
+    ∀ vs, ¬ Solution O (programWith (dataOf r) r.equations (freeDefs (freeSigs r) bodies))
+      (dataOf r) (varsOf (sigsR r) r.query) (queryOf r.query) vs :=
+  no_solution_of_check sound hO hty hAccept hr hcheck hkeeps hsrc hB htot
     (factsHoldExcept_of_all hcovered)
 
 end Inox.Bridge

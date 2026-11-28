@@ -594,16 +594,17 @@ theorem ctorOf_of {cs : List Constructor} {ss : List ADTSort} {c s : Id} {fs : L
   · cases hs
 
 /-- The input is lowered to the program and the query that Logos reads from the certificate:
-each expression of the query is what the constraint at its position is lowered to, the
-functions that they call are lowered to those of the program, and each variable of the query is
-a variable of the input of its type, matched with no other. -/
+the equations define every function that the query calls, each expression of the query is what
+the constraint at its position is lowered to, the functions that they call are lowered to those
+of the program, and each variable of the query is a variable of the input of its type, matched
+with no other. -/
 def linkCheck (R : InputRead) (r : TermSteps) : Bool :=
   let L := Link.of R r
   let S := L.sig R
   let Γ := L.ctx R
   let Γt := varsOf (sigsOf r.equations) r.query
   let Qt := queryOf r.query
-  R.vars.all (fun p => isPrimTy p.2 || isDataTy p.2) &&
+  (freeSigs r).isEmpty && R.vars.all (fun p => isPrimTy p.2 || isDataTy p.2) &&
     Qt.length == R.final.length &&
     (R.final.zip Qt).all (fun (q, q') => lowersCheck S 1000 Γ q q' .any) &&
     L.φ.all (fun (f, _) => match S.funs f with
@@ -849,9 +850,9 @@ theorem no_input_solution {O : Oracle} (sound : LogosSound) (hO : O.Sound)
     ∀ vs, ¬ InputSolution O R vs := by
   intro vs ⟨hvs, bs, hbs, hsol⟩
   unfold linkCheck at hlink
-  simp only [Bool.and_eq_true, List.all_eq_true, beq_iff_eq] at hlink
-  obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨hprim, hlen⟩, hq⟩, hfuns⟩, hvars⟩, hρ⟩, hctors⟩, hκ⟩, hσ⟩, hfk⟩, hdm⟩ :=
-    hlink
+  simp only [Bool.and_eq_true, List.all_eq_true, beq_iff_eq, List.isEmpty_iff] at hlink
+  obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨hfree, hprim⟩, hlen⟩, hq⟩, hfuns⟩, hvars⟩, hρ⟩, hctors⟩, hκ⟩, hσ⟩, hfk⟩,
+    hdm⟩ := hlink
   generalize hL : Link.of R r = L at hq hfuns hvars hρ hctors hκ hσ hfk hdm
   have hF : Funs R.program (programOf (dataOf r) r.equations) (L.sig R) := by
     intro f g ks k hf
@@ -1003,7 +1004,7 @@ theorem no_input_solution {O : Oracle} (sound : LogosSound) (hO : O.Sound)
         · exact (lower_ty hdm hv hT).2
       · cases hT
     · cases hc
-  refine no_solution_of_reached sound hO hty hAccept hr hcheck hsrc hreached _
+  refine no_solution_of_reached_closed sound hO hty hAccept hr hcheck hsrc hreached hfree _
     ⟨hvs', bs', hbs', fun q' hq' => ?_⟩
   obtain ⟨q, hqq⟩ := mem_zip_right hlen hq'
   obtain ⟨q0, hq0, hfq⟩ := List.mem_map.mp (List.of_mem_zip hqq).1

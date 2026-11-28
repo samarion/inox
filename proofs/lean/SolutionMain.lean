@@ -29,7 +29,7 @@ open Inox Inox.Bridge
 /-- Why `sourceCheck r` fails: its first part that does. -/
 def whySource (r : TermSteps) : String :=
   let D := dataOf r
-  let S := sigsOf r.equations
+  let S := sigsR r
   let Γ := varsOf S r.query
   if !dataCheck D then "the datatypes it declares are not of the fragment"
   else if !sigCheck D S then "the signatures of its functions are not of the fragment"
@@ -42,7 +42,7 @@ def whySource (r : TermSteps) : String :=
 /-- Why `reachedCheck r` fails: a fresh symbol that is not apart, or the facts that are not
 covered, by the kinds of their rules, with their clauses if `remaining`. -/
 def whyReached (r : TermSteps) (remaining : Bool) : String :=
-  let S := sigsOf r.equations
+  let S := sigsR r
   if !apart (dataOf r) S (varsOf S r.query) r then
     "a fresh symbol is a function of the program or a variable of the query"
   else
