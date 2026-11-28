@@ -27,6 +27,10 @@ trait FunctionTemplates { self: Templates =>
     val templates: MutableMap[TypedFunDef, FunctionTemplate] = MutableMap.empty
     /** The body of each function that certificates define it with (see [[definitionBody]]). */
     val bodies: MutableMap[Identifier, Expr] = MutableMap.empty
+    /** The steps of the simplification of each of the [[bodies]] (see [[definitionSteps]]), in
+      * the order of the definitions. */
+    val steps: scala.collection.mutable.LinkedHashMap[Identifier, Seq[(String, Expr)]] =
+      scala.collection.mutable.LinkedHashMap.empty
     /** The template of the interpretation of each uninterpreted function (see [[InterpretedTemplate]]). */
     val interpreted: MutableMap[Interpreted, FunctionTemplate] = MutableMap.empty
     /** The rank function of each function, and its encoding (see [[rankClauses]]). */
@@ -59,7 +63,23 @@ trait FunctionTemplates { self: Templates =>
     * type parameters: its simplified body, which its templates unfold at their type arguments
     * when the rules are logged, so that the body of every instance is an instance of it. */
   private[unrolling] def definitionBody(id: Identifier): Expr = functionCaches.bodies.getOrElseUpdate(id,
-    timers.solvers.simplify.run { simplifyFormula(getFunction(id).fullBody) })
+    timers.solvers.simplify.run {
+      val (body, steps) = simplifyFormulaRecorded(getFunction(id).fullBody)
+      functionCaches.steps(id) = steps
+      body
+    })
+
+  /** The steps of the simplification of the body of the function `id` into its [[definition]], in
+    * the solver's terms: the rule of each step and the body after it. */
+  def definitionSteps(id: Identifier): Seq[(String, Encoded)] = {
+    definitionBody(id)
+    val encoder = mkEncoder(Map.empty)
+    functionCaches.steps(id).map((rule, body) => rule -> encoder(body))
+  }
+
+  /** The functions that certificates define (see [[definitionBody]]), in the order of their
+    * definitions. */
+  private[unrolling] def definedFunctions: Seq[Identifier] = functionCaches.steps.keys.toSeq
 
   /** The definition of the function `id` in the solver's terms (see [[definitionBody]]). */
   def definition(id: Identifier): Encoded = mkEncoder(Map.empty)(definitionBody(id))
@@ -253,8 +273,8 @@ trait FunctionTemplates { self: Templates =>
   /** Whether calls of `tfd` can reach an uninterpreted function, in which case ground calls of
     * `tfd` can't be evaluated. */
   private def callsUninterpreted(tfd: TypedFunDef): Boolean = functionCaches.uninterpreted.getOrElseUpdate(tfd.id,
-    (transitiveCallees(tfd.fd) + tfd.fd).exists { fd =>
-      exprOps.exists { case _: UninterpretedCall => true case _ => false } (fd.fullBody)
+    reachableFunctions(tfd.id).exists { fid =>
+      exprOps.exists { case _: UninterpretedCall => true case _ => false } (getFunction(fid).fullBody)
     })
 
   /** Records that the equality symbol of `tpe` is constrained on some terms, by an unfolded equality

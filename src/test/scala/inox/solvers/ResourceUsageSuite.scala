@@ -8,14 +8,23 @@ import org.scalatest.funsuite.AnyFunSuite
 import scala.concurrent.duration._
 
 /** Checks that the solvers that have a resource limit (`--z3-rlimit`, `--cvc5-rlimit`) record what
-  * each of their checks spent (`resourceUsage`), in the units of that limit.
+  * each of their checks spent (`resourceUsage`), in the units of that limit, and the unrollings that
+  * each check needed (`--unroll-bound`).
   */
 class ResourceUsageSuite extends AnyFunSuite {
   import inox.trees.{given, _}
   import inox.trees.dsl.{given, _}
   import SolverResponses._
 
-  private val program = InoxProgram(NoSymbols)
+  // f(n) = if (n <= 0) 0 else f(n - 1)
+  private val fID = FreshIdentifier("f")
+  private val f = mkFunDef(fID)() { _ => (
+    Seq("n" :: IntegerType()), IntegerType(), { case Seq(n) =>
+      if_ (n <= E(BigInt(0))) { E(BigInt(0)) } else_ { FunctionInvocation(fID, Seq(), Seq(n - E(BigInt(1)))) }
+    })
+  }
+
+  private val program = InoxProgram(NoSymbols.withFunctions(Seq(f)))
   private given Symbols = program.symbols
 
   private val Seq(x, y, z) = Seq("x", "y", "z").map(Variable.fresh(_, IntegerType()))
@@ -41,6 +50,11 @@ class ResourceUsageSuite extends AnyFunSuite {
   )
 
   private val million = 1000000L
+
+  private def fOf(e: Expr): Expr = FunctionInvocation(fID, Seq(), Seq(e))
+
+  // Holds by induction only, so unrolling never proves it: f(x) == 0 for every x
+  private val needsInduction = Not(fOf(x) === E(BigInt(0)))
 
   /** Runs `body` on a fresh solver. The timeout keeps a failing test from hanging. */
   private def withSolver[T](solver: String, options: OptionValue[?]*)(body: Solver { val program: InoxProgram } => T): T = {
@@ -77,6 +91,32 @@ class ResourceUsageSuite extends AnyFunSuite {
       }
     }
 
+    test(s"${solver.name}: each check records its unrollings") {
+      requireSolver(solver.name, solver.available())
+      withSolver(solver.name) { s =>
+        s.assertCnstr(x > E(BigInt(0)))
+        assert(s.check(Simple) == Sat)
+        assert(s.resourceUsage.unrollingsPerCheck == Seq(0))
+
+        // f(3) is only defined after a few unrollings
+        s.assertCnstr(x === E(BigInt(3)) && fOf(x) === E(BigInt(0)))
+        assert(s.check(Simple) == Sat)
+        val Seq(none, some) = s.resourceUsage.unrollingsPerCheck: @unchecked
+        assert(none == 0 && some > 0)
+        assert(s.resourceUsage.unrollings.contains(some))
+      }
+    }
+
+    test(s"${solver.name}: a check stopped by the unroll bound performed that many unrollings") {
+      requireSolver(solver.name, solver.available())
+      withSolver(solver.name, unrolling.optUnrollBound(5)) { s =>
+        s.assertCnstr(needsInduction)
+        assert(s.check(Simple) == Unknown)
+        assert(s.unrollBoundReached)
+        assert(s.resourceUsage.unrollingsPerCheck == Seq(5))
+      }
+    }
+
     test(s"${solver.name}: a check stopped by the resource limit spent that limit") {
       requireSolver(solver.name, solver.available())
       withSolver(solver.name, solver.rlimit(1)) { s =>
@@ -99,6 +139,7 @@ class ResourceUsageSuite extends AnyFunSuite {
       assert(first.nonEmpty)
       assert(s.check(Simple) == Sat)
       assert(s.resourceUsage.perCheck.size == 2 * first.size)
+      assert(s.resourceUsage.unrollingsPerCheck == Seq(0, 0))
     }
   }
 

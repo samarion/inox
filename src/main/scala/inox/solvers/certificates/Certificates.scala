@@ -4,6 +4,8 @@ package inox
 package solvers
 package certificates
 
+import scala.annotation.unchecked.uncheckedVariance
+
 /** Has the solvers that can produce proofs do so: the unrolling solver logs the rules that it
   * applies, and cvc5 runs with proofs. Proof production slows the solver down from its first
   * assertion, so that it is set only where proofs will be asked for: Inox sets it for an input
@@ -15,7 +17,17 @@ object Certificates {
     * asserted and the assumptions of the check that answered unsat, in the order of the asserts
     * of the solver's session, the rules that gave the clauses, and the templates that they
     * instantiate, which a rule names by their index. */
-  final case class Refutation[E](clauses: Seq[E], assumptions: Seq[Assumed[E]], templates: Seq[TemplateClauses[E]], rules: Seq[AppliedRule[E]])
+  final case class Refutation[E](clauses: Seq[E], assumptions: Seq[Assumed[E]], templates: Seq[TemplateClauses[E]], rules: Seq[AppliedRule[E]],
+                                 input: Option[Encoding[E]] = None)
+
+  /** What relates the sources of a refutation to the input of the solver: the constraints that
+    * were asserted, as terms of the program before the encoders `encoders`, which `printer`
+    * prints, each with the term that the encoders make of it, and as well, for each function
+    * that the sources define, the call of the function on its parameters and its body after the
+    * encoders: those of the functions defined so far, which printing sources defines more of.
+    * The simplifications of the certificate relate these terms to the sources. */
+  final case class Encoding[E](encoders: Seq[String], printer: Printer[E], constraints: Seq[(E, E)],
+                               definitions: () => Seq[(E, E)] = () => Seq())
 
   /** An assumption of the check, and whether it states that an open conjunction or disjunction
     * is complete, which refutations may assume (see [[unrolling.OpenJunctions]]), or is one of
@@ -55,6 +67,24 @@ object Certificates {
     /** The declarations and definitions that printing the sources and sorts made, in the
       * printer's syntax. */
     def declarations: Seq[SExpr]
+
+    /** Gives the printer the steps of the simplification of the body of each function into the
+      * body that it is defined with (see [[define]]): the rule of each step and the body after
+      * it. */
+    def defineSteps(steps: Identifier => Seq[(String, E)]): Unit = ()
+
+    /** The body of each function that the printer defined, before the solver simplified it (the
+      * body of the function in the solver's program), by the symbol of the function, and the
+      * steps of its simplification (see [[defineSteps]]): terms over the parameters of the
+      * definition, as the definition prints them. Printing them may define more functions, whose
+      * original bodies are printed too. */
+    def originals: Seq[(SExpr, SExpr, Seq[(String, SExpr)])] = Seq()
+    /** The printer of the input of the session: of the terms of `program`, the program before
+      * the encoders that give the session's, as sources, where the symbols of the identifiers
+      * that the session's program keeps are those of this printer, and a variable `v` is the
+      * variable `encode(v)` of the session. Its declarations are those of the input. None when
+      * the printer prints no input, or not that of this program. */
+    def input(program: Program, encode: (E @uncheckedVariance) => (E @uncheckedVariance)): Option[Printer[E]] = None
 
     /** The sort, as the printer of the sources prints it, of the type that a symbol stands for
       * when the symbol of the session that stands for an expression depends on its type: the
@@ -109,11 +139,24 @@ object Certificates {
     * (<symbol of the session> <kind> "<identifier, type or index>" ... [<sort>])
     * ...)
     * (source-definitions
-    * <the declarations of the datatypes and the definitions of the functions of the sources>
+    * <the declarations of the datatypes, with their invariants, and the definitions of the functions of the sources>
     * )
     * (source-symbols
     * (<symbol of the sources> <kind> "<identifier, type or index>" ... [<sort>])
     * ...)
+    * (simplifications
+    * <the original bodies and expressions that the solver simplified, and the steps that rewrite them>
+    * )
+    * (input
+    * (encoders "<name>" ...)
+    * (definitions
+    * <the declarations of the datatypes and the definitions of the functions of the input>
+    * )
+    * (constraint <a constraint of the input> (encoded <what the encoders make of it>))
+    * ...
+    * (symbols
+    * (<symbol of the input> <kind> "<identifier, type or index>" ... [<sort>])
+    * ...))
     * (cpc
     * <the solver's CPC proof that the script has no model>
     * ))
@@ -126,7 +169,7 @@ object Certificates {
     * followed by `(where (<lhs> <rhs>) ...)` when the source names
     * markers or symbols of the template whose meanings it gives (see [[unrolling.TemplateGenerator.markers]]).
     * Every template has a source. Sources are terms of Inox's SMT-LIB 3 syntax (see
-    * [[inox.smtlib3.Printer]]), with the `(assume <condition> <body>)` of Inox's expressions,
+    * [[inox.smtlib3.Printer]]), with the `(assume <condition> <body>)` and `(error <sort> "<message>")` of Inox's expressions,
     * whose symbols are those of the printer and, for their variables, those of the session: the
     * source symbols say what they stand for. A marker of the sources is applied to its arguments
     * and qualified by the sort of the type that it is about, such as
@@ -148,8 +191,9 @@ object Certificates {
     * The proof's assumptions are the script's asserts. Given the templates, a checker checks that
     * each rule is an instance of its kind, that its clauses are the asserts it names, that every
     * assert is named, and the proof (see `proofs/certificates`). */
-  def certificate[E](proof: ScriptProof, refutation: Refutation[E], printer: Printer[E]): Either[String, Certificate] = {
-    val Refutation(clauses, assumptions, templates, rules) = refutation
+  def certificate[E](proof: ScriptProof, refutation: Refutation[E], printer: Printer[E],
+                     functionEquality: String = "none"): Either[String, Certificate] = {
+    val Refutation(clauses, assumptions, templates, rules, encoding) = refutation
     val asserts = proof.asserts.size
     val ruled = rules.flatMap(_.clauses).toSet
     if (asserts != clauses.size + assumptions.size) {
@@ -190,19 +234,110 @@ object Certificates {
         Rule(r.kind, r.arguments.map(a => Argument(a.name, a.terms.map(_ => it.next()))), instance, names(r.clauses))
       }
       val (complete, query) = (clauses.size until asserts).partition(i => assumptions(i - clauses.size).complete)
-      val certificate = Certificate(proof, declarations ++ sessionDeclarations ++ templateAsserts, templateSeq, ruleSeq, Assumptions(query, complete))
+      // what the encoders make of the constraints of the input are sources
+      val encoded = encoding.map { case Encoding(encoders, _, constraints, _) =>
+        Input(encoders, Seq(), printer.printSources(constraints.map(_._2)).terms.map(a => Constraint(a, a)))
+      }
+      // the functions that the sources define, after those of `done`: printing a function may
+      // define more of them, until the sources define them all
+      def definitions(done: Seq[Constraint]): Seq[Constraint] = encoding.fold(done) { e =>
+        Iterator.iterate(done.toVector) { done =>
+          done ++ e.definitions().drop(done.size).map { (call, body) =>
+            val printed = printer.printSources(Seq(call, body)).terms
+            Constraint(printed(0), printed(1))
+          }
+        }.sliding(2).collectFirst { case Seq(a, b) if a.size == b.size => b }.get
+      }
+      // the simplifications of the functions defined so far, and the functions of the input
+      def withDefinitions(c: Certificate): Certificate = {
+        val withSimplifications = c.copy(simplifications = simplified(sourceSeq, printer, functionEquality))
+        withSimplifications.copy(input = c.input.map(in => in.copy(functions = definitions(in.functions))))
+      }
+      val certificate = withDefinitions(Certificate(proof, declarations ++ sessionDeclarations ++ templateAsserts, templateSeq,
+        ruleSeq, Assumptions(query, complete), input = encoded))
       // the sorts of the symbols, which may declare more datatypes in the printer, whose
       // declarations are then those of the sources: of the symbols of the session that depend on a
       // type, and of the variables and uninterpreted functions of the sources and definitions
       def sorts(refs: Seq[Ref]): Map[Ref, SExpr] = refs.distinct.flatMap(ref => printer.sort(ref).map(ref -> _)).toMap
       def ofSources(ref: Ref) = ref.isInstanceOf[Ref.Variable] || ref.isInstanceOf[Ref.Uninterpreted]
       val solverSorts = sorts(certificate.solverSymbols.map(_._2).filterNot(_.isInstanceOf[Ref.Variable]))
-      val sourceSorts = sorts(certificate.copy(sourceDefinitions = printer.declarations).sourceSymbols.map(_._2).filter(ofSources))
-      Right(certificate.copy(sourceDefinitions = printer.declarations, solverSorts = solverSorts, sourceSorts = sourceSorts))
+      def sourceSortsOf(c: Certificate) = sorts(c.copy(sourceDefinitions = printer.declarations).sourceSymbols.map(_._2).filter(ofSources))
+      // printing the sorts may define more functions (such as the equality of a sort), whose
+      // simplifications and symbols may define more, until the printer defines nothing more
+      var withSorts = certificate
+      var defined = -1
+      while (defined != printer.declarations.size) {
+        defined = printer.declarations.size
+        sourceSortsOf(withSorts)
+        withSorts = withDefinitions(withSorts)
+      }
+      val sourceSorts = sourceSortsOf(withSorts)
+      // the input: its constraints are printed by its printer, whose declarations they make
+      val input = encoding.map { case Encoding(encoders, inputPrinter, constraints, _) =>
+        val before = inputPrinter.printSources(constraints.map(_._1)).terms
+        val in = Input(encoders, inputPrinter.declarations, (before zip encoded.get.constraints).map { case (b, c) => c.copy(input = b) },
+          functions = withSorts.input.get.functions)
+        val inputSorts = in.symbols.map(_._2).filter(ofSources).distinct.flatMap(ref => inputPrinter.sort(ref).map(ref -> _)).toMap
+        // the sorts may declare more datatypes
+        in.copy(definitions = inputPrinter.declarations, sorts = inputSorts)
+      }
+      Right(withSorts.copy(sourceDefinitions = printer.declarations, solverSorts = solverSorts, sourceSorts = sourceSorts,
+        input = input))
     } catch {
       case e: Throwable if !e.isInstanceOf[VirtualMachineError] =>
         Left(s"the certificate's terms or sources can't be printed in SMT-LIB (${e.getMessage})")
     }
+  }
+
+  /** The simplifications of a certificate whose templates have the sources `sources`, printed by
+    * `printer`: for each function whose body the solver simplified, and for each expression
+    * source that it simplified, the original and the steps that rewrite it into what the
+    * certificate has, which the simplifiers recorded (see `transformers.TransformationRecorder`):
+    * {{{
+    * (function-equality <none, intensional or extensional>)
+    * (function <symbol> <original body> <steps>)
+    * (expression <template index> <original> (names (<name> <subterm>) ...) <steps>)
+    * }}}
+    * where `<steps>` is `(steps (<rule> <position> <subterm>) ...)`, the rule of each step, the
+    * position of the subterm that it rewrites and what the subterm becomes. The rules are the
+    * names that the simplifiers give to what they do: the checker checks those that it knows,
+    * and reports the others. The body of a function is that of its definition, over the
+    * parameters of the definition, and the simplified expression is that of the source, where
+    * each name is the subterm that it names. The first entry is how the program compares
+    * functions: the checker only checks steps when it doesn't (see `proofs/certificates`). */
+  private def simplified[E](sources: Seq[Source[SExpr]], printer: Printer[E], functionEquality: String): Seq[SExpr] = {
+    // A step is recorded as the whole term after it. The certificate only has what the step
+    // rewrites: the position of the smallest subterm outside of which the term is the one before
+    // the step, and that subterm after the step.
+    def steps(original: SExpr, recorded: Seq[(String, SExpr)]): SExpr = {
+      var current = original
+      SList(Atom("steps") +: recorded.flatMap { (rule, term) =>
+        if (term == current) None else {
+          val position = difference(current, term)
+          val subterm = position.foldLeft(term) { case (SList(items), i) => items(i); case (t, _) => t }
+          current = term
+          Some(SList(Seq(Atom(rule), SList(position.map(i => Atom(i.toString))), subterm)))
+        }
+      })
+    }
+    def difference(a: SExpr, b: SExpr): List[Int] = (a, b) match {
+      case (SList(xs), SList(ys)) if xs.size == ys.size =>
+        xs.indices.filter(i => xs(i) != ys(i)).toList match {
+          case List(i) => i :: difference(xs(i), ys(i))
+          case _ => Nil
+        }
+      case _ => Nil
+    }
+    val functions = printer.originals.collect {
+      case (f, original, recorded) if recorded.exists(_._2 != original) =>
+        SList(Seq(Atom("function"), f, original, steps(original, recorded)))
+    }
+    val expressions = sources.zipWithIndex.collect {
+      case (Source.Expression(expr, _, Some(Source.Original(original, names, recorded))), i) =>
+        val names_ = SList(Atom("names") +: names.map((n, t) => SList(Seq(n, t))))
+        SList(Seq(Atom("expression"), Atom(i.toString), original, names_, steps(original, recorded)))
+    }
+    SList(Seq(Atom("function-equality"), Atom(functionEquality))) +: (functions ++ expressions)
   }
 
   /** The CPC proof that cvc5 answers to `(get-proof)`, or why it isn't one that checkers accept. */

@@ -3,10 +3,27 @@ name := "inox"
 enablePlugins(GitVersioning)
 
 git.useGitDescribe := true
+// sbt-git 3 scopes the public alias to the project; inherited versions need this too.
+ThisBuild / git.useGitDescribe := true
+useJGitOnlyForReads
+
+// Preserve the previous plugin's seven-character descriptions instead of
+// modern JGit's adaptive abbreviation length.
+ThisBuild / git.gitDescribedVersion := {
+  val patterns = (ThisBuild / git.gitDescribePatterns).value
+  val tagToVersion = (ThisBuild / git.gitTagToVersionNumber).value
+  val repo = new org.eclipse.jgit.storage.file.FileRepositoryBuilder()
+    .findGitDir((ThisBuild / baseDirectory).value).build()
+  try {
+    scala.util.Try(Option(new org.eclipse.jgit.api.Git(repo).describe()
+      .setTags(true).setAbbrev(7).setMatch(patterns: _*).call()))
+      .toOption.flatten.map(v => tagToVersion(v).getOrElse(v))
+  } finally repo.close()
+}
 
 organization := "ch.epfl.lara"
 
-val inoxScalaVersion = "3.10.1-RC1-bin-20260903-e1f9361-NIGHTLY"
+val inoxScalaVersion = "3.9.0"
 val laraOrganization = "ch.epfl.lara"
 
 scalaVersion := inoxScalaVersion
@@ -149,12 +166,6 @@ lazy val proofs = project
   .dependsOn(root % "compile->compile;test->test")
   .settings(
     scalaVersion := inoxScalaVersion,
-    scalaOrganization := laraOrganization,
-    excludeDependencies ++= Seq(
-      ExclusionRule("org.scala-lang", "scala-library"),
-      ExclusionRule("org.scala-lang", "scala3-library_3"),
-      ExclusionRule("org.scala-lang", "scala3-compiler_3"),
-    ),
     scalacOptions ++= Seq("-deprecation", "-unchecked", "-feature"),
     libraryDependencies += "org.scalatest" %% "scalatest" % "3.2.9" % "test",
     // Paths are relative to `proofs`. Both evaluators recurse deeply.
@@ -181,14 +192,6 @@ ItTest / testOptions := Seq(Tests.Argument("-oDF"))
 
 lazy val root = (project in file("."))
   .settings(
-    scalaOrganization := laraOrganization,
-    // The libraries of the lab's Scala compiler replace the standard ones, which ScalaZ3 and
-    // Scala-SMTLIB depend on.
-    excludeDependencies ++= Seq(
-      ExclusionRule("org.scala-lang", "scala-library"),
-      ExclusionRule("org.scala-lang", "scala3-library_3"),
-      ExclusionRule("org.scala-lang", "scala3-compiler_3"),
-    ),
     // The serialization macro only runs at compile time, so tests can never cover it.
     coverageExcludedFiles := ".*SerializationMacro.*",
   )
