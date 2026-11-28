@@ -28,7 +28,8 @@ import sys
 import zlib
 
 import resource_usage as ru
-from test_timings import (MAJOR_FACTOR, MAJOR_NEW_SECONDS, MAJOR_SECONDS, MAX_LISTED, MIN_FACTOR,
+from test_timings import (MAJOR_FACTOR, MAJOR_FACTOR_COVERED, MAJOR_NEW_SECONDS, MAJOR_SECONDS,
+                          MAJOR_SECONDS_COVERED, MAX_LISTED, MIN_FACTOR,
                           MIN_SECONDS, MIN_SECONDS_SINGLE, factor, interval, seconds, show)
 
 MARKER = "<!-- inox-coverage -->"
@@ -138,8 +139,12 @@ def timings_table(sections, with_details=True):
 
     out = ["### Test durations", ""]
     if major:
-        out += [f"**Much slower** (by {MAJOR_FACTOR:g}× and {MAJOR_SECONDS:g} s or more, "
-                f"or new and over {MAJOR_NEW_SECONDS:g} s):", ""]
+        covered = any(j.get("covered") for j in jobs)
+        out += [f"**Much slower** (by {MAJOR_FACTOR:g}× and {MAJOR_SECONDS:g} s or more than the slowest "
+                f"earlier build of `main`"
+                + (f", {MAJOR_FACTOR_COVERED:g}× and {MAJOR_SECONDS_COVERED:g} s for tests whose solver work "
+                   f"is compared" if covered else "")
+                + f", or new and over {MAJOR_NEW_SECONDS:g} s):", ""]
         for occ in major[:MAX_LISTED]:
             j, t = max(occ, key=lambda jt: jt[1]["head"])
             others = [short(o) for o, _ in occ if o is not j]

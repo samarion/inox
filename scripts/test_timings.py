@@ -39,8 +39,14 @@ comparison accounts for both:
   at least 50% and 1 s. The comment needs more for a job that no other job
   confirms (see scripts/pr_comment.py).
 - A test that becomes slower by at least 5× and 30 s, or a new test of more
-  than 2 minutes, is a major slowdown: no runner noise accounts for it, so it
-  is reported on its own, ahead of the other changes, without the statistics.
+  than 2 minutes, is a major slowdown. The slowdown is measured from the
+  slowest that the test was in the builds of main, so that a test that
+  main's builds already vary that much for doesn't count, and new tests are
+  those that no build of main ran. A test whose solver work is compared (see
+  scripts/resource_usage.py) needs 10× and 2 minutes, since its work already
+  shows what the solvers spend. No runner noise accounts for a major
+  slowdown, so it is reported on its own, ahead of the other changes,
+  without the statistics.
 """
 
 import json
@@ -71,6 +77,11 @@ MIN_SECONDS_SINGLE = 5.0
 MAJOR_FACTOR = 5.0
 MAJOR_SECONDS = 30.0
 MAJOR_NEW_SECONDS = 120.0
+# The tests whose solver work is compared only need their durations for what
+# the work doesn't show (time spent outside the solvers): a major slowdown of
+# theirs needs this factor and this many seconds.
+MAJOR_FACTOR_COVERED = 10.0
+MAJOR_SECONDS_COVERED = 120.0
 MAX_LISTED = 15
 # The changed tests of each job kept in the comment's data.
 MAX_STORED = 40
@@ -264,11 +275,24 @@ class Comparison:
         def gained(k):
             return head[k] - base[k] * math.exp(speed)
 
+        # The slowest that a test was in the builds of main, relative to the
+        # base: a test that sometimes takes 10 times longer on main, as some
+        # do on loaded runners, isn't slower when it does so again.
+        def slowest(k):
+            return max([0.0] + [r[k] for _, _, r in hist_rel if k in r])
+
         def major(k):
-            return rel[k] > math.log(MAJOR_FACTOR) and gained(k) >= MAJOR_SECONDS
+            fac, secs = ((MAJOR_FACTOR_COVERED, MAJOR_SECONDS_COVERED) if k in covered
+                         else (MAJOR_FACTOR, MAJOR_SECONDS))
+            above = rel[k] - slowest(k)
+            gained_above = head[k] - base[k] * math.exp(speed + slowest(k))
+            return above > math.log(fac) and gained_above >= secs
 
         self.major = sorted((k for k in measured if major(k)), key=lambda k: -gained(k))
-        self.major += sorted((k for k in head.keys() - base.keys() if head[k] >= MAJOR_NEW_SECONDS),
+        # New tests: those that neither the base nor the history ran.
+        ran = set(base).union(*history)
+        self.major += sorted((k for k in head.keys() - ran
+                              if head[k] >= MAJOR_NEW_SECONDS),
                              key=lambda k: -head[k])
         # Major slowdowns are reported apart, and the others by the time they
         # gain or lose: a test that is 3 minutes slower matters more than one
