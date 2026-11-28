@@ -96,14 +96,14 @@ class ResourceUsageSuite extends AnyFunSuite {
       withSolver(solver.name) { s =>
         s.assertCnstr(x > E(BigInt(0)))
         assert(s.check(Simple) == Sat)
-        assert(s.resourceUsage.unrollings == Seq(0))
+        assert(s.resourceUsage.unrollingsPerCheck == Seq(0))
 
         // f(3) is only defined after a few unrollings
         s.assertCnstr(x === E(BigInt(3)) && fOf(x) === E(BigInt(0)))
         assert(s.check(Simple) == Sat)
-        val Seq(none, some) = s.resourceUsage.unrollings: @unchecked
+        val Seq(none, some) = s.resourceUsage.unrollingsPerCheck: @unchecked
         assert(none == 0 && some > 0)
-        assert(s.resourceUsage.maxUnrollings.contains(some))
+        assert(s.resourceUsage.unrollings.contains(some))
       }
     }
 
@@ -113,7 +113,7 @@ class ResourceUsageSuite extends AnyFunSuite {
         s.assertCnstr(needsInduction)
         assert(s.check(Simple) == Unknown)
         assert(s.unrollBoundReached)
-        assert(s.resourceUsage.unrollings == Seq(5))
+        assert(s.resourceUsage.unrollingsPerCheck == Seq(5))
       }
     }
 
@@ -139,7 +139,7 @@ class ResourceUsageSuite extends AnyFunSuite {
       assert(first.nonEmpty)
       assert(s.check(Simple) == Sat)
       assert(s.resourceUsage.perCheck.size == 2 * first.size)
-      assert(s.resourceUsage.unrollings == Seq(0, 0))
+      assert(s.resourceUsage.unrollingsPerCheck == Seq(0, 0))
     }
   }
 
