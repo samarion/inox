@@ -231,12 +231,22 @@ def reachedCovered0 (r : TermSteps) : Term → Bool :=
   fun t => ({ r with equations := [] } : TermSteps).covered t || ok (__eo_to_smt t) ||
     inst.contains t || p.instQuery D S Γ qs Qs t
 
+/-- The disjunctions `(or g c)` of the guarded definitions `(=> g (= c rhs))` of Booleans of the
+steps: the constant is true where the guard is false (`Step.Only`). -/
+def guardedTrue (r : TermSteps) : List SmtTerm :=
+  r.fresh.filterMap fun st => match st with
+    | .defineGuarded c g _ =>
+      if __smtx_typeof (__eo_to_smt c) = .Bool ∧ __smtx_typeof (__eo_to_smt g) = .Bool then
+        some (.or (__eo_to_smt g) (__eo_to_smt c))
+      else none
+    | _ => none
+
 /-- The fact `t` holds where the calls that evaluation goes through have values: as
-`reachedCovered0` decides, or since it follows from the clauses of the steps and the facts that
-`reachedCovered0` accepts. -/
+`reachedCovered0` decides, or since it follows from the clauses of the steps, what the steps
+make true (`guardedTrue`) and the facts that `reachedCovered0` accepts. -/
 def reachedCovered (r : TermSteps) : Term → Bool :=
   let covered := reachedCovered0 r
-  let C := (extend r.base r.fresh ++ r.facts.filter covered).map __eo_to_smt
+  let C := (extend r.base r.fresh ++ r.facts.filter covered).map __eo_to_smt ++ guardedTrue r
   fun t => covered t || entailedBy [] C r.baseLits (__eo_to_smt t)
 
 /-- No fresh symbol is a function of `S` or a variable of `Γ`. -/
@@ -760,13 +770,31 @@ theorem holds_reachedCovered (hO : O.Sound) (hty : LogosTyping) (hS : SigOk D S)
   rcases h with h | h
   · exact holds_reachedCovered0 hO hty hS hP hEnv hbase hDr hSr hE hΓr hqs h hsub M hG hsat
   · have hC : ∀ c ∈ (extend r.base r.fresh ++ r.facts.filter (reachedCovered0 r)).map
-        __eo_to_smt, __smtx_model_eval M c = SmtValue.Boolean true := by
+        __eo_to_smt ++ guardedTrue r, __smtx_model_eval M c = SmtValue.Boolean true := by
       intro c hc
-      obtain ⟨u, hu, rfl⟩ := List.mem_map.mp hc
-      rcases List.mem_append.mp hu with hu | hu
-      · exact hsat.2 u (hsub hu)
-      · exact holds_reachedCovered0 hO hty hS hP hEnv hbase hDr hSr hE hΓr hqs
-          (List.of_mem_filter hu) hsub M hG hsat
+      rcases List.mem_append.mp hc with hc | hc
+      · obtain ⟨u, hu, rfl⟩ := List.mem_map.mp hc
+        rcases List.mem_append.mp hu with hu | hu
+        · exact hsat.2 u (hsub hu)
+        · exact holds_reachedCovered0 hO hty hS hP hEnv hbase hDr hSr hE hΓr hqs
+            (List.of_mem_filter hu) hsub M hG hsat
+      · obtain ⟨st, hst, hc⟩ := List.mem_filterMap.mp hc
+        cases st <;> simp only [reduceCtorEq] at hc
+        rename_i a g _
+        split at hc
+        · next hT =>
+          cases hc
+          have ho := hG.2 _ hst hT.1
+          obtain ⟨bg, hbg⟩ := eval_bool hty hsat.1 hT.2
+          obtain ⟨ba, hba⟩ := eval_bool hty hsat.1 hT.1
+          cases bg
+          · rw [ho hbg] at hba
+            cases hba
+            simp only [__smtx_model_eval, hbg, ho hbg]
+            rfl
+          · simp only [__smtx_model_eval, hbg, hba]
+            cases ba <;> rfl
+        · cases hc
     exact entailedBy_sound hty (eqs := []) (fun e he => by cases he) hsat.1 hC
       (kSound_baseLits hty hsat.1 fun t ht => hsat.2 t (hsub ht)) h
 

@@ -108,6 +108,10 @@ theorem satisfies_setConst {M : SmtModel} {assums : List Term} (hsat : Satisfies
 def Reinterprets (c : Term) (M M' : SmtModel) : Prop :=
   M' = M ∨ ∃ s T v, __eo_to_smt c = SmtTerm.UConst s T ∧ M' = setConst s T M v
 
+theorem eval_eq_bool' (x y : SmtValue) : ∃ b, __smtx_model_eval_eq x y = SmtValue.Boolean b := by
+  unfold __smtx_model_eval_eq
+  split <;> exact ⟨_, rfl⟩
+
 section Rules
 
 variable (hty : LogosTyping) {M : SmtModel} {assums : List Term} (hsat : Satisfies M assums)
@@ -146,6 +150,47 @@ theorem define_guarded_extends {g rhs : Term} (hg : mentions s T (__eo_to_smt g)
   rw [List.mem_singleton.mp ht, eo_to_smt_mkImp, eo_to_smt_mkEq, hc]
   exact (define_guarded_sat (cs := []) hs hsat.1 (by simp) hrhs hv hcan hg
     (eval_bool hty hsat.1 hgb)).2.2
+
+/-- Guarded `Define`, where the constant, when it is a Boolean, is true where the guard is
+false. -/
+theorem define_guarded_extends_only {g rhs : Term} (hg : mentions s T (__eo_to_smt g) = false)
+    (hrhs : mentions s T (__eo_to_smt rhs) = false)
+    (hbool : __smtx_typeof (__eo_to_smt (mkImp g (mkEq c rhs))) = SmtType.Bool) :
+    ∃ M', Satisfies M' (assums ++ [mkImp g (mkEq c rhs)]) ∧ Reinterprets c M M' ∧
+      (__smtx_typeof (__eo_to_smt c) = SmtType.Bool →
+        __smtx_model_eval M' (__eo_to_smt g) = SmtValue.Boolean false →
+        __smtx_model_eval M' (__eo_to_smt c) = SmtValue.Boolean true) := by
+  rw [eo_to_smt_mkImp, eo_to_smt_mkEq, hc] at hbool
+  obtain ⟨hgb, heqb⟩ := typeof_imp_bool hbool
+  obtain ⟨hr, hne⟩ := typeof_eq_bool heqb
+  rw [typeof_uconst hne] at hr hne
+  obtain ⟨b, hb⟩ := eval_bool hty hsat.1 hgb
+  by_cases hfalse : T = SmtType.Bool ∧ b = false
+  · obtain ⟨rfl, rfl⟩ := hfalse
+    refine ⟨_, satisfies_setConst hsat hs hfresh (v := SmtValue.Boolean true)
+      (by simp [__smtx_typeof_value]) (by simp [__smtx_value_canonical]) ?_,
+      Or.inr ⟨_, _, _, hc, rfl⟩, fun _ _ => by rw [hc]; exact eval_setConst_self M _⟩
+    intro t ht
+    rw [List.mem_singleton.mp ht, eo_to_smt_mkImp, eo_to_smt_mkEq, hc]
+    simp only [__smtx_model_eval]
+    rw [eval_setConst hs M _ _ hg, hb]
+    obtain ⟨b', hb'⟩ := eval_eq_bool' (native_model_lookup (setConst s SmtType.Bool M
+      (SmtValue.Boolean true)) s SmtType.Bool)
+      (__smtx_model_eval (setConst s SmtType.Bool M (SmtValue.Boolean true)) (__eo_to_smt rhs))
+    rw [hb']
+    cases b' <;> rfl
+  · obtain ⟨hv, hcan⟩ := hty.1 M _ hsat.1 (by rw [hr]; exact hne)
+    rw [hr] at hv
+    refine ⟨_, satisfies_setConst hsat hs hfresh hv hcan ?_, Or.inr ⟨_, _, _, hc, rfl⟩, ?_⟩
+    · intro t ht
+      rw [List.mem_singleton.mp ht, eo_to_smt_mkImp, eo_to_smt_mkEq, hc]
+      exact (define_guarded_sat (cs := []) hs hsat.1 (by simp) hrhs hv hcan hg ⟨b, hb⟩).2.2
+    · intro hcT hgf
+      rw [hc] at hcT ⊢
+      rw [typeof_uconst (by rw [hcT]; simp)] at hcT
+      rw [eval_setConst hs M _ _ hg, hb] at hgf
+      cases hgf
+      exact absurd ⟨hcT, rfl⟩ hfalse
 
 omit hty in
 /-- The root literal: `c`, for a fresh constant `c`. -/
@@ -238,12 +283,17 @@ def Fresh (st : Step) (assums : List Term) : Prop :=
     ∀ t ∈ st.clauses, __smtx_typeof (__eo_to_smt t) = SmtType.Bool
 
 /-- What the model of a step's clauses also has: the constant of an `Enables` step holds only if
-one of its blockers does, when it has blockers. The clauses `(=> b c)` don't say so, but the model
-that makes `c` the disjunction of the blockers does, and the later steps keep it. -/
+one of its blockers does, when it has blockers, and the constant of a guarded `Define`, when it is
+a Boolean, holds where its guard doesn't. The clauses don't say so, but the model that makes `c`
+the disjunction of the blockers, or true where the guard is false, does, and the later steps keep
+it. -/
 def Only (st : Step) (M : SmtModel) : Prop :=
   match st with
   | enables c bs => bs ≠ [] → __smtx_model_eval M (__eo_to_smt c) = SmtValue.Boolean true →
       ∃ b ∈ bs, __smtx_model_eval M (__eo_to_smt b) = SmtValue.Boolean true
+  | defineGuarded c g _ => __smtx_typeof (__eo_to_smt c) = SmtType.Bool →
+      __smtx_model_eval M (__eo_to_smt g) = SmtValue.Boolean false →
+      __smtx_model_eval M (__eo_to_smt c) = SmtValue.Boolean true
   | _ => True
 
 /-- Reinterpreting a constant that the clauses of a step don't mention keeps `Only` of it. -/
@@ -263,6 +313,13 @@ theorem only_setConst {st : Step} {assums : List Term} (hsub : ∀ t ∈ st.clau
     rw [eval_setConst hs M v _ (hm b0 hb0).2] at hcv
     obtain ⟨b, hb, hbv⟩ := h hne hcv
     exact ⟨b, hb, by rw [eval_setConst hs M v _ (hm b hb).1]; exact hbv⟩
+  case defineGuarded c g rhs =>
+    intro hcT hgf
+    have hm := hfresh _ (hsub (mkImp g (mkEq c rhs)) (by simp [clauses]))
+    simp only [eo_to_smt_mkImp, eo_to_smt_mkEq, mentions, Bool.or_eq_false_iff] at hm
+    rw [eval_setConst hs M v _ hm.1] at hgf
+    rw [eval_setConst hs M v _ hm.2.1]
+    exact h hcT hgf
   all_goals trivial
 
 /-- A model of `assums` extends to a model of `assums` and the clauses of a step that can follow
@@ -276,7 +333,7 @@ theorem extends_reinterprets (hty : LogosTyping) {st : Step} {assums : List Term
   case define c rhs =>
     simpa using define_extends hty hsat hc hs hfresh (hparts rhs (by simp)) (hbool _ (by simp))
   case defineGuarded c g rhs =>
-    simpa using define_guarded_extends hty hsat hc hs hfresh (hparts g (by simp))
+    simpa using define_guarded_extends_only hty hsat hc hs hfresh (hparts g (by simp))
       (hparts rhs (by simp)) (hbool _ (by simp))
   case root c => simpa using root_extends hsat hc hs hfresh (hbool _ (by simp))
   case hypothesis c a f =>
