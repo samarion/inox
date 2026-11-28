@@ -13,9 +13,11 @@ which each update their own sections as soon as they complete:
   timings-coverage   test durations of the Inox coverage workflow
   timings-inox       test durations of Inox CI
   timings-stainless  test durations of the Stainless downstream CI
+  usage-stainless    the solvers' work on each test of the Stainless downstream CI
 
 The test durations are JSON (see `scripts/test_timings.py section`), and the
-comment shows those of all workflows in one table. The JSON is kept in the
+comment shows those of all workflows in one table. The solvers' work is JSON
+too (see `scripts/resource_usage.py section`). The JSON is kept in the
 comment, hidden, for the next updates.
 """
 
@@ -25,13 +27,17 @@ import re
 import sys
 import zlib
 
+import resource_usage as ru
 from test_timings import (MAJOR_FACTOR, MAJOR_NEW_SECONDS, MAJOR_SECONDS, MAX_LISTED, MIN_FACTOR,
                           MIN_SECONDS, MIN_SECONDS_SINGLE, factor, interval, seconds, show)
 
 MARKER = "<!-- inox-coverage -->"
 MARKDOWN = ["stainless-skip", "coverage"]
 TIMINGS = ["timings-coverage", "timings-inox", "timings-stainless"]
-SECTIONS = MARKDOWN + TIMINGS
+USAGE = ["usage-stainless"]
+# The sections whose JSON the comment keeps.
+DATA = TIMINGS + USAGE
+SECTIONS = MARKDOWN + DATA
 
 
 def encode(data):
@@ -48,7 +54,7 @@ def parse(body):
         if m.group(1) in MARKDOWN:
             sections[m.group(1)] = m.group(2).strip("\n")
     for m in re.finditer(r"<!-- data:([\w-]+) ([A-Za-z0-9+/=]+) -->", body):
-        if m.group(1) in TIMINGS:
+        if m.group(1) in DATA:
             try:
                 sections[m.group(1)] = decode(m.group(2))
             except (ValueError, zlib.error):
@@ -197,8 +203,115 @@ def timings_table(sections, with_details=True):
                         "builds of `main` differ from each other.")
     if any(j.get("enough") and not j.get("ci") for j in jobs):
         notes.insert(0, "A total is shown once 2 earlier builds of `main` give its interval.")
+    for j in jobs:
+        if j.get("covered"):
+            notes.append(f"{j['covered']:,} tests of {j['label']} are compared by their solvers' work "
+                         f"instead, and only their major slowdowns by their durations.")
     if notes:
         out.append("<sub>" + " ".join(x.strip("_") for x in notes) + "</sub>")
+    return "\n".join(out).strip("\n")
+
+
+def work(v):
+    """Resources, in the millions of units of the solvers' limits."""
+    m = v / ru.MILLION
+    return f"{m:,.0f} M" if m >= 10 else f"{m:,.1f} M" if m >= 1 else f"{m:.2f} M"
+
+
+def change(metric, b, h):
+    show_value = work if metric == "resources" else (lambda v: f"{v:,}")
+    f = f", ×{(h + 1) / (b + 1):.2f}" if (h + 1) / (b + 1) >= 0.1 else f", ×1/{(b + 1) / (h + 1):,.0f}"
+    return f"{metric} {show_value(b)} → {show_value(h)}{f}"
+
+
+def describe(t):
+    parts = []
+    for m in ru.METRICS:
+        if m in t:
+            parts.append(change(m, *t[m]))
+    if "inconclusive" in t:
+        b, h = t["inconclusive"]
+        parts.append(f"inconclusive VCs {b} → {h}")
+    return f"- {show(t['key'])}: " + "; ".join(parts)
+
+
+def total(job, metric):
+    t = job.get(metric) or {}
+    if not t.get("count"):
+        return "–"
+    b, h = t["base"], t["head"]
+    if b == h:
+        return "same"
+    shown = work if metric == "resources" else (lambda v: f"{v:,}")
+    r = (h + 1) / (b + 1)
+    text = f"×{r:.2f} ({shown(b)} → {shown(h)})"
+    # Totals move a little with the symbol names: only bold what is beyond.
+    return f"<b>{text}</b>" if r >= 1.1 or r <= 1 / 1.1 else text
+
+
+def usage_table(sections, with_details=True):
+    """The work of the solvers on the tests of each job that recorded it: the
+    resources that z3 and cvc5 count and the unrollings of Inox's unrolling
+    solver, which don't depend on the runner, so that any test whose work
+    changes is listed, without the statistics that durations need."""
+    jobs = [sections[s] for s in USAGE if sections.get(s, {}).get("count")]
+    if not jobs:
+        return ""
+    out = ["### Solver work", ""]
+    major = [(j, t) for j in jobs for t in j.get("major", [])]
+    if major:
+        out += [f"**Much more work** (by {ru.MAJOR_RESOURCES_FACTOR:g}× and {work(ru.MAJOR_RESOURCES_MIN)} "
+                f"resources, or {ru.MAJOR_UNROLLINGS_FACTOR:g}× and {ru.MAJOR_UNROLLINGS_MIN} unrollings, "
+                f"or more inconclusive VCs):", ""]
+        for j, t in major[:MAX_LISTED]:
+            out.append(describe(t) + (f" on {j['label']}" if len(jobs) > 1 else ""))
+        if len(major) > MAX_LISTED:
+            out.append(f"- and {len(major) - MAX_LISTED} more")
+        out.append("")
+    out += ["| Job | Resources | Unrollings | Tests |", "|---|---:|---:|---|"]
+    for j in jobs:
+        c = j.get("changed", {})
+        tests = ", ".join(x for x in (
+            f"<b>{len(j['major'])} much more</b>" if j.get("major") else "",
+            f"{c['more']} more" if c.get("more") else "",
+            f"{c['less']} less" if c.get("less") else "") if x)
+        out.append(f"| {j['label']} | {total(j, 'resources')} | {total(j, 'unrollings')} | {tests or '–'} |")
+    out.append("")
+    changed = [(j, t) for j in jobs for t in j.get("tests", [])]
+    lines = []
+    for what, more in (("More work", True), ("Less work", False)):
+        ts = [(j, t) for j, t in changed if ru.more_work(t) == more]
+        if not ts:
+            continue
+        lines += [f"{what}:", ""]
+        for j, t in ts[:MAX_LISTED]:
+            lines.append(describe(t) + (f" on {j['label']}" if len(jobs) > 1 else ""))
+        if len(ts) > MAX_LISTED:
+            lines.append(f"- and {len(ts) - MAX_LISTED} more")
+        lines.append("")
+    explain = (f"Resources are the work that z3 and cvc5 count for their resource limits (in millions "
+               f"of units), over all the checks of a test; unrollings are those of all its VCs. A test is "
+               f"listed when its resources change by {ru.RESOURCES_FACTOR:g}× and {work(ru.RESOURCES_MIN)} "
+               f"or more, its unrollings by {ru.UNROLLINGS_FACTOR:g}× and {ru.UNROLLINGS_MIN} or more, "
+               f"beyond what they were in earlier builds of `main`, or when its inconclusive VCs change. "
+               f"Without {ru.MIN_HISTORY} earlier builds of `main`, the factor of the resources is "
+               f"{ru.NO_HISTORY_MARGIN:g} times larger.")
+    if changed and with_details:
+        out += [f"<details><summary>Tests whose work changed ({len(changed)})</summary>", "", *lines,
+                explain, "", "</details>", ""]
+    elif changed:
+        out += [f"_{len(changed)} tests changed: too many to list here._", ""]
+    notes = []
+    for j in jobs:
+        if j.get("new") or j.get("gone"):
+            notes.append(f"{j['label']}: {j['count']:,} tests compared"
+                         + (f", {j['new']:,} new" if j.get("new") else "")
+                         + (f", {j['gone']:,} no longer recorded" if j.get("gone") else "") + ".")
+        if j.get("history", 0) < ru.MIN_HISTORY:
+            notes.append(f"Fewer than {ru.MIN_HISTORY} earlier builds of `main` show how much the work of "
+                         f"{j['label']}'s tests varies, so the factor of the resources is {ru.NO_HISTORY_MARGIN:g} times larger.")
+    if notes:
+        out.append("<sub>" + " ".join(notes) + "</sub>")
     return "\n".join(out).strip("\n")
 
 
@@ -207,10 +320,13 @@ def render(sections, with_details=True):
     for s in MARKDOWN:
         if s in sections:
             parts.append(f"<!-- begin:{s} -->\n{sections[s]}\n<!-- end:{s} -->")
+    table = usage_table(sections, with_details)
+    if table:
+        parts.append(table)
     table = timings_table(sections, with_details)
     if table:
         parts.append(table)
-    for s in TIMINGS:
+    for s in DATA:
         if s in sections:
             parts.append(f"<!-- data:{s} {encode(sections[s])} -->")
     body = "\n\n".join(parts)
@@ -230,7 +346,7 @@ def main(args):
     content = open(args[2]).read().strip("\n")
     if not content:
         sections.pop(args[1], None)
-    elif args[1] in TIMINGS:
+    elif args[1] in DATA:
         sections[args[1]] = json.loads(content)
     else:
         sections[args[1]] = content

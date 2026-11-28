@@ -7,14 +7,17 @@ usage:
       the duration and outcome of every test case.
   test_timings.py merge <out.json> <in.json>...
       Merges collected timings, for builds that ran their tests in several jobs.
-  test_timings.py section <groups.tsv> [<note.md>]
+  test_timings.py section <groups.tsv> [<note.md> [<covered.txt>]]
       Prints, as JSON, the results for the comment's table of test durations of
       the jobs of a workflow, and the tests that changed significantly. Each
       line of `groups.tsv` describes a job: its label, then, separated by
       tabs, the timings of the pull request build (head), of the build of
       main (base), and of earlier builds of main (history), used to estimate
       how much the durations of two builds vary without any change to the
-      code. The notes of `note.md` are shown below the table.
+      code. The notes of `note.md` are shown below the table. The tests named
+      in `covered.txt`, one per line, are compared by the work of their
+      solvers instead (see scripts/resource_usage.py): only their major
+      slowdowns are reported.
 
 Test durations on CI runners vary a lot between builds of the same code, as a
 whole, because runners differ in speed and load, and test by test. The
@@ -188,7 +191,7 @@ def show(key):
 class Comparison:
     """The comparison of one job's build with the build of main."""
 
-    def __init__(self, label, head_path, base_path, history_paths):
+    def __init__(self, label, head_path, base_path, history_paths, covered=frozenset()):
         # Labels come from artifact names, which pull request builds choose.
         self.label = SAFE.sub("?", label)[:60].replace("<", "‹").replace(">", "›").replace("&", "+")
         head, base = passed(load(head_path)), passed(load(base_path))
@@ -270,7 +273,12 @@ class Comparison:
         # Major slowdowns are reported apart, and the others by the time they
         # gain or lose: a test that is 3 minutes slower matters more than one
         # that is 10 times slower by a few seconds.
-        self.listed = {sign: sorted((k for k in measured if significant(k, sign) and k not in self.major),
+        # The tests whose solver work is compared don't need their durations
+        # compared too, apart from their major slowdowns, which their work may
+        # not show (such as time spent outside the solvers).
+        self.covered = sum(1 for k in measured if k in covered)
+        self.listed = {sign: sorted((k for k in measured if significant(k, sign) and k not in self.major
+                                     and k not in covered),
                                     key=lambda k: -gained(k) * sign)
                        for sign in (1, -1)}
 
@@ -284,6 +292,8 @@ class Comparison:
         if not self.per_test:
             return job
         job.update(history=self.history, speed=self.speed)
+        if self.covered:
+            job["covered"] = self.covered
         job["major"] = [{"key": k, "base": self.base.get(k), "head": self.head[k],
                          "rel": round(self.rel[k], 4) if k in self.rel else None}
                         for k in self.major[:MAX_STORED]]
@@ -296,16 +306,17 @@ class Comparison:
         return job
 
 
-def section(groups_path, note_path=None):
+def section(groups_path, note_path=None, covered_path=None):
     """Prints, as JSON, the results of the jobs of a workflow for the comment's
     table of test durations (see scripts/pr_comment.py, which shows those of
     all workflows together). Each line of `groups_path` holds a job's label,
     then its head, base and history timings, separated by tabs."""
+    covered = frozenset(line.rstrip("\n") for line in open(covered_path)) if covered_path else frozenset()
     comparisons = []
     for line in open(groups_path):
         fields = line.rstrip("\n").split("\t")
         if len(fields) >= 3:
-            comparisons.append(Comparison(fields[0], fields[1], fields[2], fields[3:]))
+            comparisons.append(Comparison(fields[0], fields[1], fields[2], fields[3:], covered))
     notes = []
     if note_path:
         note = open(note_path).read().strip()
@@ -332,7 +343,7 @@ def main(args):
         collect(args[1], args[2:])
     elif len(args) >= 3 and args[0] == "merge":
         merge(args[1], args[2:])
-    elif len(args) in (2, 3) and args[0] == "section":
+    elif len(args) in (2, 3, 4) and args[0] == "section":
         section(*args[1:])
     else:
         sys.exit(__doc__)

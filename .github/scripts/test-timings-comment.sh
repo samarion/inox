@@ -2,7 +2,7 @@
 # Compares the test durations of a pull request build with those of main, for
 # the pull request comment. Called by the coverage comment workflow.
 #
-# usage: test-timings-comment.sh <workflow files> <run id> <artifact prefix> <mode> <label> <out.json>
+# usage: test-timings-comment.sh <workflow files> <run id> <artifact prefix> <mode> <label> <out.json> [<usage.json>]
 #
 # Writes the rows of the comment's table of test durations, as JSON (see
 # scripts/test_timings.py section), labelled with <label>.
@@ -20,13 +20,19 @@
 # of the comma-separated <workflow files> (newest first), so that a job that
 # moves to another workflow keeps its history.
 #
+# With <usage.json>, also writes the comparison of the work that the solvers
+# spent on each test (see scripts/resource_usage.py), from the `usage.json` of
+# the artifacts, for the builds that recorded it. The durations of the tests
+# whose work is compared are then only checked for major slowdowns.
+#
 # Writes nothing when the build has no timings. Prints the pull request
 # number and head commit that the build tested, if any, to stdout.
 set -euo pipefail
 
-workflows=$1 run=$2 prefix=$3 mode=$4 title=$5 out=$6
+workflows=$1 run=$2 prefix=$3 mode=$4 title=$5 out=$6 usage_out=${7:-}
 work=$(mktemp -d)
 : > "$out"
+[ -z "$usage_out" ] || : > "$usage_out"
 
 # The artifacts come from pull request builds: only read plain files.
 read_meta() { [ -f "$1" ] && head -c 200 "$1" | tr -cd '0-9a-f \n' | head -n 1 || true; }
@@ -41,6 +47,11 @@ groups() {  # <dir>
   local dir=$1
   if [ "$mode" = merged ]; then
     python3 scripts/test_timings.py merge "$dir/all.timings" "$dir"/"$prefix"*/timings.json
+    # The solvers' work, when the build recorded it.
+    local usages=("$dir"/"$prefix"*/usage.json)
+    if [ -f "${usages[0]}" ]; then
+      python3 scripts/test_timings.py merge "$dir/all.usage" "${usages[@]}"
+    fi
   else
     for a in "$dir"/"$prefix"*/; do
       a=${a%/}
@@ -119,6 +130,18 @@ base_stainless=$(read_meta "$(ls -d "$work/main-$base_run/$prefix"*/ | head -n 1
 if [ -n "$head_stainless" ] && [ "$head_stainless" != "$base_stainless" ]; then
   note="${note:+$note }_The two builds tested different Stainless commits, so Stainless changes count too._"
 fi
+# The solvers' work, compared with the same builds of main as the durations.
+: > "$work/covered.txt"
+if [ -n "$usage_out" ] && [ "$mode" = merged ] && [ -f "$work/head/all.usage" ] &&
+   [ -f "$work/main-$base_run/all.usage" ]; then
+  history=()
+  for id in "${history_runs[@]}"; do
+    [ -f "$work/main-$id/all.usage" ] && history+=("$work/main-$id/all.usage")
+  done
+  python3 scripts/resource_usage.py section "$title" "$work/head/all.usage" "$work/main-$base_run/all.usage" \
+    "${history[@]}" > "$usage_out"
+  python3 scripts/resource_usage.py covered "$work/head/all.usage" "$work/main-$base_run/all.usage" > "$work/covered.txt"
+fi
 echo "$note" > "$work/note.md"
-python3 scripts/test_timings.py section "$groups" "$work/note.md" > "$out"
+python3 scripts/test_timings.py section "$groups" "$work/note.md" "$work/covered.txt" > "$out"
 echo "$pr $pr_head"
