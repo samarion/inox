@@ -67,12 +67,16 @@ pr_head=$(read_meta "$meta/pr-head-sha")
 base_sha=$(read_meta "$meta/base-sha")
 groups "$work/head"
 
-# Builds of main, newest first: the one at base_sha is the base, and up to 6
-# others are the history.
-base_run= history_runs=()
+# Builds of main, newest first. For each group of timings, the base is the
+# newest of them at base_sha that has the group, and up to 6 others that have
+# it are the history. The workflows can run the same push separately, and
+# each has only its own groups (Inox CI has no Linux JDK 21 timings, which the
+# coverage workflow has), so the base is chosen group by group.
+main_runs=() base_runs=()
 while read -r id; do
   [ "$id" = "$run" ] && continue
   dir="$work/main-$id"
+  [ -e "$dir" ] && continue
   download "$id" "$dir" || continue
   m=$(ls -d "$dir/$prefix"*/ | head -n 1)
   # Only builds of main itself, without pull requests merged into it.
@@ -80,59 +84,67 @@ while read -r id; do
     continue
   fi
   groups "$dir"
-  if [ -z "$base_run" ] && [ "$(read_meta "$m/tested-sha")" = "$base_sha" ]; then
-    base_run=$id
-  else
-    history_runs+=("$id")
-  fi
-  [ -n "$base_run" ] && [ "${#history_runs[@]}" -ge 6 ] && break
+  main_runs+=("$id")
+  [ "$(read_meta "$m/tested-sha")" = "$base_sha" ] && base_runs+=("$id")
+  [ "${#base_runs[@]}" -gt 0 ] && [ "${#main_runs[@]}" -ge 12 ] && break
 done < <(IFS=,; for workflow in $workflows; do
            gh run list --repo "$GITHUB_REPOSITORY" --workflow "$workflow" --branch main --status completed \
              --limit 20 --json databaseId,createdAt --jq '.[] | "\(.createdAt) \(.databaseId)"'
          done | sort -r | head -n 20 | cut -d' ' -f2)
 
-if [ -z "$base_run" ]; then
-  # The latest build of main, compared with the others.
-  if [ "${#history_runs[@]}" -eq 0 ]; then
-    echo "_No build of \`main\` with test durations to compare with yet ($title)._" > "$work/note.md"
-    : > "$work/groups.tsv"
-    python3 scripts/test_timings.py section "$work/groups.tsv" "$work/note.md" > "$out"
-    echo "$pr $pr_head"
-    exit 0
-  fi
-  base_run=${history_runs[0]}
-  history_runs=("${history_runs[@]:1}")
-  note="_Compared with the latest build of \`main\` (none at this build's base), so later changes to \`main\` count too ($title)._"
-else
-  note=
+if [ "${#main_runs[@]}" -eq 0 ]; then
+  echo "_No build of \`main\` with test durations to compare with yet ($title)._" > "$work/note.md"
+  : > "$work/groups.tsv"
+  python3 scripts/test_timings.py section "$work/groups.tsv" "$work/note.md" > "$out"
+  echo "$pr $pr_head"
+  exit 0
 fi
 
+note=
+base_run= history_runs=()   # those of the last group, for the merged mode
 groups="$work/groups.tsv"
 : > "$groups"
 for head in "$work/head"/*.timings; do
   name=$(basename "$head" .timings)
-  base="$work/main-$base_run/$name.timings"
-  [ -f "$base" ] || continue
+  group_base=
+  for id in "${base_runs[@]}"; do
+    [ -f "$work/main-$id/$name.timings" ] && { group_base=$id; break; }
+  done
+  if [ -z "$group_base" ]; then
+    # The latest build of main that has the group, compared with the others.
+    for id in "${main_runs[@]}"; do
+      [ -f "$work/main-$id/$name.timings" ] && { group_base=$id; break; }
+    done
+    [ -n "$group_base" ] || continue
+    note="_Compared with the latest build of \`main\` (none at this build's base), so later changes to \`main\` count too ($title)._"
+  fi
+  group_history=()
+  for id in "${main_runs[@]}"; do
+    [ "$id" != "$group_base" ] && [ -f "$work/main-$id/$name.timings" ] && group_history+=("$id")
+  done
+  group_history=("${group_history[@]:0:6}")
+  base_run=$group_base history_runs=("${group_history[@]}")
   if [ "$mode" = merged ]; then
     label=$title
   else
     label="$title $(echo "${name#"$prefix"}" | sed 's/-jdk/ /')"
   fi
-  line="$label"$'\t'"$head"$'\t'"$base"
-  for id in "${history_runs[@]}"; do
-    [ -f "$work/main-$id/$name.timings" ] && line+=$'\t'"$work/main-$id/$name.timings"
+  line="$label"$'\t'"$head"$'\t'"$work/main-$group_base/$name.timings"
+  for id in "${group_history[@]}"; do
+    line+=$'\t'"$work/main-$id/$name.timings"
   done
   echo "$line" >> "$groups"
 done
 # The Stainless downstream CI tests the Stainless main of the day.
 head_stainless=$(read_meta "$meta/stainless-sha")
-base_stainless=$(read_meta "$(ls -d "$work/main-$base_run/$prefix"*/ | head -n 1)/stainless-sha")
+base_stainless=
+[ -n "$base_run" ] && base_stainless=$(read_meta "$(ls -d "$work/main-$base_run/$prefix"*/ | head -n 1)/stainless-sha")
 if [ -n "$head_stainless" ] && [ "$head_stainless" != "$base_stainless" ]; then
   note="${note:+$note }_The two builds tested different Stainless commits, so Stainless changes count too._"
 fi
 # The solvers' work, compared with the same builds of main as the durations.
 : > "$work/covered.txt"
-if [ -n "$usage_out" ] && [ "$mode" = merged ] && [ -f "$work/head/all.usage" ] &&
+if [ -n "$usage_out" ] && [ "$mode" = merged ] && [ -n "$base_run" ] && [ -f "$work/head/all.usage" ] &&
    [ -f "$work/main-$base_run/all.usage" ]; then
   history=()
   for id in "${history_runs[@]}"; do
