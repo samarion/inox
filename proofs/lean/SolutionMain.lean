@@ -10,8 +10,8 @@ import Inox.Joined
 the base clauses are the translations of the program and of the query read from them
 (`sourceCheck`), and every fact is covered where the calls that evaluation goes through have
 values (`reachedCheck`). These are the hypotheses of the theorem that are computed, so for such
-a certificate the query that it reads has no solution in the program that it reads, given the
-soundness of Logos. Otherwise it says which check fails, and with `--remaining` it prints the
+a certificate the query that it reads has no solution in the program that it reads, whatever the
+bodies of the functions that no equation defines, given the soundness of Logos. Otherwise it says which check fails, and with `--remaining` it prints the
 facts that are not covered. It exits with 1 unless the theorem applies to every certificate.
 
 With `--input` it also says, for each certificate, how many constraints of its input the theorem

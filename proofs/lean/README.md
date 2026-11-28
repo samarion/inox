@@ -954,7 +954,16 @@ only. It does, and `reachedCheck` decides it:
   term reaches the calls of its operands that are evaluated: those of a branch
   of an `ite` whose condition is known, and those that both branches make;
 - the other facts hold without the equations (`TermSteps.covered` with none),
-  and no fresh symbol is a function of the program or a variable of the query
+  or are instances of a universal quantifier that the query assumes
+  (`Paths.instQuery`, by the theorem of Logos on its rule `instantiate`, in
+  [`Inox/Instantiate.lean`](Inox/Instantiate.lean)), or follow from the clauses
+  of the steps and the facts accepted otherwise (`entailedBy` of
+  [`Inox/Entailed.lean`](Inox/Entailed.lean)): under each value of a Boolean
+  that is the premise of an implication, the literals that the clauses make
+  known make the fact true or a clause false. A guarded definition of a
+  Boolean is true where its guard is false (`Step.Only`), which the facts may
+  use too (`guardedTrue`);
+- no fresh symbol is a function of the program or a variable of the query
   (`apart`).
 
 Then a guard that holds implies that its call gives a value, by induction along
@@ -967,10 +976,22 @@ theorem no_solution_of_reached {O : Oracle} (sound : LogosSound) (hO : O.Sound)
     (hty : LogosTyping) {certificate : Logos.Sexp} {checked : Checked}
     {r : TermSteps} (hAccept : accept certificate = .ok checked)
     (hr : termSteps checked = .ok r) (hcheck : r.check = true)
-    (hsrc : sourceCheck r = true) (hreached : reachedCheck r = true) :
-    ∀ vs, ¬ Solution O (programOf (dataOf r) r.equations) (dataOf r)
-      (varsOf (sigsOf r.equations) r.query) (queryOf r.query) vs
+    (hsrc : sourceCheck r = true) (hreached : reachedCheck r = true)
+    {bodies : List Expr}
+    (hbodies : FreeBodies (dataOf r) (sigsR r) (freeSigs r) bodies) :
+    ∀ vs, ¬ Solution O
+      (programWith (dataOf r) r.equations (freeDefs (freeSigs r) bodies))
+      (dataOf r) (varsOf (sigsR r) r.query) (queryOf r.query) vs
 ```
+
+The functions that the query and the equations call and that no equation
+defines (`freeSigs`) are parameters: the query has no solution whatever their
+bodies, of their types. `no_solution_of_reached_closed` is the theorem when
+there is none, in the program of the equations. The query may assume universal
+quantifiers over integers, Booleans and datatypes whose fields are such values
+([`Inox/Quant.lean`](Inox/Quant.lean)), which its translation leaves out:
+each value of Logos of such a datatype is that of a value of Inox
+(`value_of_sort_k`), so the quantifier of Logos is true where that of Inox is.
 
 Nothing is assumed of the calls of the program, and `r.keeps` is not needed.
 The checks hold of the two certificates above, and of the certificate of a
@@ -995,13 +1016,11 @@ cd proofs/lean/verification && lake build inox-solution
 ```
 
 The first build compiles the modules that the executable imports, those of
-Mathlib too, which takes a quarter of an hour. Of the 36 certificates of the
-corpus, the checks hold of 7: the 3 of `error-is-infeasible.smt3`, one of
-`empty-function-codomains.smt3`, that of `size-negative.smt3`, whose function
-is over lists, and those of `bitvector-division-by-zero-is-total.smt3` and
-`real-division-by-zero-is-infeasible.smt3`. 25 are outside the fragment, 2
-have facts that are not covered, and 2 have a proof with a constant array,
-which Logos doesn't read.
+Mathlib too, which takes a quarter of an hour. Of the 72 certificates of the
+corpus, the checks hold of 40. Most of the others have first-class functions,
+which the fragment doesn't have: free variables of function types, lambdas,
+and the functions that Inox lifts out of them, which have no equation. 2 have
+a proof with a constant array, which Logos doesn't read.
 
 **Assumptions.** A body with assumptions is read with them: Logos doesn't read
 `(assume c b)` in a term, so the equation that the clauses instantiate is
