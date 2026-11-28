@@ -81,7 +81,9 @@ def back : SmtTerm → Expr
   | .Boolean b => .BooleanLiteral b
   | .ite (.xor c (.Boolean false)) a _ => .Assume (back c) (back a)
   | .ite c a b => .IfExpr (back c) (back a) (back b)
+  | .not (.exists s T (.not b)) => .Forall [.Param (idOf s) (tyOf T)] (back b)
   | .not a => .Not (back a)
+  | .Var s _ => .Variable (idOf s)
   | .imp a b => .Implies (back a) (back b)
   | .eq a b => .Equals (back a) (back b)
   | .plus a b => .Plus (back a) (back b)
@@ -179,7 +181,7 @@ def consts : SmtTerm → List (native_String × SmtType)
   | .UConst s T => [(s, T)]
   | .ite c a b => consts c ++ consts a ++ consts b
   | .not a | .uneg a | .bvneg a | .bvnot a | .extract _ _ a | .zero_extend _ a
-  | .sign_extend _ a | .set_singleton a => consts a
+  | .sign_extend _ a | .set_singleton a | .exists _ _ a => consts a
   | .xor a b => consts a ++ consts b
   | .imp a b | .eq a b | .plus a b | .neg a b | .mult a b | .div a b | .mod a b | .lt a b
   | .gt a b | .leq a b | .geq a b | .and a b | .or a b | .bvadd a b | .bvsub a b | .bvmul a b
@@ -1289,11 +1291,53 @@ def eqCheck (D : List Data) (S : List Sig) (e : Equation) : Bool :=
 def varsCheck (D : List Data) (S : List Sig) (Γ : List (Id × Ty)) : Bool :=
   Γ.all fun p => (kind D p.2).isSome && S.all fun s => p.1 != s.name
 
-/-- Each expression of the query is a Boolean, and each base clause is the translation of one,
+/-- Whether `T` is the type of a parameter of a quantifier: an integer or a Boolean. -/
+def bindsTy : Ty → Bool
+  | .IntegerType | .BooleanType => true
+  | _ => false
+
+theorem bindsTy_spec {T : Ty} (h : bindsTy T = true) : T = .IntegerType ∨ T = .BooleanType := by
+  cases T <;> simp_all [bindsTy]
+
+/-- Whether `p` is an assumption of the query (`Formula`): a Boolean, or the universal
+quantifier of one parameter, an integer or a Boolean named after no function, over a Boolean. -/
+def formulaCheck (D : List Data) (S : List Sig) (Γ : List (Id × Ty)) : Expr → Bool
+  | .Forall [.Param x T] b =>
+    bindsTy T && S.all (fun s => x != s.name) &&
+      decide (Unreserved (nm x)) && decide (infer D S ((x, T) :: Γ) b = some .bool)
+  | p => decide (infer D S Γ p = some .bool)
+
+mutual
+/-- The expression of the fragment of the expression `e` of the query (`QTy`), if it is one. -/
+def inferQ (D : List Data) (S : List Sig) (Γ : List (Id × Ty)) (e : Expr) : Option Expr :=
+  if infer D S Γ e = some .bool then some e else
+  match e with
+  | .Assume p b => if formulaCheck D S Γ p then inferQ D S Γ b else none
+  | .IfExpr c a b =>
+    if infer D S Γ c = some .bool then
+      match inferQ D S Γ a, inferQ D S Γ b with
+      | some a', some b' => some (.IfExpr c a' b')
+      | _, _ => none
+    else none
+  | .And es => (inferQs D S Γ es).map .And
+  | .Or es => (inferQs D S Γ es).map .Or
+  | .Not a => (inferQ D S Γ a).map .Not
+  | _ => none
+
+/-- The expressions of the fragment of the expressions `es` of the query, if they are some. -/
+def inferQs (D : List Data) (S : List Sig) (Γ : List (Id × Ty)) : List Expr → Option (List Expr)
+  | [] => some []
+  | e :: es =>
+    match inferQ D S Γ e, inferQs D S Γ es with
+    | some e', some es' => some (e' :: es')
+    | _, _ => none
+end
+
+/-- Each expression of the query is of `QTy`, and each base clause is the translation of one,
 which leaves its assumptions out. -/
 def baseCheck (D : List Data) (S : List Sig) (Γ : List (Id × Ty)) (base query : List Term) :
     Bool :=
-  (query.all fun s => decide (infer D S Γ (back (__eo_to_smt s)) = some .bool)) &&
+  (query.all fun s => (inferQ D S Γ (back (__eo_to_smt s))).isSome) &&
     base.all fun t => query.any fun s =>
       decide (__eo_to_smt t = tr D S Γ (back (__eo_to_smt s)))
 
@@ -1373,6 +1417,77 @@ theorem varsFresh_of_check {S : List Sig} {Γ : List (Id × Ty)} (h : varsCheck 
   simp only [varsCheck, Bool.and_eq_true, List.all_eq_true, bne_iff_ne] at h
   exact ⟨fun p hp => fragTy_of_kind (h p hp).1, fun p hp s hs => (h p hp).2 s hs⟩
 
+theorem formula_sound (hD : DataOk D) (S : List Sig) (Γ : List (Id × Ty)) (p : Expr)
+    (h : formulaCheck D S Γ p = true) : Formula D S Γ p := by
+  unfold formulaCheck at h
+  split at h
+  · rename_i x T b
+    simp only [Bool.and_eq_true, decide_eq_true_eq, List.all_eq_true, bne_iff_ne] at h
+    obtain ⟨⟨⟨hT, hx⟩, hu⟩, hb⟩ := h
+    exact .forall_ ⟨bindsTy_spec hT, fun s hs => hx s hs, hu⟩ (infer_sound hD S _ b .bool hb)
+  · exact .leaf (infer_sound hD S Γ p .bool (by simpa using h))
+
+mutual
+theorem inferQ_sound (hD : DataOk D) (S : List Sig) (Γ : List (Id × Ty)) (e e' : Expr)
+    (h : inferQ D S Γ e = some e') : QTy D S Γ e e' := by
+  rw [inferQ.eq_def] at h
+  split at h
+  · rename_i hi
+    cases h
+    exact .leaf (infer_sound hD S Γ e .bool hi)
+  · split at h
+    · rename_i p b _
+      split at h
+      · rename_i hp
+        exact .assume (formula_sound hD S Γ p hp) (inferQ_sound hD S Γ b e' h)
+      · cases h
+    · rename_i c a b _
+      split at h
+      · rename_i hc
+        split at h
+        · rename_i a' b' ha hb
+          cases h
+          exact .ite (infer_sound hD S Γ c .bool hc) (inferQ_sound hD S Γ a a' ha)
+            (inferQ_sound hD S Γ b b' hb)
+        · cases h
+      · cases h
+    · rename_i es _
+      obtain ⟨es', hes, rfl⟩ := Option.map_eq_some_iff.mp h
+      obtain ⟨hl, hall⟩ := inferQs_sound hD S Γ es es' hes
+      exact .and hl hall
+    · rename_i es _
+      obtain ⟨es', hes, rfl⟩ := Option.map_eq_some_iff.mp h
+      obtain ⟨hl, hall⟩ := inferQs_sound hD S Γ es es' hes
+      exact .or hl hall
+    · rename_i a _
+      obtain ⟨a', ha, rfl⟩ := Option.map_eq_some_iff.mp h
+      exact .not (inferQ_sound hD S Γ a a' ha)
+    · cases h
+termination_by sizeOf e
+
+theorem inferQs_sound (hD : DataOk D) (S : List Sig) (Γ : List (Id × Ty)) (es es' : List Expr)
+    (h : inferQs D S Γ es = some es') :
+    es.length = es'.length ∧ ∀ q ∈ es.zip es', QTy D S Γ q.1 q.2 := by
+  match es, es', h with
+  | [], es', h =>
+    rw [inferQs] at h
+    cases h
+    exact ⟨rfl, fun q hq => by cases hq⟩
+  | e :: es, es', h =>
+    rw [inferQs] at h
+    split at h
+    · rename_i e' es'' he hes
+      cases h
+      obtain ⟨hl, hall⟩ := inferQs_sound hD S Γ es es'' hes
+      refine ⟨by simp [hl], fun q hq => ?_⟩
+      rw [List.zip_cons_cons] at hq
+      rcases List.mem_cons.mp hq with hq | hq
+      · rw [hq]; exact inferQ_sound hD S Γ e e' he
+      · exact hall q hq
+    · cases h
+termination_by sizeOf es
+end
+
 theorem baseFor_of_check (hD : DataOk D) {S : List Sig} {Γ : List (Id × Ty)}
     {base query : List Term} (h : baseCheck D S Γ base query = true) :
     BaseFor D S Γ (queryOf query) base := by
@@ -1380,16 +1495,18 @@ theorem baseFor_of_check (hD : DataOk D) {S : List Sig} {Γ : List (Id × Ty)}
     List.any_eq_true] at h
   intro t ht
   obtain ⟨s, hs, hts⟩ := h.2 t ht
-  exact ⟨_, List.mem_map_of_mem hs, infer_sound hD S Γ _ .bool (h.1 s hs), hts⟩
+  obtain ⟨q', hq'⟩ := Option.isSome_iff_exists.mp (h.1 s hs)
+  exact ⟨_, List.mem_map_of_mem hs, q', inferQ_sound hD S Γ _ _ hq', hts⟩
 
-/-- The expressions of the query are Booleans. -/
+/-- The expressions of the query are of `QTy`. -/
 theorem query_ty_of_check (hD : DataOk D) {S : List Sig} {Γ : List (Id × Ty)}
     {base query : List Term} (h : baseCheck D S Γ base query = true) :
-    ∀ q ∈ queryOf query, HasTy D S Γ q .BooleanType := by
-  simp only [baseCheck, Bool.and_eq_true, decide_eq_true_eq, List.all_eq_true] at h
+    ∀ q ∈ queryOf query, ∃ q', QTy D S Γ q q' := by
+  simp only [baseCheck, Bool.and_eq_true, List.all_eq_true] at h
   intro q hq
   obtain ⟨s, hs, rfl⟩ := List.mem_map.mp hq
-  exact infer_sound hD S Γ _ .bool (h.1 s hs)
+  obtain ⟨q', hq'⟩ := Option.isSome_iff_exists.mp (h.1 s hs)
+  exact ⟨q', inferQ_sound hD S Γ _ _ hq'⟩
 
 /-- The query of an accepted certificate has no solution in the program of the certificate, when
 the check of this file holds (`hsrc`) and every call of the program gives a value (`htot`), given

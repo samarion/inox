@@ -513,9 +513,26 @@ theorem lit_typeof (k : Int) : __smtx_typeof (lit k) = .Int := by
 theorem lit_eval (M : SmtModel) (k : Int) : __smtx_model_eval M (lit k) = .Numeral k := by
   unfold lit; split <;> simp [__smtx_model_eval, __smtx_model_eval_uneg, native_zneg]
 
+/-- The variables and types of the parameters of a quantifier. -/
+def paramPairs : List Param → List (Id × Ty)
+  | [] => []
+  | .Param x T :: ps => (x, T) :: paramPairs ps
+
+/-- The term `t` under an existential quantifier of each of the variables `ks`, the first
+outermost. -/
+def exs : List (native_String × SmtType) → SmtTerm → SmtTerm
+  | [], t => t
+  | (s, T) :: ks, t => .exists s T (exs ks t)
+
+/-- The substitution of the bound variables `ks` for the constants of the same names and sorts. -/
+def boundSubst (ks : List (native_String × SmtType)) : List (native_String × SmtType × SmtTerm) :=
+  ks.map fun k => (k.1, k.2, .Var k.1 k.2)
+
 mutual
 /-- The term of the expression `e` of the fragment: a variable is the constant named after it, of
-the sort of its type, and a call the application of the constant named after the function. -/
+the sort of its type, a call the application of the constant named after the function, and a
+universal quantifier the negation of the existential quantifier of the negation of its body, whose
+constants of its parameters are the bound variables. -/
 def tr (D : List Data) (S : List Sig) (Γ : List (Id × Ty)) : Expr → SmtTerm
   | .Variable x =>
     match Γ.lookup x with
@@ -614,6 +631,9 @@ def tr (D : List Data) (S : List Sig) (Γ : List (Id × Ty)) : Expr → SmtTerm
   | .SetUnion s u => .set_union (tr D S Γ s) (tr D S Γ u)
   | .SetIntersection s u => .set_inter (tr D S Γ s) (tr D S Γ u)
   | .SetDifference s u => .set_minus (tr D S Γ s) (tr D S Γ u)
+  | .Forall ps b =>
+    .not (exs (ptys D (paramPairs ps)) (.not (substSmt (boundSubst (ptys D (paramPairs ps)))
+      (tr D S (paramPairs ps ++ Γ) b))))
   | _ => .Boolean false
 
 def trs (D : List Data) (S : List Sig) (Γ : List (Id × Ty)) : List Expr → List SmtTerm

@@ -1,5 +1,6 @@
 /- Copyright 2009-2026 EPFL, Lausanne -/
 import Inox.Reach
+import Inox.Quant
 import Inox.Source
 
 /-!
@@ -256,71 +257,6 @@ theorem mem_bindParams : ∀ {ps : List (native_String × SmtType)} {us : List S
     · exact .head _
     · exact .tail _ (mem_bindParams h)
 
-theorem noBinder_andT : ∀ ts : List SmtTerm, (∀ t ∈ ts, noBinder t = true) →
-    noBinder (andT ts) = true
-  | [], _ => rfl
-  | t :: ts, h => by
-    simp only [andT, noBinder, Bool.and_eq_true]
-    exact ⟨h t (.head _), noBinder_andT ts fun u hu => h u (.tail _ hu)⟩
-
-theorem noBinder_orT : ∀ ts : List SmtTerm, (∀ t ∈ ts, noBinder t = true) →
-    noBinder (orT ts) = true
-  | [], _ => rfl
-  | t :: ts, h => by
-    simp only [orT, noBinder, Bool.and_eq_true]
-    exact ⟨h t (.head _), noBinder_orT ts fun u hu => h u (.tail _ hu)⟩
-
-theorem noBinder_spine : ∀ (us : List SmtTerm) (f : SmtTerm), noBinder f = true →
-    (∀ u ∈ us, noBinder u = true) → noBinder (spine f us) = true
-  | [], _, hf, _ => hf
-  | a :: as, f, hf, h =>
-    noBinder_spine as (.Apply f a) (by simp [noBinder, hf, h a (.head _)])
-      fun u hu => h u (.tail _ hu)
-
-theorem all_of_zip {α β : Type} {Q : α → Prop} : ∀ {l : List α} {m : List β},
-    l.length = m.length → (∀ p ∈ l.zip m, Q p.1) → ∀ a ∈ l, Q a
-  | [], _, _, _, _, ha => by cases ha
-  | _ :: _, [], hl, _, _, _ => by simp at hl
-  | a :: l, b :: m, hl, h, x, hx => by
-    rcases List.mem_cons.mp hx with rfl | hx
-    · exact h (x, b) (.head _)
-    · exact all_of_zip (by simpa using hl) (fun p hp => h p (.tail _ hp)) x hx
-
-/-- The term of an expression of the fragment has no binder. -/
-theorem noBinder_tr {S : List Sig} {Γ : List (Id × Ty)} {e : Expr} {T : Ty}
-    (h : HasTy D S Γ e T) : noBinder (tr D S Γ e) = true := by
-  induction h with
-  | var hx hT => simp [tr, hx, noBinder]
-  | int i => rfl
-  | bool b => rfl
-  | @and es _ ih =>
-    simp only [tr, trs_eq]
-    exact noBinder_andT _ fun t ht => by
-      obtain ⟨e, he, rfl⟩ := List.mem_map.mp ht
-      exact ih e he
-  | @or es _ ih =>
-    simp only [tr, trs_eq]
-    exact noBinder_orT _ fun t ht => by
-      obtain ⟨e, he, rfl⟩ := List.mem_map.mp ht
-      exact ih e he
-  | @invoke s args hs hl _ ih =>
-    simp only [tr, hs, trs_eq]
-    refine noBinder_spine _ _ rfl fun t ht => ?_
-    obtain ⟨e, he, rfl⟩ := List.mem_map.mp ht
-    exact all_of_zip (Q := fun a => noBinder (tr D S Γ a) = true) (by simpa using hl) ih e he
-  | assume _ _ _ ihb => simpa [tr] using ihb
-  | @adt c d i fs args hc hl _ ih =>
-    simp only [tr, hc, trs_eq]
-    refine noBinder_spine _ _ rfl fun t ht => ?_
-    obtain ⟨e, he, rfl⟩ := List.mem_map.mp ht
-    exact all_of_zip (Q := fun a => noBinder (tr D S Γ a) = true) (by simpa using hl) ih e he
-  | isCons hc _ ih => simpa [tr, hc, noBinder] using ih
-  | sel hx _ ih => simpa [tr, hx, noBinder] using ih
-  | frac _ => simp only [tr, lit, noBinder]; split <;> split <;> simp [noBinder]
-  | setEmpty _ => simp [tr, trs, noBinder]
-  | setOne _ ih => simpa [tr, trs, noBinder] using ih
-  | _ => simp only [tr]; (try split) <;> (try split) <;> simp_all [noBinder]
-
 /-! ## The literals of definitions -/
 
 theorem kSound_closeK {M : SmtModel} {defs : List (SmtTerm × SmtTerm)}
@@ -569,7 +505,7 @@ theorem assumed_sound (hO : O.Sound) (hty : LogosTyping) (hS : SigOk D S) (hP : 
 theorem assumedQuery_sound (hO : O.Sound) (hty : LogosTyping) (hS : SigOk D S) (hP : ProgTy D S P)
     {Γ : List (Id × Ty)} {env : Env} (hEnv : EnvTy D Γ env) {p : Paths} {M : SmtModel}
     (hM : Ctx O P D S Γ env p M) {qs : List Expr}
-    (hqs : ∀ q ∈ qs, HasTy D S Γ q .BooleanType ∧ ∃ n v, eval O P n env q = .Ok v)
+    (hqs : ∀ q ∈ qs, (∃ q', QTy D S Γ q q') ∧ ∃ n v, eval O P n env q = .Ok v)
     {φ : SmtTerm} (h : p.assumedQuery D S Γ qs φ = true) :
     __smtx_model_eval M φ = SmtValue.Boolean true := by
   unfold Paths.assumedQuery at h
@@ -585,9 +521,9 @@ theorem assumedQuery_sound (hO : O.Sound) (hty : LogosTyping) (hS : SigOk D S) (
       cases b <;> rfl
     · have hK := kSound_append (kSound_closeK hM.defs p.defs.length (lits_sound g true hbg))
         hM.known
-      obtain ⟨hqt, n, v, hn⟩ := hqs q hq
-      rw [holds_of_assumesW hO hty hS hP.2 (call_ty' hO hty hS hP n) hqt env v hEnv hn M hM.wf
-        (hM.calls n) hM.vars M (fun t => t) hM.wf (fun _ _ _ => rfl) _ hK ψ ha]
+      obtain ⟨⟨q', hqt⟩, n, v, hn⟩ := hqs q hq
+      rw [q_holds_of_assumes hO hty hS hP.2 (call_ty' hO hty hS hP n) hqt env v hEnv hn M hM.wf
+        (hM.calls n) hM.vars _ hK ψ ha]
       exact eval_imp_true hty hM.wf hg
   · simp at h
 
@@ -715,7 +651,7 @@ theorem holds_reachedCovered (hO : O.Sound) (hty : LogosTyping) (hS : SigOk D S)
       ∃ n v, eval O P n env q = .Ok v)
     (hDr : D = dataOf r) (hSr : S = sigsOf r.equations) (hE : ∀ e ∈ r.equations, EqBody P D S e)
     (hΓr : Γ = varsOf (sigsOf r.equations) r.query)
-    (hqs : ∀ q ∈ queryOf r.query, HasTy D S Γ q .BooleanType ∧ ∃ n v, eval O P n env q = .Ok v)
+    (hqs : ∀ q ∈ queryOf r.query, (∃ q', QTy D S Γ q q') ∧ ∃ n v, eval O P n env q = .Ok v)
     {t : Term}
     (h : reachedCovered r t = true) {assums : List Term}
     (hsub : extend r.base r.fresh ⊆ assums) :
@@ -801,9 +737,9 @@ theorem no_solution_of_reached {O : Oracle} (sound : LogosSound) (hO : O.Sound)
       __eo_to_smt t = tr (dataOf r) (sigsOf r.equations) (varsOf (sigsOf r.equations) r.query) q ∧
       ∃ n v, eval O (programOf (dataOf r) r.equations) n (Env.Env [] bs) q = .Ok v := by
     intro t ht
-    obtain ⟨q, hq, hqt, htr⟩ := hB t ht
+    obtain ⟨q, hq, q', hqq, htr⟩ := hB t ht
     obtain ⟨n, hn⟩ := hsol q hq
-    exact ⟨q, hqt, htr, n, _, hn⟩
+    exact ⟨q', hasTy_of_q hqq, htr.trans (tr_of_q hqq), n, _, eval_of_q hqq _ _ hn⟩
   refine no_good_model_of_accept_only sound hty
     (Agrees O (programOf (dataOf r) r.equations) (dataOf r) (sigsOf r.equations)
       (varsOf (sigsOf r.equations) r.query)
@@ -817,7 +753,8 @@ theorem no_solution_of_reached {O : Oracle} (sound : LogosSound) (hO : O.Sound)
       varsOk_star hΓ M0 cd hbs []⟩
     (satisfies_star hO hty hS hPF hP hΓ hM0 cd hvs hbs [] ?_)
   intro t ht
-  obtain ⟨q, hq, hty', htr⟩ := hB t ht
-  exact ⟨q, hty', htr, hsol q hq⟩
+  obtain ⟨q, hq, q', hqq, htr⟩ := hB t ht
+  obtain ⟨n, hn⟩ := hsol q hq
+  exact ⟨q', hasTy_of_q hqq, htr.trans (tr_of_q hqq), n, eval_of_q hqq _ _ hn⟩
 
 end Inox.Bridge

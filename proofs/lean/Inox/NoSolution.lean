@@ -1,5 +1,6 @@
 /- Copyright 2009-2026 EPFL, Lausanne -/
 import Inox.Bridge
+import Inox.Quant
 import Inox.Codes
 import Cpc.Proofs.TypePreservation.Nonvacuity
 
@@ -128,10 +129,10 @@ theorem satisfies_star (hO : O.Sound) (hty : LogosTyping) (hS : SigOk D S) (hPF 
   rfl
 
 /-- The base clauses `base` are the translations of the expressions `qs` of a query over the
-free variables `Γ`. -/
+free variables `Γ`, which are of `QTy`. -/
 def BaseFor (D : List Data) (S : List Sig) (Γ : List (Id × Ty)) (qs : List Expr)
     (base : List Term) : Prop :=
-  ∀ t ∈ base, ∃ q ∈ qs, HasTy D S Γ q .BooleanType ∧ __eo_to_smt t = tr D S Γ q
+  ∀ t ∈ base, ∃ q ∈ qs, ∃ q', QTy D S Γ q q' ∧ __eo_to_smt t = tr D S Γ q
 
 /-- The values `vs` of the free variables `Γ` are a solution of the query `qs`: each of its
 expressions evaluates to `true`, with some fuel. -/
@@ -165,7 +166,8 @@ theorem no_solution (sound : LogosSound) (hO : O.Sound) (hty : LogosTyping) (hS 
     (good_star hO hty hS hPF hP htot hE cd hM0 (wf_varsModel hS.data hM0 hvs) rfl)
     (satisfies_star hO hty hS hPF hP hΓ hM0 cd hvs hbs [] ?_)
   intro t ht
-  obtain ⟨q, hq, hty', htr⟩ := hbase t ht
-  exact ⟨q, hty', htr, hsol q hq⟩
+  obtain ⟨q, hq, q', hqq, htr⟩ := hbase t ht
+  obtain ⟨n, hn⟩ := hsol q hq
+  exact ⟨q', hasTy_of_q hqq, htr.trans (tr_of_q hqq), n, eval_of_q hqq _ _ hn⟩
 
 end Inox.Bridge
